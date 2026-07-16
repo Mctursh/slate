@@ -1,0 +1,12 @@
+[package]
+name = "slate"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "3"
+members = [ "slate-rpc", "slate-ingest", "slate-common", "slate-store" ]
+
+[workspace.dependencies]
+
+[dependencies]
