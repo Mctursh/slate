@@ -4,3 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# --- Solana snapshot reading ---
+# Versions are pinned to match Cloudbreak's crates/snapshot. The snapshot binary
+# format is tied to the solana-accounts-db version, so do NOT bump these casually.
+# agave-unstable-api: opt-in that acknowledges the accounts-db reading API is
+# "unstable" (may change in v4+). Without it, every AccountsFile call warns as deprecated.
+solana-accounts-db = { version = "3.1.5", features = ["agave-unstable-api"] }
+solana-account = "3.0.0"       # account types
+solana-pubkey = "4.0.0"        # Pubkey
+
+# A snapshot archive is a zstd-compressed tarball.
+tar = "0.4"
+zstd = "0.13"
+
+# bincode (1.x, as Solana uses) for any bank/metadata you need to deserialize.
+bincode = "1.3"
+
+anyhow = "1"
+
+slate-store = { path = "../slate-store"}
+tokio = { workspace = true }
+
+# Add later ONLY if the unpack path you lift needs to load the bank for the slot:
+# solana-runtime = "3.1.5"
