@@ -5,14 +5,15 @@ pub type StoreResult<T> = Result<T, clickhouse::error::Error>;
 
 #[derive(Deserialize, Row)]
 pub struct AccountUpdate {
-    pubkey: [u8; 32],
-    owner: [u8; 32],
-    slot: u64,
-    lamports: u64,
-    write_version: u64,
-    rent_epoch: u64,
+    pub pubkey: [u8; 32],
+    pub owner: [u8; 32],
+    pub slot: u64,
+    pub lamports: u64,
+    pub write_version: u64,
+    pub rent_epoch: u64,
+    pub executable: u8,
     #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
+    pub data: Vec<u8>,
 }
 #[derive(Serialize, Row)]
 pub struct AccountUpdateInsert {
@@ -46,7 +47,7 @@ impl ClickHouseClient {
         pubkey: &[u8; 32],
         as_of_slot: u64,
     ) -> StoreResult<Option<AccountUpdate>> {
-        let query = "SELECT pubkey, owner, slot, lamports, write_version, rent_epoch, data FROM slate.account_updates WHERE pubkey = unhex(?) AND slot <= ? ORDER BY slot DESC, write_version DESC LIMIT 1";
+        let query = "SELECT pubkey, owner, slot, lamports, write_version, rent_epoch, executable, data FROM slate.account_updates WHERE pubkey = unhex(?) AND slot <= ? ORDER BY slot DESC, write_version DESC LIMIT 1";
         let row = self
             .client
             .query(query)
@@ -63,7 +64,7 @@ impl ClickHouseClient {
         owner: &[u8; 32],
         as_of_slot: u64,
     ) -> StoreResult<Vec<AccountUpdate>> {
-        let query = "SELECT pubkey, owner, as_of_slot AS slot, lamports, as_of_write_version AS write_version, rent_epoch, data
+        let query = "SELECT pubkey, owner, as_of_slot AS slot, lamports, as_of_write_version AS write_version, rent_epoch, executable, data
                     FROM (
                         SELECT
                             pubkey,
@@ -72,6 +73,7 @@ impl ClickHouseClient {
                             argMax(lamports,      (slot, write_version)) AS lamports,
                             argMax(write_version, (slot, write_version)) AS as_of_write_version,
                             argMax(rent_epoch,    (slot, write_version)) AS rent_epoch,
+                            argMax(executable,    (slot, write_version)) AS executable,
                             argMax(data,          (slot, write_version)) AS data
                         FROM slate.account_updates
                         WHERE pubkey IN (

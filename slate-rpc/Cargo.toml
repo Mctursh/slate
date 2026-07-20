@@ -4,3 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# JSON-RPC transport: server + envelope ({jsonrpc,id,result/error}) + error type.
+jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }
+
+slate-store = { path = "../slate-store" }
+
+# Agave-compatible response shaping (matches Cloudbreak crates/api). These replace the old
+# hand-rolled response struct + bs58/base64: solana-pubkey does base58, encode_ui_account does base64.
+solana-account = "3.0.0"                       # Account fed to the encoder
+solana-account-decoder = { version = "3.1.5", features = ["agave-unstable-api"] }  # encode_ui_account, UiAccountEncoding
+solana-account-decoder-client-types = "3.1.5"  # UiAccount type
+solana-rpc-client-api = "3.1.5"                # Response, RpcResponseContext, RpcKeyedAccount
+solana-pubkey = "4.0.0"                         # Pubkey: parse/format base58, feed the encoder
+
+serde = { workspace = true }       # Serialize bound for to_value
+serde_json = { workspace = true }  # to_value
+tokio = { workspace = true }       # async runtime
+anyhow = "1"
