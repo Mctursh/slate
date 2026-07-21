@@ -28,7 +28,7 @@
 //! Goal of step 1: print `(pubkey, lamports, owner, data.len())` for each account in a small
 //! `solana-test-validator` snapshot. No ClickHouse yet — that comes after you can read.
 
-// TODO(you): implement the snapshot reader here.
+pub mod capture;
 
 use std::fs::read_dir;
 
