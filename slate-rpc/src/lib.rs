@@ -10,7 +10,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::ErrorObject,
 };
-use slate_store::{AccountUpdate, ClickHouseClient};
+use slate_store::{AccountAtSlot, AccountUpdate, ClickHouseClient};
 use solana_account::Account;
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
@@ -49,13 +49,12 @@ impl SlateRpcServer for Rpc {
     ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(pubkey)?;
 
-        let account = self
+        let AccountAtSlot { account, fidelity } = self
             .store
-            .get_account_info(&key, as_of_slot)
+            .get_account_info_as_of(&key, as_of_slot)
             .await
             .map_err(|_| ErrorObject::owned(-32603, "failed to query account store", None::<()>))?;
 
-        // Agave getAccountInfo: { context: { slot }, value: UiAccount | null }
         let response = RpcResponse {
             context: RpcResponseContext {
                 slot: as_of_slot,
@@ -63,7 +62,9 @@ impl SlateRpcServer for Rpc {
             },
             value: account.map(|a| encode(&a)),
         };
-        to_value(response)
+        let mut response = to_value(response)?;
+        response["context"]["fidelity"] = to_value(fidelity)?;
+        Ok(response)
     }
 
     async fn get_program_accounts(

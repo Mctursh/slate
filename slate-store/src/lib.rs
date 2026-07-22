@@ -28,6 +28,22 @@ pub struct AccountUpdateInsert {
     pub data: Vec<u8>,
 }
 
+// #[derive(Serialize, Row)]
+// pub struct CoverageRow {
+//     segment_lo: u64,
+//     segment_hi: u64
+// }
+#[derive(Debug, PartialEq, Serialize)]
+pub enum Fidelity {
+    Exact,
+    Uncertain,
+}
+
+pub struct AccountAtSlot {
+    pub account: Option<AccountUpdate>,
+    pub fidelity: Fidelity,
+}
+
 pub struct ClickHouseClient {
     client: clickhouse::Client,
 }
@@ -108,6 +124,59 @@ impl ClickHouseClient {
         }
         insert.end().await?;
         Ok(())
+    }
+
+    pub async fn record_coverage(&self, lo: u64, hi: u64) -> StoreResult<()> {
+        self.client
+            .query("INSERT INTO coverage  VALUES (?, ?)")
+            .bind(lo)
+            .bind(hi)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_covered(&self, from: u64, to: u64) -> StoreResult<bool> {
+        let query = "
+            SELECT count() > 0 FROM (
+                SELECT segment_lo, max(segment_hi) AS hi
+                FROM slate.coverage
+                GROUP BY segment_lo
+            )
+            WHERE segment_lo <= ? AND hi >= ?
+        ";
+        let covered = self
+            .client
+            .query(query)
+            .bind(from)
+            .bind(to)
+            .fetch_one::<u8>()
+            .await?;
+
+        Ok(covered != 0)
+    }
+
+    pub async fn get_account_info_as_of(
+        &self,
+        pubkey: &[u8; 32],
+        as_of_slot: u64,
+    ) -> StoreResult<AccountAtSlot> {
+        let account = self.get_account_info(pubkey, as_of_slot).await?;
+        let fidelity = match &account {
+            Some(a) => {
+                if self.is_covered(a.slot, as_of_slot).await? {
+                    Fidelity::Exact
+                } else {
+                    Fidelity::Uncertain
+                }
+            }
+            None =>
+            /* Decision 1 goes here */
+            {
+                Fidelity::Uncertain
+            }
+        };
+        Ok(AccountAtSlot { account, fidelity })
     }
 }
 
@@ -248,5 +317,13 @@ mod tests {
             scanned_pubkeys(pk(0xBB), 200).await.unwrap(),
             vec![pk(0x22)]
         );
+    }
+
+    #[tokio::test]
+    async fn coverage_only_matches_spans_inside_a_segment() {
+        store().record_coverage(100, 150).await.unwrap();
+        assert!(store().is_covered(120, 140).await.unwrap()); // fully inside [100,150]
+        assert!(!store().is_covered(120, 200).await.unwrap()); // 200 is past hi
+        assert!(!store().is_covered(90, 140).await.unwrap()); // 90 is below lo
     }
 }
