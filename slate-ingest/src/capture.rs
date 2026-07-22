@@ -56,6 +56,15 @@ impl Capturer {
             current_segment_lo: None,
         }
     }
+    
+    pub fn from_baseline(store: ClickHouseClient, s_snap: u64) -> Self {
+        Self {
+            store,
+            buffer: BTreeMap::new(),
+            watermark: s_snap,
+            current_segment_lo: Some(s_snap),
+        }
+    }
 
     /// Drive one event through the pipeline.
     pub async fn handle_event(&mut self, event: StreamEvent) -> anyhow::Result<()> {
@@ -349,5 +358,97 @@ mod tests {
             8
         );
         assert_eq!(ans.fidelity, Fidelity::Exact, "520 is inside segment 2");
+    }
+
+    /// The bootstrap seam: a snapshot baseline makes accounts answerable even if they never move
+    /// again, and turns a true absence into a provable one. Synthetic baseline at slot 10 (kept
+    /// below the other tests' >=100 segments so it's the global coverage floor here), then a mock
+    /// stream extends it forward to slot 50. Uses 0xD1/0xD2/0xD3, their own accounts.
+    #[tokio::test]
+    async fn baseline_makes_untouched_and_absent_accounts_answerable() {
+        use slate_store::{AccountUpdateInsert, Fidelity};
+
+        let store = ClickHouseClient::new("http://localhost:8123");
+
+        // Synthetic baseline: the full account set stamped at S_snap = 10 (what the snapshot
+        // loader will do next), plus coverage marking slot 10 captured. Stamping every baseline
+        // account at S_snap is what lets is_covered treat the baseline as one coherent floor.
+        let baseline = |first: u8, lamports: u64| AccountUpdateInsert {
+            pubkey: pk(first),
+            slot: 10,
+            write_version: 0,
+            owner: pk(0xC0),
+            lamports,
+            executable: 0,
+            rent_epoch: 0,
+            data: Vec::new(),
+        };
+        store
+            .insert_accounts(&[baseline(0xD1, 100), baseline(0xD2, 200)])
+            .await
+            .unwrap();
+        store.record_coverage(10, 10).await.unwrap();
+
+        // Stream forward FROM the baseline: D1 rewritten to 150 at slot 50 extends coverage to one
+        // contiguous segment [10, 50]. D2 is never touched again.
+        let mut cap =
+            Capturer::from_baseline(ClickHouseClient::new("http://localhost:8123"), 10);
+        cap.run(vec![
+            StreamEvent::Account(AccountWrite {
+                pubkey: pk(0xD1),
+                owner: pk(0xC0),
+                lamports: 150,
+                executable: false,
+                rent_epoch: 0,
+                data: Vec::new(),
+                slot: 50,
+                write_version: 1,
+            }),
+            StreamEvent::Slot {
+                slot: 50,
+                parent: Some(49),
+                status: SlotStatus::Finalized,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // D2 never moved after the baseline, yet it's answerable, and (10,30] is inside the
+        // covered segment -> Exact. This is what the baseline buys us.
+        let ans = store.get_account_info_as_of(&pk(0xD2), 30).await.unwrap();
+        assert_eq!(
+            ans.account.expect("D2 answerable from the baseline").lamports,
+            200
+        );
+        assert_eq!(ans.fidelity, Fidelity::Exact);
+
+        // D1 as-of 40: before the slot-50 update, so the baseline value, Exact.
+        let ans = store.get_account_info_as_of(&pk(0xD1), 40).await.unwrap();
+        assert_eq!(ans.account.expect("D1 at 40").lamports, 100);
+        assert_eq!(ans.fidelity, Fidelity::Exact);
+
+        // D1 as-of 50: the streamed update lands on top of the baseline.
+        let ans = store.get_account_info_as_of(&pk(0xD1), 50).await.unwrap();
+        assert_eq!(ans.account.expect("D1 at 50").lamports, 150);
+        assert_eq!(ans.fidelity, Fidelity::Exact);
+
+        // D3 never existed. With gapless coverage from the baseline floor up to 30, that absence
+        // is provable -> None, Exact. This is the seam's whole point for the None case.
+        let ans = store.get_account_info_as_of(&pk(0xD3), 30).await.unwrap();
+        assert!(ans.account.is_none());
+        assert_eq!(
+            ans.fidelity,
+            Fidelity::Exact,
+            "absence inside a gapless baseline is provable"
+        );
+
+        // D3 as-of 5: below the baseline floor (10), we have no data there, so we can't vouch.
+        let ans = store.get_account_info_as_of(&pk(0xD3), 5).await.unwrap();
+        assert!(ans.account.is_none());
+        assert_eq!(
+            ans.fidelity,
+            Fidelity::Uncertain,
+            "below the baseline floor -> uncertain"
+        );
     }
 }

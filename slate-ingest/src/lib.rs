@@ -37,9 +37,10 @@ use slate_store::{AccountUpdateInsert, ClickHouseClient};
 use solana_account::ReadableAccount;
 use solana_accounts_db::accounts_file::{AccountsFile, StorageAccess};
 
-pub async fn read_snapshot_accounts(dir: &str) -> Result<(), anyhow::Error> {
+pub async fn read_snapshot_accounts(dir: &str) -> Result<u64, anyhow::Error> {
     let store = ClickHouseClient::new("http://localhost:8123");
     let mut accounts: Vec<AccountUpdateInsert> = Vec::new();
+    let mut s_snap: u64 = u64::default();
     for entry in read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -48,6 +49,7 @@ pub async fn read_snapshot_accounts(dir: &str) -> Result<(), anyhow::Error> {
         };
         let Some(name) = name.to_str() else { continue };
         let slot = get_slot_from_filename(name)?;
+        s_snap = s_snap.max(slot);
         // AppendVec DELETES its backing file on Drop (remove_file_on_drop defaults to true, and
         // there's no public opt-out). So read a throwaway copy: the copy gets deleted on drop,
         // the real snapshot file survives, and the loader stays non-destructive + re-runnable.
@@ -75,9 +77,15 @@ pub async fn read_snapshot_accounts(dir: &str) -> Result<(), anyhow::Error> {
             });
         }
     }
+    if accounts.is_empty() {
+        return Ok(0);
+    }
+    for a in &mut accounts {
+        a.slot = s_snap
+    }
     store.insert_accounts(&accounts).await?;
-
-    Ok(())
+    store.record_coverage(s_snap, s_snap).await?;
+    Ok(s_snap)
 }
 
 fn get_slot_from_filename(filename: &str) -> Result<u64, anyhow::Error> {

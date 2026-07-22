@@ -170,13 +170,18 @@ impl ClickHouseClient {
                     Fidelity::Uncertain
                 }
             }
-            None =>
-            /* Decision 1 goes here */
-            {
-                Fidelity::Uncertain
+            None => match self.earliest_covered().await? {
+                Some(floor) if as_of_slot >= floor && self.is_covered(floor, as_of_slot).await? => Fidelity::Exact,
+                _ => Fidelity::Uncertain
             }
         };
         Ok(AccountAtSlot { account, fidelity })
+    }
+
+    pub async fn earliest_covered(&self) -> StoreResult<Option<u64>> {
+        let query = "SELECT segment_lo FROM slate.coverage ORDER BY segment_lo LIMIT 1";
+        let floor = self.client.query(query).fetch_optional::<u64>().await?;
+        Ok(floor)
     }
 }
 
