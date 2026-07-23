@@ -10,7 +10,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::ErrorObject,
 };
-use slate_store::{AccountAtSlot, AccountUpdate, ClickHouseClient, ProgramAccountAtSlot};
+use slate_store::{AccountAtSlot, AccountUpdate, ClickHouseClient, Fidelity, ProgramAccountAtSlot};
 use solana_account::Account;
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
@@ -32,6 +32,16 @@ pub trait SlateRpc {
     async fn get_program_accounts(
         &self,
         owner: String,
+        as_of_slot: u64,
+    ) -> RpcResult<serde_json::Value>;
+
+    #[method(name = "getBalance")]
+    async fn get_balance(&self, pubkey: String, as_of_slot: u64) -> RpcResult<serde_json::Value>;
+
+    #[method(name = "getMultipleAccounts")]
+    async fn get_multiple_accounts(
+        &self,
+        pubkeys: Vec<String>,
         as_of_slot: u64,
     ) -> RpcResult<serde_json::Value>;
 }
@@ -102,6 +112,62 @@ impl SlateRpcServer for Rpc {
         response["context"]["fidelity"] = to_value(fidelity)?;
         Ok(response)
     }
+
+    async fn get_multiple_accounts(
+        &self,
+        pubkeys: Vec<String>,
+        as_of_slot: u64,
+    ) -> RpcResult<serde_json::Value> {
+        let keys = pubkeys
+            .iter()
+            .map(|k| decode_pubkey(k.to_string()))
+            .collect::<RpcResult<Vec<_>>>()?;
+        let mut fidelities: Vec<Fidelity> = Vec::with_capacity(keys.len());
+        let mut accounts: Vec<Option<UiAccount>> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let AccountAtSlot { account, fidelity } = self
+                .store
+                .get_account_info_as_of(&key, as_of_slot)
+                .await
+                .map_err(|_| {
+                    ErrorObject::owned(-32603, "failed to query account store", None::<()>)
+                })?;
+            let value = account.map(|a| encode(&a));
+            fidelities.push(fidelity);
+            accounts.push(value);
+        }
+        let mut response = to_value(RpcResponse {
+            context: RpcResponseContext {
+                slot: as_of_slot,
+                api_version: None,
+            },
+            value: accounts,
+        })?;
+        response["context"]["fidelities"] = to_value(fidelities)?;
+        Ok(response)
+    }
+
+    async fn get_balance(&self, pubkey: String, as_of_slot: u64) -> RpcResult<serde_json::Value> {
+        let key = decode_pubkey(pubkey)?;
+        let AccountAtSlot { account, fidelity } = self
+            .store
+            .get_account_info_as_of(&key, as_of_slot)
+            .await
+            .map_err(|_| ErrorObject::owned(-32603, "failed to query account store", None::<()>))?;
+
+        let value = account.map(|a| a.lamports).unwrap_or(0);
+        let response = RpcResponse {
+            context: RpcResponseContext {
+                slot: as_of_slot,
+                api_version: None,
+            },
+            value,
+        };
+
+        let mut response = to_value(response)?;
+        response["context"]["fidelity"] = to_value(fidelity)?;
+        Ok(response)
+    }
 }
 
 /// Map a stored account to Agave's `UiAccount` (base64 encoding for now).
@@ -133,4 +199,61 @@ fn decode_pubkey(s: String) -> RpcResult<[u8; 32]> {
 fn to_value<T: serde::Serialize>(v: T) -> RpcResult<serde_json::Value> {
     serde_json::to_value(v)
         .map_err(|_| ErrorObject::owned(-32603, "failed to serialize response", None::<()>))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slate_store::AccountUpdateInsert;
+
+    fn pk(first: u8) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[0] = first;
+        a
+    }
+    fn b58(first: u8) -> String {
+        Pubkey::from(pk(first)).to_string()
+    }
+
+    /// getMultipleAccounts must return accounts in input order, `null` in place for ones that
+    /// don't exist, and a `context.fidelities` array parallel to `value`. Needs ClickHouse up.
+    /// Uses 0xF1/0xF2 (seeded) and 0xF9 (never seeded) so it doesn't collide with other fixtures.
+    #[tokio::test]
+    async fn get_multiple_accounts_shape() {
+        let store = ClickHouseClient::new("http://localhost:8123");
+        let row = |first: u8, lamports: u64| AccountUpdateInsert {
+            pubkey: pk(first),
+            slot: 100,
+            write_version: 0,
+            owner: pk(0xC0),
+            lamports,
+            executable: 0,
+            rent_epoch: 0,
+            data: Vec::new(),
+        };
+        store
+            .insert_accounts(&[row(0xF1, 111), row(0xF2, 222)])
+            .await
+            .unwrap();
+
+        let rpc = Rpc { store };
+        // Middle key doesn't exist -> null in the middle of the array.
+        let v = rpc
+            .get_multiple_accounts(vec![b58(0xF1), b58(0xF9), b58(0xF2)], 200)
+            .await
+            .unwrap();
+
+        let value = v["value"].as_array().expect("value is an array");
+        assert_eq!(value.len(), 3);
+        assert_eq!(value[0]["lamports"], 111);
+        assert!(value[1].is_null(), "missing account is null in place");
+        assert_eq!(value[2]["lamports"], 222);
+
+        // Fidelities run parallel to value: one per requested key, same order.
+        let fids = v["context"]["fidelities"]
+            .as_array()
+            .expect("context.fidelities is an array");
+        assert_eq!(fids.len(), 3);
+        assert_eq!(v["context"]["slot"], 200);
+    }
 }
