@@ -44,6 +44,11 @@ pub struct AccountAtSlot {
     pub fidelity: Fidelity,
 }
 
+pub struct ProgramAccountAtSlot {
+    pub accounts: Vec<AccountUpdate>,
+    pub fidelity: Fidelity
+}
+
 pub struct ClickHouseClient {
     client: clickhouse::Client,
 }
@@ -170,18 +175,31 @@ impl ClickHouseClient {
                     Fidelity::Uncertain
                 }
             }
-            None => match self.earliest_covered().await? {
-                Some(floor) if as_of_slot >= floor && self.is_covered(floor, as_of_slot).await? => Fidelity::Exact,
-                _ => Fidelity::Uncertain
-            }
+            None => self.coverage_fidelity(as_of_slot).await?,
         };
         Ok(AccountAtSlot { account, fidelity })
     }
+
+    pub async fn get_program_accounts_as_of(&self, owner: &[u8; 32], as_of_slot: u64) -> StoreResult<ProgramAccountAtSlot> {
+        let accounts = self.get_program_accounts(owner, as_of_slot).await?;
+        let fidelity = self.coverage_fidelity(as_of_slot).await?;
+        Ok(ProgramAccountAtSlot { accounts, fidelity })
+    } 
 
     pub async fn earliest_covered(&self) -> StoreResult<Option<u64>> {
         let query = "SELECT segment_lo FROM slate.coverage ORDER BY segment_lo LIMIT 1";
         let floor = self.client.query(query).fetch_optional::<u64>().await?;
         Ok(floor)
+    }
+
+    async fn coverage_fidelity(&self, as_of_slot: u64) -> StoreResult<Fidelity> {
+        let fidelity = match self.earliest_covered().await? {
+            Some(floor) if as_of_slot >= floor && self.is_covered(floor, as_of_slot).await? => {
+                Fidelity::Exact
+            }
+            _ => Fidelity::Uncertain,
+        };
+        Ok(fidelity)
     }
 }
 
@@ -330,5 +348,25 @@ mod tests {
         assert!(store().is_covered(120, 140).await.unwrap()); // fully inside [100,150]
         assert!(!store().is_covered(120, 200).await.unwrap()); // 200 is past hi
         assert!(!store().is_covered(90, 140).await.unwrap()); // 90 is below lo
+    }
+
+    #[tokio::test]
+    async fn program_scan_carries_fidelity() {
+        seed_test_accounts().await;
+        // Scan far past any coverage we have. The result set can't be vouched for: a gap could
+        // hide an account we'd never even list, so no per-account check would catch it. The
+        // accounts still come back, but the whole result is flagged Uncertain.
+        let res = store()
+            .get_program_accounts_as_of(&pk(0xAA), 10_000_000)
+            .await
+            .unwrap();
+        let mut keys: Vec<[u8; 32]> = res.accounts.iter().map(|a| a.pubkey).collect();
+        keys.sort();
+        assert_eq!(keys, vec![pk(0x11)], "only X is still under P1 at a high slot");
+        assert_eq!(
+            res.fidelity,
+            Fidelity::Uncertain,
+            "past all coverage -> whole scan is uncertain"
+        );
     }
 }

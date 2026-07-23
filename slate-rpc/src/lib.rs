@@ -10,7 +10,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::ErrorObject,
 };
-use slate_store::{AccountAtSlot, AccountUpdate, ClickHouseClient};
+use slate_store::{AccountAtSlot, AccountUpdate, ClickHouseClient, ProgramAccountAtSlot};
 use solana_account::Account;
 use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
 use solana_account_decoder_client_types::UiAccount;
@@ -74,23 +74,33 @@ impl SlateRpcServer for Rpc {
     ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(owner)?;
 
-        let rows = self
+        let ProgramAccountAtSlot { accounts, fidelity } = self
             .store
-            .get_program_accounts(&key, as_of_slot)
+            .get_program_accounts_as_of(&key, as_of_slot)
+            // .get_program_accounts(&key, as_of_slot)
             .await
             .map_err(|_| {
                 ErrorObject::owned(-32603, "failed to query program accounts", None::<()>)
             })?;
 
-        // Agave getProgramAccounts (default): [ { pubkey, account: UiAccount } ]
-        let keyed: Vec<RpcKeyedAccount> = rows
+        // getProgramAccounts with context: { context: { slot, fidelity }, value: [ {pubkey, account} ] }
+        let keyed: Vec<RpcKeyedAccount> = accounts
             .into_iter()
             .map(|a| RpcKeyedAccount {
                 pubkey: Pubkey::from(a.pubkey).to_string(),
                 account: encode(&a),
             })
             .collect();
-        to_value(keyed)
+        let response = RpcResponse {
+            context: RpcResponseContext {
+                slot: as_of_slot,
+                api_version: None,
+            },
+            value: keyed,
+        };
+        let mut response = to_value(response)?;
+        response["context"]["fidelity"] = to_value(fidelity)?;
+        Ok(response)
     }
 }
 
