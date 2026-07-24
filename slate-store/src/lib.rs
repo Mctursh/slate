@@ -49,9 +49,16 @@ pub struct ProgramAccountAtSlot {
     pub fidelity: Fidelity
 }
 
+pub struct ProgramAccountsPage {
+    pub accounts: Vec<AccountUpdate>,
+    pub fidelity: Fidelity,
+    pub next_cursor: Option<[u8; 32]>,
+}
+
 pub struct ClickHouseClient {
     client: clickhouse::Client,
 }
+
 
 impl ClickHouseClient {
     pub fn new(url: &str) -> Self {
@@ -116,6 +123,63 @@ impl ClickHouseClient {
             .fetch_all::<AccountUpdate>()
             .await?;
         Ok(rows)
+    }
+
+    pub async fn get_program_accounts_page(
+        &self,
+        owner: &[u8; 32],
+        as_of_slot: u64,
+        cursor: Option<[u8; 32]>,
+        limit: u64,
+    ) -> StoreResult<ProgramAccountsPage> {
+        let cursor = cursor.unwrap_or([0u8; 32]);
+
+        let query = "SELECT pubkey, owner, as_of_slot AS slot, lamports, as_of_write_version AS write_version, rent_epoch, executable, data
+                    FROM (
+                        SELECT
+                            pubkey,
+                            argMax(owner,         (slot, write_version)) AS owner,
+                            argMax(slot,          (slot, write_version)) AS as_of_slot,
+                            argMax(lamports,      (slot, write_version)) AS lamports,
+                            argMax(write_version, (slot, write_version)) AS as_of_write_version,
+                            argMax(rent_epoch,    (slot, write_version)) AS rent_epoch,
+                            argMax(executable,    (slot, write_version)) AS executable,
+                            argMax(data,          (slot, write_version)) AS data
+                        FROM slate.account_updates
+                        WHERE pubkey IN (
+                            SELECT DISTINCT pubkey FROM slate.account_updates_by_owner
+                            WHERE owner = unhex(?) AND slot <= ? AND pubkey > unhex(?)
+                        ) AND slot <= ?
+                        GROUP BY pubkey
+                    )
+                    WHERE owner = unhex(?) AND lamports > 0
+                    ORDER BY pubkey
+                    LIMIT ?
+            ";
+        let accounts = self
+            .client
+            .query(query)
+            .bind(hex::encode(owner))
+            .bind(as_of_slot)
+            .bind(hex::encode(cursor))
+            .bind(as_of_slot)
+            .bind(hex::encode(owner))
+            .bind(limit)
+            .fetch_all::<AccountUpdate>()
+            .await?;
+
+        let fidelity = self.coverage_fidelity(as_of_slot).await?;
+        let next_cursor = if accounts.len() as u64 == limit {
+            accounts.last().map(|a| a.pubkey)
+        } else {
+            None
+        };
+
+        Ok(ProgramAccountsPage {
+            accounts,
+            fidelity,
+            next_cursor,
+        })
     }
 
     pub async fn insert_accounts(&self, rows: &[AccountUpdateInsert]) -> StoreResult<()> {
@@ -368,5 +432,56 @@ mod tests {
             Fidelity::Uncertain,
             "past all coverage -> whole scan is uncertain"
         );
+    }
+
+    /// Keyset pagination over a frozen slot must walk the whole set exactly once — same order as
+    /// the full scan, no dupes, no gaps — with next_cursor threading to the end. Owner 0xE0 and
+    /// accounts 0xE1..0xE5 are this test's own (pubkey byte-order is E1 < E2 < ... < E5).
+    #[tokio::test]
+    async fn pagination_walks_the_whole_set_once() {
+        let store = store();
+        let row = |first: u8| AccountUpdateInsert {
+            pubkey: pk(first),
+            slot: 100,
+            write_version: 0,
+            owner: pk(0xE0),
+            lamports: 10,
+            executable: 0,
+            rent_epoch: 0,
+            data: Vec::new(),
+        };
+        store
+            .insert_accounts(&[row(0xE1), row(0xE2), row(0xE3), row(0xE4), row(0xE5)])
+            .await
+            .unwrap();
+
+        // Ground truth: the full scan, sorted by pubkey.
+        let mut full: Vec<[u8; 32]> = store
+            .get_program_accounts(&pk(0xE0), 200)
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.pubkey)
+            .collect();
+        full.sort();
+
+        // Walk pages of 2, threading next_cursor until it comes back None.
+        let mut walked: Vec<[u8; 32]> = Vec::new();
+        let mut cursor: Option<[u8; 32]> = None;
+        for _ in 0..10 {
+            let page = store
+                .get_program_accounts_page(&pk(0xE0), 200, cursor, 2)
+                .await
+                .unwrap();
+            walked.extend(page.accounts.iter().map(|a| a.pubkey));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        // The paged walk equals the full set: in pubkey order, no dupes, no gaps.
+        assert_eq!(walked, full);
+        assert_eq!(walked.len(), 5);
     }
 }
