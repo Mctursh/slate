@@ -3,6 +3,7 @@ name = "slate-ingest"
 version = "0.1.0"
 edition = "2024"
 
+
 [dependencies]
 # --- Solana snapshot reading ---
 # Versions are pinned to match Cloudbreak's crates/snapshot. The snapshot binary
@@ -24,6 +25,14 @@ anyhow = "1"
 
 slate-store = { path = "../slate-store"}
 tokio = { workspace = true }
+
+# --- Live ingest: Yellowstone gRPC (Dragon's Mouth) ---
+# Pinned together: client 13.x depends on proto ^12.5, so these two share one proto schema.
+# The plugin you build must be from the SAME yellowstone-grpc 13.x release line, and that
+# release fixes the Agave version the test-validator has to run.
+yellowstone-grpc-client = "13.2.1"
+yellowstone-grpc-proto = "12.5.0"
+futures = "0.3"                    # StreamExt for the subscribe stream (driver loop)
 
 # Add later ONLY if the unpack path you lift needs to load the bank for the slot:
 # solana-runtime = "3.1.5"

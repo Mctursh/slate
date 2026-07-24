@@ -4,7 +4,7 @@ use slate_store::{AccountUpdateInsert, ClickHouseClient};
 // (You'll add `AccountUpdateInsert` to this import when you write the commit mapper.)
 
 /// One account write off the stream.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AccountWrite {
     pub pubkey: [u8; 32],
     pub owner: [u8; 32],
@@ -26,6 +26,7 @@ pub enum SlotStatus {
 }
 
 /// A single event off the stream.
+#[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Account(AccountWrite),
     Slot {
@@ -97,6 +98,8 @@ impl Capturer {
                 self.watermark = self.watermark.max(slot);
                 let lo = *self.current_segment_lo.get_or_insert(slot);
                 self.store.record_coverage(lo, self.watermark).await?;
+
+                println!("Finalized Slot {}", self.watermark)
             }
             StreamEvent::Slot {
                 slot,

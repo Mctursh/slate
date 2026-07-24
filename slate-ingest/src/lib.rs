@@ -1,34 +1,5 @@
-//! slate-ingest — reads Solana snapshots (and later the live account stream) into the store.
-//!
-//! ## First task: read a snapshot's accounts
-//!
-//! You are NOT parsing the binary format. `solana-accounts-db`'s `AccountsFile` decodes it.
-//! Lift two things from cloudbreak `crates/snapshot`:
-//!
-//! 1. Unpack the archive → a list of account files.
-//!    Reference: `sidecar.rs::unpack_compressed_snapshot` → `Vec<AccountFileData>`, where
-//!    `AccountFileData { path, size, slot, write_version }`.
-//!    Simplest start: untar the `.tar.zst` yourself (`zstd` decode then `tar` extract); the
-//!    account files land under `accounts/`, named `<slot>.<id>` — the slot is in the filename.
-//!
-//! 2. Iterate the accounts in each file.
-//!    Reference: `lt_hash.rs` lines ~63–90:
-//!    ```ignore
-//!    use solana_accounts_db::accounts_file::{AccountsFile, StorageAccess};
-//!    let af = AccountsFile::new_for_startup(&path, size, StorageAccess::default())?;
-//!    let mut offsets = Vec::new();
-//!    af.scan_accounts_without_data(|offset, _| offsets.push(offset))?;
-//!    for offset in offsets {
-//!        af.get_stored_account_callback(offset, |account| {
-//!            // account.pubkey(), account.owner, account.lamports(), account.data(), ...
-//!        });
-//!    }
-//!    ```
-//!
-//! Goal of step 1: print `(pubkey, lamports, owner, data.len())` for each account in a small
-//! `solana-test-validator` snapshot. No ClickHouse yet — that comes after you can read.
-
 pub mod capture;
+pub mod yellowstone;
 
 use std::fs::read_dir;
 
