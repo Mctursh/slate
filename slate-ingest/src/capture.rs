@@ -107,6 +107,7 @@ impl Capturer {
             }
             StreamEvent::Gap => {
                 self.current_segment_lo = None;
+                self.buffer.clear();
             }
             StreamEvent::Slot { .. } => {}
         }
@@ -445,6 +446,44 @@ mod tests {
             ans.fidelity,
             Fidelity::Uncertain,
             "below the baseline floor -> uncertain"
+        );
+    }
+
+    /// A stream drop must not leave buffered pre-gap writes to commit later. A write still in the
+    /// buffer (its slot hadn't finalized) is dropped by the Gap, so when that slot's Finalized
+    /// arrives after the gap there's nothing to commit. Uses 0xE9 @ slot 900, its own.
+    #[tokio::test]
+    async fn gap_drops_unfinalized_buffered_writes() {
+        let mut cap = Capturer::new(ClickHouseClient::new("http://localhost:8123"));
+        cap.run(vec![
+            // written at 900, NOT yet finalized -> sits in the buffer
+            StreamEvent::Account(AccountWrite {
+                pubkey: pk(0xE9),
+                owner: pk(0xC0),
+                lamports: 42,
+                executable: false,
+                rent_epoch: 0,
+                data: Vec::new(),
+                slot: 900,
+                write_version: 1,
+            }),
+            // stream drops -> Gap must clear the buffer
+            StreamEvent::Gap,
+            // slot 900 finalizes after the gap, but its buffered write is gone
+            StreamEvent::Slot {
+                slot: 900,
+                parent: Some(899),
+                status: SlotStatus::Finalized,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // The write was dropped by the Gap, so the post-gap finalize committed nothing.
+        let store = ClickHouseClient::new("http://localhost:8123");
+        assert!(
+            store.get_account_info(&pk(0xE9), 1000).await.unwrap().is_none(),
+            "Gap must drop buffered un-finalized writes"
         );
     }
 }

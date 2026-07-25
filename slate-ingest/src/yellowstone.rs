@@ -1,7 +1,5 @@
-
-
-use std::collections::HashMap;
-use futures::StreamExt; 
+use futures::StreamExt;
+use std::{collections::HashMap, time::Duration};
 
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient, GeyserStream};
 use yellowstone_grpc_proto::geyser::{
@@ -11,6 +9,8 @@ use yellowstone_grpc_proto::geyser::{
 };
 
 use crate::capture::{AccountWrite, Capturer, SlotStatus, StreamEvent};
+
+const RECONNECT_BACKOFF: Duration = Duration::new(5, 0);
 
 pub struct IngestConfig {
     pub endpoint: String,
@@ -66,7 +66,7 @@ pub async fn connect_and_subscribe(cfg: &IngestConfig) -> anyhow::Result<GeyserS
         accounts: HashMap::from([(
             "accounts".into(),
             SubscribeRequestFilterAccounts {
-                owner: cfg.owners.clone(), 
+                owner: cfg.owners.clone(),
                 ..Default::default()
             },
         )]),
@@ -81,21 +81,53 @@ pub async fn connect_and_subscribe(cfg: &IngestConfig) -> anyhow::Result<GeyserS
         ..Default::default()
     };
 
-    let mut builder =
-        GeyserGrpcClient::build_from_shared(cfg.endpoint.clone())?.x_token(cfg.x_token.clone())?;
+    let mut builder = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone())?
+        .x_token(cfg.x_token.clone())?
+        .connect_timeout(Duration::from_secs(10)) // don't hang forever dialing a dead endpoint
+        .http2_keep_alive_interval(Duration::from_secs(10)) // ping the server every 10s
+        .keep_alive_timeout(Duration::from_secs(5)) // no pong in 5s -> connection is dead
+        .keep_alive_while_idle(true); // ping even when no data is flowing
     if cfg.endpoint.starts_with("https") {
         builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
+
     let mut client = builder.connect().await?;
     let stream = client.subscribe_once(sub_request).await?;
     Ok(stream)
 }
 
 pub async fn run(cfg: &IngestConfig, capturer: &mut Capturer) -> anyhow::Result<()> {
-    let mut stream = connect_and_subscribe(cfg).await?;
+    let mut connected_before = false;
+    loop {
+        if connected_before {
+            capturer.handle_event(StreamEvent::Gap).await?;
+        }
+        connected_before = true;
+
+        drive_stream(cfg, capturer).await?;
+        tokio::time::sleep(RECONNECT_BACKOFF).await;
+    }
+}
+
+async fn drive_stream(cfg: &IngestConfig, capturer: &mut Capturer) -> anyhow::Result<()> {
+    let mut stream = match connect_and_subscribe(cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("connect failed: {e:#} — retrying");
+            return Ok(());
+        }
+    };
     while let Some(update) = stream.next().await {
-        if let Some(event) = adapt(update?) {
-            capturer.handle_event(event).await?;
+        match update {
+            Ok(u) => {
+                if let Some(event) = adapt(u) {
+                    capturer.handle_event(event).await?; // propagate DB errors for now, to be handled in the store
+                }
+            }
+            Err(status) => {
+                eprintln!("stream error: {status} — reconnecting");
+                return Ok(());
+            }
         }
     }
     Ok(())
