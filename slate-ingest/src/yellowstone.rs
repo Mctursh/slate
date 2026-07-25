@@ -19,9 +19,6 @@ pub struct IngestConfig {
     // pub commitment: Commitmewnt
 }
 
-/// Map one Yellowstone update to a `StreamEvent`, or `None` to skip it. `None` covers keepalives
-/// (Ping/Pong), streams we didn't subscribe to (Transaction/Block/Entry), unmapped slot statuses,
-/// and malformed messages — the driver just ignores those.
 pub fn adapt(update: SubscribeUpdate) -> Option<StreamEvent> {
     match update.update_oneof? {
         UpdateOneof::Account(a) => adapt_account(a),
@@ -54,9 +51,6 @@ fn adapt_slot(s: SubscribeUpdateSlot) -> Option<StreamEvent> {
     })
 }
 
-/// Yellowstone `SlotStatus` (an i32 on the wire) -> our `SlotStatus`. Only the four with pipeline
-/// meaning map; `SlotFirstShredReceived` / `SlotCompleted` / `SlotCreatedBank` have no counterpart,
-/// so they return `None` and the whole slot update is skipped.
 fn map_status(raw: i32) -> Option<SlotStatus> {
     match ProtoSlotStatus::try_from(raw).ok()? {
         ProtoSlotStatus::SlotFinalized => Some(SlotStatus::Finalized),

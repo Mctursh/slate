@@ -1,2 +1,8 @@
 /target
 /dev-snapshot
+/dev
+SPEC.md
+TASKS.md
+# /dev/*.dylib
+# /dev/*.so
+# /dev/test-ledger

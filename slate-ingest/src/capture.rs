@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use slate_store::{AccountUpdateInsert, ClickHouseClient};
-// (You'll add `AccountUpdateInsert` to this import when you write the commit mapper.)
 
-/// One account write off the stream.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountWrite {
     pub pubkey: [u8; 32],
@@ -16,7 +14,6 @@ pub struct AccountWrite {
     pub write_version: u64,
 }
 
-/// Slot lifecycle. We only commit on `Finalized`; `Dead` = abandoned fork.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotStatus {
     Processed,
@@ -25,7 +22,6 @@ pub enum SlotStatus {
     Dead,
 }
 
-/// A single event off the stream.
 #[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Account(AccountWrite),
@@ -106,16 +102,13 @@ impl Capturer {
                 status: SlotStatus::Dead,
                 ..
             } => {
-                // TODO(you): abandoned fork — drop this slot's buffered writes, commit nothing.
                 let _ = slot;
                 self.buffer.remove(&slot);
             }
             StreamEvent::Gap => {
                 self.current_segment_lo = None;
             }
-            StreamEvent::Slot { .. } => {
-                // Processed / Confirmed: nothing to do yet — we only commit on Finalized.
-            }
+            StreamEvent::Slot { .. } => {}
         }
         Ok(())
     }
