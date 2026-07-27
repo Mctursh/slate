@@ -62,20 +62,33 @@ pub struct ClickHouseClient {
 
 impl ClickHouseClient {
     pub fn new(url: &str) -> Self {
+        Self::with_config(url, "slate", "slate", "slate")
+    }
+
+    /// Same as `new`, but targets an explicit database. Tests use this to point at `slate_test`
+    /// so the suite can never write into the serving `slate` database (which would drag the
+    /// coverage floor down and make live scans read Uncertain).
+    pub fn with_database(url: &str, database: &str) -> Self {
+        Self::with_config(url, database, "slate", "slate")
+    }
+
+    /// Full constructor: URL, database, and credentials.
+    pub fn with_config(url: &str, database: &str, user: &str, password: &str) -> Self {
         let client = clickhouse::Client::default()
             .with_url(url)
-            .with_database("slate")
-            .with_user("slate")
-            .with_password("slate");
+            .with_database(database)
+            .with_user(user)
+            .with_password(password);
         ClickHouseClient { client }
     }
+
 
     pub async fn get_account_info(
         &self,
         pubkey: &[u8; 32],
         as_of_slot: u64,
     ) -> StoreResult<Option<AccountUpdate>> {
-        let query = "SELECT pubkey, owner, slot, lamports, write_version, rent_epoch, executable, data FROM slate.account_updates WHERE pubkey = unhex(?) AND slot <= ? ORDER BY slot DESC, write_version DESC LIMIT 1";
+        let query = "SELECT pubkey, owner, slot, lamports, write_version, rent_epoch, executable, data FROM account_updates WHERE pubkey = unhex(?) AND slot <= ? ORDER BY slot DESC, write_version DESC LIMIT 1";
         let row = self
             .client
             .query(query)
@@ -103,9 +116,9 @@ impl ClickHouseClient {
                             argMax(rent_epoch,    (slot, write_version)) AS rent_epoch,
                             argMax(executable,    (slot, write_version)) AS executable,
                             argMax(data,          (slot, write_version)) AS data
-                        FROM slate.account_updates
+                        FROM account_updates
                         WHERE pubkey IN (
-                            SELECT DISTINCT pubkey FROM slate.account_updates_by_owner
+                            SELECT DISTINCT pubkey FROM account_updates_by_owner
                             WHERE owner = unhex(?) AND slot <= ?
                         ) AND slot <= ?
                         GROUP BY pubkey
@@ -145,9 +158,9 @@ impl ClickHouseClient {
                             argMax(rent_epoch,    (slot, write_version)) AS rent_epoch,
                             argMax(executable,    (slot, write_version)) AS executable,
                             argMax(data,          (slot, write_version)) AS data
-                        FROM slate.account_updates
+                        FROM account_updates
                         WHERE pubkey IN (
-                            SELECT DISTINCT pubkey FROM slate.account_updates_by_owner
+                            SELECT DISTINCT pubkey FROM account_updates_by_owner
                             WHERE owner = unhex(?) AND slot <= ? AND pubkey > unhex(?)
                         ) AND slot <= ?
                         GROUP BY pubkey
@@ -209,7 +222,7 @@ impl ClickHouseClient {
         let query = "
             SELECT count() > 0 FROM (
                 SELECT segment_lo, max(segment_hi) AS hi
-                FROM slate.coverage
+                FROM coverage
                 GROUP BY segment_lo
             )
             WHERE segment_lo <= ? AND hi >= ?
@@ -251,9 +264,18 @@ impl ClickHouseClient {
     } 
 
     pub async fn earliest_covered(&self) -> StoreResult<Option<u64>> {
-        let query = "SELECT segment_lo FROM slate.coverage ORDER BY segment_lo LIMIT 1";
+        let query = "SELECT segment_lo FROM coverage ORDER BY segment_lo LIMIT 1";
         let floor = self.client.query(query).fetch_optional::<u64>().await?;
         Ok(floor)
+    }
+
+    /// Highest slot captured across all coverage segments (the "tip"). `None` when nothing is
+    /// captured yet. Mirrors `earliest_covered`; the validation harness uses it to show how far
+    /// behind the tip a queried slot has fallen.
+    pub async fn latest_covered(&self) -> StoreResult<Option<u64>> {
+        let query = "SELECT segment_hi FROM coverage ORDER BY segment_hi DESC LIMIT 1";
+        let tip = self.client.query(query).fetch_optional::<u64>().await?;
+        Ok(tip)
     }
 
     async fn coverage_fidelity(&self, as_of_slot: u64) -> StoreResult<Fidelity> {
@@ -280,7 +302,7 @@ mod tests {
     }
 
     fn store() -> ClickHouseClient {
-        ClickHouseClient::new("http://localhost:8123")
+        ClickHouseClient::with_database("http://localhost:8123", "slate_test")
     }
 
     /// Seed the canonical X/Y/Z dataset through the real insert path so the tests are

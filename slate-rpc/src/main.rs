@@ -1,14 +1,32 @@
+use clap::Parser;
+use slate_common::config::Config;
 use slate_rpc::{Rpc, SlateRpcServer};
 use slate_store::ClickHouseClient;
-use tokio::main;
 
+#[derive(Parser)]
+struct Args {
+    /// Path to the config file.
+    #[arg(long, default_value = "slate.toml")]
+    config: String,
+}
 
-#[main]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store = ClickHouseClient::new("http://localhost:8123");
-    // 8899 = Solana's standard RPC port. (Not 9000 — that's ClickHouse's native TCP port,
-    // which docker-compose maps to the host, so binding 9000 collides with ClickHouse.)
-    let server = jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:8899").await?;
+    let args = Args::parse();
+    let cfg = Config::load(&args.config)?;
+
+    let store = ClickHouseClient::with_config(
+        &cfg.clickhouse.url,
+        &cfg.clickhouse.database,
+        &cfg.clickhouse.user,
+        &cfg.clickhouse.password,
+    );
+
+    // 8899 = Solana's standard RPC port by default (see slate.toml [rpc].bind). Not 9000 — that's
+    // ClickHouse's native TCP port, which docker-compose maps to the host.
+    let server = jsonrpsee::server::ServerBuilder::default()
+        .build(cfg.rpc.bind.as_str())
+        .await?;
     let handle = server.start(Rpc { store }.into_rpc());
 
     handle.stopped().await;

@@ -8,6 +8,8 @@ edition = "2024"
 jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }
 
 slate-store = { path = "../slate-store" }
+slate-common = { path = "../slate-common" }
+clap = { workspace = true }
 
 # Agave-compatible response shaping (matches Cloudbreak crates/api). These replace the old
 # hand-rolled response struct + bs58/base64: solana-pubkey does base58, encode_ui_account does base64.

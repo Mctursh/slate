@@ -1,6 +1,7 @@
 /target
 /dev-snapshot
 /dev
+/slate.toml
 SPEC.md
 TASKS.md
 # /dev/*.dylib

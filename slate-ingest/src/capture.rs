@@ -269,10 +269,10 @@ mod tests {
     /// pubkeys (0xA1/0xA2/0xA3) don't collide with the store's X/Y/Z fixtures.
     #[tokio::test]
     async fn commits_on_finalize_and_drops_dead_fork() {
-        let mut cap = Capturer::new(ClickHouseClient::new("http://localhost:8123"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
         cap.run(mock_stream()).await.unwrap();
 
-        let store = ClickHouseClient::new("http://localhost:8123");
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
 
         // A1 finalized twice: at 100 (lamports 5) then at 150 (lamports 6).
         let a1_at_100 = store
@@ -322,10 +322,10 @@ mod tests {
     async fn gap_makes_post_gap_reads_untrusted() {
         use slate_store::Fidelity;
 
-        let mut cap = Capturer::new(ClickHouseClient::new("http://localhost:8123"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
         cap.run(mock_stream_with_gap()).await.unwrap();
 
-        let store = ClickHouseClient::new("http://localhost:8123");
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
 
         // as-of 120: resolves to the slot-100 write, and (100,120] is inside segment [100,150].
         let ans = store.get_account_info_as_of(&pk(0xB1), 120).await.unwrap();
@@ -365,7 +365,7 @@ mod tests {
     async fn baseline_makes_untouched_and_absent_accounts_answerable() {
         use slate_store::{AccountUpdateInsert, Fidelity};
 
-        let store = ClickHouseClient::new("http://localhost:8123");
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
 
         // Synthetic baseline: the full account set stamped at S_snap = 10 (what the snapshot
         // loader will do next), plus coverage marking slot 10 captured. Stamping every baseline
@@ -389,7 +389,7 @@ mod tests {
         // Stream forward FROM the baseline: D1 rewritten to 150 at slot 50 extends coverage to one
         // contiguous segment [10, 50]. D2 is never touched again.
         let mut cap =
-            Capturer::from_baseline(ClickHouseClient::new("http://localhost:8123"), 10);
+            Capturer::from_baseline(ClickHouseClient::with_database("http://localhost:8123", "slate_test"), 10);
         cap.run(vec![
             StreamEvent::Account(AccountWrite {
                 pubkey: pk(0xD1),
@@ -454,7 +454,7 @@ mod tests {
     /// arrives after the gap there's nothing to commit. Uses 0xE9 @ slot 900, its own.
     #[tokio::test]
     async fn gap_drops_unfinalized_buffered_writes() {
-        let mut cap = Capturer::new(ClickHouseClient::new("http://localhost:8123"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
         cap.run(vec![
             // written at 900, NOT yet finalized -> sits in the buffer
             StreamEvent::Account(AccountWrite {
@@ -480,7 +480,7 @@ mod tests {
         .unwrap();
 
         // The write was dropped by the Gap, so the post-gap finalize committed nothing.
-        let store = ClickHouseClient::new("http://localhost:8123");
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
         assert!(
             store.get_account_info(&pk(0xE9), 1000).await.unwrap().is_none(),
             "Gap must drop buffered un-finalized writes"

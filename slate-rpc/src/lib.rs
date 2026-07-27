@@ -235,7 +235,7 @@ mod tests {
     /// Uses 0xF1/0xF2 (seeded) and 0xF9 (never seeded) so it doesn't collide with other fixtures.
     #[tokio::test]
     async fn get_multiple_accounts_shape() {
-        let store = ClickHouseClient::new("http://localhost:8123");
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
         let row = |first: u8, lamports: u64| AccountUpdateInsert {
             pubkey: pk(first),
             slot: 100,
@@ -277,7 +277,7 @@ mod tests {
     /// order, ending when next_cursor comes back null. Owner 0x77 + accounts 0x71..0x75 are its own.
     #[tokio::test]
     async fn get_program_accounts_paginates_via_cursor() {
-        let seed = ClickHouseClient::new("http://localhost:8123");
+        let seed = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
         let row = |first: u8| AccountUpdateInsert {
             pubkey: pk(first),
             slot: 100,
@@ -293,7 +293,7 @@ mod tests {
             .unwrap();
 
         let rpc = Rpc {
-            store: ClickHouseClient::new("http://localhost:8123"),
+            store: ClickHouseClient::with_database("http://localhost:8123", "slate_test"),
         };
         let owner = b58(0x77);
 

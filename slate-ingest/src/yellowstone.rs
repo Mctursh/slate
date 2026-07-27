@@ -61,8 +61,12 @@ fn map_status(raw: i32) -> Option<SlotStatus> {
     }
 }
 
-pub async fn connect_and_subscribe(cfg: &IngestConfig) -> anyhow::Result<GeyserStream> {
+pub async fn connect_and_subscribe(
+    cfg: &IngestConfig,
+    from_slot: Option<u64>,
+) -> anyhow::Result<GeyserStream> {
     let sub_request = SubscribeRequest {
+        from_slot,
         accounts: HashMap::from([(
             "accounts".into(),
             SubscribeRequestFilterAccounts {
@@ -96,21 +100,30 @@ pub async fn connect_and_subscribe(cfg: &IngestConfig) -> anyhow::Result<GeyserS
     Ok(stream)
 }
 
-pub async fn run(cfg: &IngestConfig, capturer: &mut Capturer) -> anyhow::Result<()> {
+pub async fn run(
+    cfg: &IngestConfig,
+    capturer: &mut Capturer,
+    from_slot: Option<u64>,
+) -> anyhow::Result<()> {
     let mut connected_before = false;
+    let mut next_from_slot = from_slot;
     loop {
         if connected_before {
             capturer.handle_event(StreamEvent::Gap).await?;
         }
         connected_before = true;
-
-        drive_stream(cfg, capturer).await?;
+        drive_stream(cfg, capturer, next_from_slot).await?;
+        next_from_slot = None;
         tokio::time::sleep(RECONNECT_BACKOFF).await;
     }
 }
 
-async fn drive_stream(cfg: &IngestConfig, capturer: &mut Capturer) -> anyhow::Result<()> {
-    let mut stream = match connect_and_subscribe(cfg).await {
+async fn drive_stream(
+    cfg: &IngestConfig,
+    capturer: &mut Capturer,
+    from_slot: Option<u64>,
+) -> anyhow::Result<()> {
+    let mut stream = match connect_and_subscribe(cfg, from_slot).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("connect failed: {e:#} — retrying");

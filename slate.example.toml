@@ -1,0 +1,25 @@
+# Slate configuration. Copy to slate.toml and edit — slate.toml is gitignored, so the token you
+# put there never lands in git. This committed example carries only a placeholder. You can also
+# set GRPC_TOKEN in the env to override [ingest].x-token (handy for CI/containers).
+
+[clickhouse]
+url = "http://localhost:8123"
+database = "slate"
+user = "slate"
+password = "slate"
+
+[ingest]
+# Yellowstone gRPC (Dragon's Mouth) endpoint for the live stream.
+grpc-endpoint = "https://laserstream-devnet-ewr.helius-rpc.com"
+# The program whose accounts Slate captures (owner scope).
+program = "SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy"
+# gRPC auth token (also the default baseline-RPC api key). Put the real value in your gitignored
+# slate.toml. GRPC_TOKEN env overrides this.
+x-token = "<YOUR_GRPC_TOKEN>"
+# JSON-RPC endpoint for the getProgramAccounts baseline. Optional — if omitted, defaults to the
+# Helius devnet RPC built from GRPC_TOKEN. Set it (api key in the URL) to use another provider:
+# baseline-rpc = "https://<name>.solana-devnet.quiknode.pro/<key>/"
+
+[rpc]
+# Address the JSON-RPC server binds to.
+bind = "127.0.0.1:8899"
