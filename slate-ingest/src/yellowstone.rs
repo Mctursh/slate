@@ -16,7 +16,6 @@ pub struct IngestConfig {
     pub endpoint: String,
     pub x_token: Option<String>,
     pub owners: Vec<String>,
-    // pub commitment: Commitmewnt
 }
 
 pub fn adapt(update: SubscribeUpdate) -> Option<StreamEvent> {
@@ -134,7 +133,8 @@ async fn drive_stream(
         match update {
             Ok(u) => {
                 if let Some(event) = adapt(u) {
-                    capturer.handle_event(event).await?; // propagate DB errors for now, to be handled in the store
+                    // Store errors are fatal; only stream errors (below) trigger a reconnect.
+                    capturer.handle_event(event).await?;
                 }
             }
             Err(status) => {
@@ -151,7 +151,6 @@ mod tests {
     use super::*;
     use yellowstone_grpc_proto::geyser::{SubscribeUpdateAccountInfo, SubscribeUpdatePing};
 
-    /// Wrap an UpdateOneof into a SubscribeUpdate (the rest of the fields default).
     fn update(oneof: UpdateOneof) -> SubscribeUpdate {
         SubscribeUpdate {
             update_oneof: Some(oneof),

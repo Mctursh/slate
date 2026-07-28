@@ -5,7 +5,6 @@ use slate_store::ClickHouseClient;
 
 #[derive(Parser)]
 struct Args {
-    /// Path to the config file.
     #[arg(long, default_value = "slate.toml")]
     config: String,
 }
@@ -22,8 +21,6 @@ async fn main() -> anyhow::Result<()> {
         &cfg.clickhouse.password,
     );
 
-    // 8899 = Solana's standard RPC port by default (see slate.toml [rpc].bind). Not 9000 — that's
-    // ClickHouse's native TCP port, which docker-compose maps to the host.
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(cfg.rpc.bind.as_str())
         .await?;

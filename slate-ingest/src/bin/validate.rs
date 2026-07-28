@@ -1,15 +1,3 @@
-//! validate — run the differential correctness harness against a running Slate.
-//!
-//! Prereq: `live` is already ingesting the SAME program into the configured ClickHouse. This tool
-//! reads an independent reference RPC and Slate's store, waits for Slate to capture through the
-//! reference's finalized slot, and diffs Slate's now-historical answer against it.
-//!
-//! Usage:
-//!   REFERENCE_RPC=<url> cargo run -p slate-ingest --bin validate -- <program_pubkey> [--config slate.toml]
-//!
-//! Use a REFERENCE_RPC that did NOT seed Slate's baseline, or the unchanged accounts match
-//! trivially and prove nothing. Exit code is non-zero on any mismatch, so it's CI-able.
-
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -23,9 +11,7 @@ const COVERAGE_WAIT_SECS: u64 = 120;
 
 #[derive(Parser)]
 struct Args {
-    /// The program (owner) pubkey to validate, base58.
     program: String,
-    /// Path to the config file.
     #[arg(long, default_value = "slate.toml")]
     config: String,
 }
@@ -45,11 +31,9 @@ async fn main() -> anyhow::Result<()> {
         &cfg.clickhouse.password,
     );
 
-    // 1. Oracle: the reference RPC's view of the program at its current finalized slot.
     let (s1, oracle) = fetch_oracle(&rpc_url, &args.program).await?;
     println!("oracle: {} accounts at finalized slot {s1}", oracle.len());
 
-    // 2. Wait until Slate has captured through S1, so we're asking about a slot in its past.
     println!("waiting for Slate to cover slot {s1} ...");
     let mut waited = 0u64;
     while !store.is_covered(s1, s1).await? {
@@ -68,11 +52,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 3. Slate's answer for the same program, as-of the now-historical slot S1.
     let (fidelity, slate) = fetch_slate(&store, &program_bytes, s1).await?;
 
-    // Respect Slate's own honesty flag: Uncertain means a coverage gap straddles S1, so a mismatch
-    // there would be Slate correctly refusing to vouch, not a data bug. Don't score it.
     if fidelity != Fidelity::Exact {
         println!("\nSlate reports fidelity Uncertain for slot {s1} (a coverage gap straddles it).");
         println!(
@@ -81,7 +62,6 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 4. Diff.
     let report = diff(&oracle, &slate);
     println!(
         "\ncompared {} oracle accounts against Slate as-of {s1}",

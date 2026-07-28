@@ -1,17 +1,3 @@
-//! validate — differential correctness harness.
-//!
-//! Slate's marquee claim is answering for a *past* slot, which a live RPC can't check directly (it
-//! forgot). So we borrow the Cloudbreak/Superbank pattern — diff against a reference RPC — and add
-//! a time twist: read a program's full account set from an independent RPC at its current finalized
-//! slot `S1`, wait until Slate has captured *past* `S1`, then ask Slate for the same program as-of
-//! `S1`. If Slate's live-captured reconstruction of a now-historical slot matches an RPC that never
-//! fed it, the ingest pipeline is correct. No snapshot, no data download — just a reference RPC.
-//!
-//! `rent_epoch` is deliberately NOT part of the pass/fail check: it's a vestigial field (`u64::MAX`
-//! for rent-exempt accounts) that providers report inconsistently, and Slate stores whatever its
-//! source hands it — so a difference reflects provider disagreement, not a Slate bug. We tally it
-//! separately for transparency instead of failing on it.
-
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -20,8 +6,6 @@ use base64::Engine;
 use slate_store::{ClickHouseClient, Fidelity};
 use solana_pubkey::Pubkey;
 
-/// The normalized account state both sides reduce to, so the oracle and Slate are directly
-/// comparable regardless of wire shape.
 #[derive(Debug, Clone)]
 pub struct AcctState {
     pub owner: [u8; 32],
@@ -31,9 +15,6 @@ pub struct AcctState {
     pub data: Vec<u8>,
 }
 
-/// Fetch every account owned by `program` from the reference RPC as of its current finalized slot.
-/// Returns that slot (`S1`) and the accounts keyed by pubkey. This is the independent oracle — an
-/// RPC that has never seen Slate's data. Use one that did NOT seed Slate's baseline.
 pub async fn fetch_oracle(
     rpc_url: &str,
     program: &str,
@@ -42,8 +23,7 @@ pub async fn fetch_oracle(
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getProgramAccounts",
-        // base64 (not base64+zstd): zstd is non-deterministic across implementations and would
-        // false-positive on every account. finalized + withContext so we get the exact slot.
+        // base64 not base64+zstd: zstd is non-deterministic and would false-positive every account
         "params": [program, { "encoding": "base64", "commitment": "finalized", "withContext": true }],
     });
 
@@ -84,8 +64,6 @@ pub async fn fetch_oracle(
     Ok((s1, map))
 }
 
-/// Ask Slate for the same program as-of slot `s1`, reshaped into the comparable map, plus the
-/// fidelity Slate assigns to that answer (the caller respects it — see the bin).
 pub async fn fetch_slate(
     store: &ClickHouseClient,
     program: &[u8; 32],
@@ -108,14 +86,10 @@ pub async fn fetch_slate(
     Ok((answer.fidelity, map))
 }
 
-/// A single disagreement between the oracle and Slate.
 #[derive(Debug)]
 pub enum Diff {
-    /// In the reference RPC but absent from Slate — a write Slate missed.
     MissingInSlate([u8; 32]),
-    /// In Slate but absent from the reference RPC — Slate is holding stale/extra state.
     ExtraInSlate([u8; 32]),
-    /// Both have it, but a field disagrees.
     Field {
         pubkey: [u8; 32],
         field: &'static str,
@@ -124,16 +98,12 @@ pub enum Diff {
     },
 }
 
-/// The outcome of a diff. `diffs` is the pass/fail set (never includes `rent_epoch`);
-/// `rent_epoch_diffs` counts accounts that disagreed only on the vestigial field, for transparency.
 pub struct DiffReport {
     pub diffs: Vec<Diff>,
     pub rent_epoch_diffs: usize,
     pub compared: usize,
 }
 
-/// Diff two account sets (order-agnostic — keyed by pubkey). Compares owner, lamports, executable,
-/// and data exactly; `rent_epoch` is only tallied, never failed on.
 pub fn diff(
     oracle: &HashMap<[u8; 32], AcctState>,
     slate: &HashMap<[u8; 32], AcctState>,
@@ -178,7 +148,6 @@ pub fn diff(
                 slate: format!("{} bytes [{}…]", s.data.len(), hex8(&s.data)),
             });
         }
-        // rent_epoch: informational only, never a failure (see module docs).
         if o.rent_epoch != s.rent_epoch {
             rent_epoch_diffs += 1;
         }
@@ -228,25 +197,22 @@ mod tests {
         }
     }
 
-    /// The three failure shapes: an account only the oracle has, one only Slate has, and one both
-    /// have but whose data disagrees.
     #[test]
     fn diff_flags_missing_extra_and_field() {
         let mut oracle = HashMap::new();
-        oracle.insert(pk(1), st(10, b"a")); // matches
-        oracle.insert(pk(2), st(20, b"b")); // missing in slate
-        oracle.insert(pk(3), st(30, b"c")); // data differs
+        oracle.insert(pk(1), st(10, b"a"));
+        oracle.insert(pk(2), st(20, b"b"));
+        oracle.insert(pk(3), st(30, b"c"));
         let mut slate = HashMap::new();
         slate.insert(pk(1), st(10, b"a"));
         slate.insert(pk(3), st(30, b"DIFFERENT"));
-        slate.insert(pk(4), st(40, b"d")); // extra in slate
+        slate.insert(pk(4), st(40, b"d"));
 
         let r = diff(&oracle, &slate);
         assert_eq!(r.compared, 3);
         assert_eq!(r.diffs.len(), 3, "one missing, one field, one extra");
     }
 
-    /// A rent_epoch-only difference must never fail the run, but must be counted.
     #[test]
     fn rent_epoch_never_fails_but_is_counted() {
         let mut oracle = HashMap::new();

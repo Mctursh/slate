@@ -1,8 +1,3 @@
-//! snapshot loader — load a Solana snapshot's accounts (filtered by owner) into Slate as a
-//! baseline. A dev/bootstrap tool; the live path is the `live` binary.
-//!
-//!   cargo run -p slate-ingest -- <snapshot_accounts_dir> [--owner <base58>] [--config slate.toml]
-
 use std::str::FromStr;
 
 use clap::Parser;
@@ -13,12 +8,9 @@ use solana_pubkey::Pubkey;
 
 #[derive(Parser)]
 struct Args {
-    /// Directory of snapshot account files (named `<slot>.<id>`).
     snapshot_dir: String,
-    /// Owner (program) pubkey to filter to, base58. Defaults to the System program.
     #[arg(long, default_value = "11111111111111111111111111111111")]
     owner: String,
-    /// Path to the config file.
     #[arg(long, default_value = "slate.toml")]
     config: String,
 }

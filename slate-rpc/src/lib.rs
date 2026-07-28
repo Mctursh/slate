@@ -1,10 +1,3 @@
-//! slate-rpc — HTTP JSON-RPC server exposing the historical account store in Agave's shape.
-//!
-//! jsonrpsee is the transport (server + `{jsonrpc,id,result/error}` envelope + error type).
-//! The Solana crates produce the exact payloads: `encode_ui_account` -> `UiAccount` (the
-//! `value` object, base64 data, camelCase, `space`, etc.), and `Response`/`RpcResponseContext`
-//! give the `{context, value}` wrapper. Reference: cloudbreak crates/api/src/methods.
-
 use jsonrpsee::{
     core::{RpcResult, async_trait},
     proc_macros::rpc,
@@ -153,8 +146,6 @@ impl SlateRpcServer for Rpc {
     }
 }
 
-/// Build the Agave `{ context: { slot, fidelity }, value }` envelope shared by every read method.
-/// The paginated scan splices `next_cursor` into `context` afterward.
 fn respond<T: serde::Serialize>(
     slot: u64,
     value: T,
@@ -175,7 +166,6 @@ fn internal(msg: &'static str) -> ErrorObject<'static> {
     ErrorObject::owned(-32603, msg, None::<()>)
 }
 
-/// Map stored accounts to Agave's keyed-account array (`[{ pubkey, account }]`).
 fn keyed(accounts: Vec<AccountUpdate>) -> Vec<RpcKeyedAccount> {
     accounts
         .into_iter()
@@ -186,7 +176,6 @@ fn keyed(accounts: Vec<AccountUpdate>) -> Vec<RpcKeyedAccount> {
         .collect()
 }
 
-/// Map a stored account to Agave's `UiAccount` (base64 encoding for now).
 fn encode(a: &AccountUpdate) -> UiAccount {
     let account = Account {
         lamports: a.lamports,
@@ -204,7 +193,6 @@ fn encode(a: &AccountUpdate) -> UiAccount {
     )
 }
 
-/// base58 string -> 32-byte key, validated by solana-pubkey.
 fn decode_pubkey(s: String) -> RpcResult<[u8; 32]> {
     let pk: Pubkey = s
         .parse()
@@ -230,9 +218,6 @@ mod tests {
         Pubkey::from(pk(first)).to_string()
     }
 
-    /// getMultipleAccounts must return accounts in input order, `null` in place for ones that
-    /// don't exist, and a `context.fidelities` array parallel to `value`. Needs ClickHouse up.
-    /// Uses 0xF1/0xF2 (seeded) and 0xF9 (never seeded) so it doesn't collide with other fixtures.
     #[tokio::test]
     async fn get_multiple_accounts_shape() {
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
@@ -252,7 +237,6 @@ mod tests {
             .unwrap();
 
         let rpc = Rpc { store };
-        // Middle key doesn't exist -> null in the middle of the array.
         let v = rpc
             .get_multiple_accounts(vec![b58(0xF1), b58(0xF9), b58(0xF2)], 200)
             .await
@@ -264,7 +248,6 @@ mod tests {
         assert!(value[1].is_null(), "missing account is null in place");
         assert_eq!(value[2]["lamports"], 222);
 
-        // Fidelities run parallel to value: one per requested key, same order.
         let fids = v["context"]["fidelities"]
             .as_array()
             .expect("context.fidelities is an array");
@@ -272,9 +255,6 @@ mod tests {
         assert_eq!(v["context"]["slot"], 200);
     }
 
-    /// Paginated getProgramAccounts must thread the base58 cursor across the wire: each page's
-    /// context.next_cursor feeds the next call, and the walk covers the whole set once, in pubkey
-    /// order, ending when next_cursor comes back null. Owner 0x77 + accounts 0x71..0x75 are its own.
     #[tokio::test]
     async fn get_program_accounts_paginates_via_cursor() {
         let seed = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
@@ -297,7 +277,6 @@ mod tests {
         };
         let owner = b58(0x77);
 
-        // Walk pages of 2 through the RPC layer, threading the base58 next_cursor until it's null.
         let mut walked: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
@@ -310,11 +289,10 @@ mod tests {
             }
             match v["context"]["next_cursor"].as_str() {
                 Some(c) => cursor = Some(c.to_string()),
-                None => break, // null -> last page
+                None => break,
             }
         }
 
-        // The whole set, once, in pubkey (byte) order.
         assert_eq!(
             walked,
             vec![b58(0x71), b58(0x72), b58(0x73), b58(0x74), b58(0x75)]

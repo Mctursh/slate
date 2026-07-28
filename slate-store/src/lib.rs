@@ -28,11 +28,6 @@ pub struct AccountUpdateInsert {
     pub data: Vec<u8>,
 }
 
-// #[derive(Serialize, Row)]
-// pub struct CoverageRow {
-//     segment_lo: u64,
-//     segment_hi: u64
-// }
 #[derive(Debug, PartialEq, Serialize)]
 pub enum Fidelity {
     Exact,
@@ -65,14 +60,10 @@ impl ClickHouseClient {
         Self::with_config(url, "slate", "slate", "slate")
     }
 
-    /// Same as `new`, but targets an explicit database. Tests use this to point at `slate_test`
-    /// so the suite can never write into the serving `slate` database (which would drag the
-    /// coverage floor down and make live scans read Uncertain).
     pub fn with_database(url: &str, database: &str) -> Self {
         Self::with_config(url, database, "slate", "slate")
     }
 
-    /// Full constructor: URL, database, and credentials.
     pub fn with_config(url: &str, database: &str, user: &str, password: &str) -> Self {
         let client = clickhouse::Client::default()
             .with_url(url)
@@ -269,9 +260,6 @@ impl ClickHouseClient {
         Ok(floor)
     }
 
-    /// Highest slot captured across all coverage segments (the "tip"). `None` when nothing is
-    /// captured yet. Mirrors `earliest_covered`; the validation harness uses it to show how far
-    /// behind the tip a queried slot has fallen.
     pub async fn latest_covered(&self) -> StoreResult<Option<u64>> {
         let query = "SELECT segment_hi FROM coverage ORDER BY segment_hi DESC LIMIT 1";
         let tip = self.client.query(query).fetch_optional::<u64>().await?;
@@ -293,8 +281,6 @@ impl ClickHouseClient {
 mod tests {
     use super::*;
 
-    /// A 32-byte pubkey whose first byte is `first` and the rest zeros,
-    /// matching the seed data (e.g. unhex('11' || repeat('00',31))).
     fn pk(first: u8) -> [u8; 32] {
         let mut a = [0u8; 32];
         a[0] = first;
@@ -305,9 +291,6 @@ mod tests {
         ClickHouseClient::with_database("http://localhost:8123", "slate_test")
     }
 
-    /// Seed the canonical X/Y/Z dataset through the real insert path so the tests are
-    /// self-contained rather than depending on manually-seeded rows. Idempotent:
-    /// ReplacingMergeTree collapses identical rows, so calling it every test is safe.
     async fn seed_test_accounts() {
         fn row(
             pubkey: [u8; 32],
@@ -329,14 +312,11 @@ mod tests {
             }
         }
         let rows = vec![
-            // X (0x11): three versions, always owned by P1 (0xAA)
             row(pk(0x11), 100, 1, pk(0xAA), 5, b"x-v1"),
             row(pk(0x11), 150, 2, pk(0xAA), 6, b"x-v2"),
             row(pk(0x11), 200, 3, pk(0xAA), 4, b"x-v3"),
-            // Y (0x22): P1, then reassigned to P2 (0xBB) at slot 180
             row(pk(0x22), 120, 10, pk(0xAA), 9, b"y-early"),
             row(pk(0x22), 180, 11, pk(0xBB), 9, b"y-moved"),
-            // Z (0x33): alive under P1, then closed at 170 (0 lamports, owner reset to system)
             row(pk(0x33), 130, 20, pk(0xAA), 7, b"z-alive"),
             row(pk(0x33), 170, 21, pk(0x00), 0, b""),
         ];
@@ -346,7 +326,6 @@ mod tests {
             .expect("seeding test accounts failed");
     }
 
-    /// Sorted pubkeys returned by a program scan, for order-independent comparison.
     async fn scanned_pubkeys(owner: [u8; 32], slot: u64) -> StoreResult<Vec<[u8; 32]>> {
         let mut keys: Vec<[u8; 32]> = store()
             .get_program_accounts(&owner, slot)
@@ -358,8 +337,6 @@ mod tests {
         Ok(keys)
     }
 
-    // ---- point lookup (get_account_info) ----
-
     #[tokio::test]
     async fn point_lookup_returns_latest_version_at_slot() {
         seed_test_accounts().await;
@@ -368,7 +345,7 @@ mod tests {
             .await
             .unwrap()
             .expect("X exists at 175");
-        assert_eq!(acct.lamports, 6); // the slot-150 version
+        assert_eq!(acct.lamports, 6);
         assert_eq!(acct.data, b"x-v2");
     }
 
@@ -380,7 +357,7 @@ mod tests {
             .await
             .unwrap()
             .expect("X exists at 250");
-        assert_eq!(acct.lamports, 4); // the slot-200 version
+        assert_eq!(acct.lamports, 4);
         assert_eq!(acct.data, b"x-v3");
     }
 
@@ -396,12 +373,9 @@ mod tests {
         );
     }
 
-    // ---- program scan (get_program_accounts) ----
-
     #[tokio::test]
     async fn scan_includes_owned_alive_accounts() {
         seed_test_accounts().await;
-        // At slot 150: X owned by P1, Y still under P1, Z still alive under P1.
         assert_eq!(
             scanned_pubkeys(pk(0xAA), 150).await.unwrap(),
             vec![pk(0x11), pk(0x22), pk(0x33)]
@@ -411,7 +385,6 @@ mod tests {
     #[tokio::test]
     async fn scan_excludes_moved_and_closed_accounts() {
         seed_test_accounts().await;
-        // At slot 200: Y moved to P2 (180), Z closed (170). Only X remains under P1.
         assert_eq!(
             scanned_pubkeys(pk(0xAA), 200).await.unwrap(),
             vec![pk(0x11)]
@@ -421,7 +394,6 @@ mod tests {
     #[tokio::test]
     async fn scan_finds_account_under_new_owner() {
         seed_test_accounts().await;
-        // Y moved to P2 at slot 180, so P2 owns it at slot 200.
         assert_eq!(
             scanned_pubkeys(pk(0xBB), 200).await.unwrap(),
             vec![pk(0x22)]
@@ -431,17 +403,14 @@ mod tests {
     #[tokio::test]
     async fn coverage_only_matches_spans_inside_a_segment() {
         store().record_coverage(100, 150).await.unwrap();
-        assert!(store().is_covered(120, 140).await.unwrap()); // fully inside [100,150]
-        assert!(!store().is_covered(120, 200).await.unwrap()); // 200 is past hi
-        assert!(!store().is_covered(90, 140).await.unwrap()); // 90 is below lo
+        assert!(store().is_covered(120, 140).await.unwrap());
+        assert!(!store().is_covered(120, 200).await.unwrap());
+        assert!(!store().is_covered(90, 140).await.unwrap());
     }
 
     #[tokio::test]
     async fn program_scan_carries_fidelity() {
         seed_test_accounts().await;
-        // Scan far past any coverage we have. The result set can't be vouched for: a gap could
-        // hide an account we'd never even list, so no per-account check would catch it. The
-        // accounts still come back, but the whole result is flagged Uncertain.
         let res = store()
             .get_program_accounts_as_of(&pk(0xAA), 10_000_000)
             .await
@@ -456,9 +425,6 @@ mod tests {
         );
     }
 
-    /// Keyset pagination over a frozen slot must walk the whole set exactly once — same order as
-    /// the full scan, no dupes, no gaps — with next_cursor threading to the end. Owner 0xE0 and
-    /// accounts 0xE1..0xE5 are this test's own (pubkey byte-order is E1 < E2 < ... < E5).
     #[tokio::test]
     async fn pagination_walks_the_whole_set_once() {
         let store = store();
@@ -477,7 +443,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Ground truth: the full scan, sorted by pubkey.
         let mut full: Vec<[u8; 32]> = store
             .get_program_accounts(&pk(0xE0), 200)
             .await
@@ -487,7 +452,6 @@ mod tests {
             .collect();
         full.sort();
 
-        // Walk pages of 2, threading next_cursor until it comes back None.
         let mut walked: Vec<[u8; 32]> = Vec::new();
         let mut cursor: Option<[u8; 32]> = None;
         for _ in 0..10 {
@@ -502,7 +466,6 @@ mod tests {
             }
         }
 
-        // The paged walk equals the full set: in pubkey order, no dupes, no gaps.
         assert_eq!(walked, full);
         assert_eq!(walked.len(), 5);
     }
