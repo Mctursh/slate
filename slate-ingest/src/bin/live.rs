@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
         endpoint: ingest.grpc_endpoint.clone(),
         x_token: token.clone(),
         owners: vec![ingest.program.clone()],
+        max_decoding_bytes: ingest.grpc_max_decoding_bytes,
     };
 
     let store = ClickHouseClient::with_config(

@@ -16,6 +16,7 @@ pub struct IngestConfig {
     pub endpoint: String,
     pub x_token: Option<String>,
     pub owners: Vec<String>,
+    pub max_decoding_bytes: usize,
 }
 
 pub fn adapt(update: SubscribeUpdate) -> Option<StreamEvent> {
@@ -87,6 +88,7 @@ pub async fn connect_and_subscribe(
     let mut builder = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone())?
         .x_token(cfg.x_token.clone())?
         .connect_timeout(Duration::from_secs(10)) // don't hang forever dialing a dead endpoint
+        .max_decoding_message_size(cfg.max_decoding_bytes) // mainnet accounts exceed the 4 MB default
         .http2_keep_alive_interval(Duration::from_secs(10)) // ping the server every 10s
         .keep_alive_timeout(Duration::from_secs(5)) // no pong in 5s -> connection is dead
         .keep_alive_while_idle(true); // ping even when no data is flowing

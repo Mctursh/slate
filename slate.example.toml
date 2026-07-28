@@ -10,6 +10,8 @@ password = "slate"
 [ingest]
 # Yellowstone gRPC endpoint for the live stream.
 grpc-endpoint = "https://your-grpc-endpoint:443"
+# Max gRPC message to decode, in bytes. Defaults to 64 MiB; raise it if a program has larger accounts.
+grpc-max-decoding-bytes = 67108864
 # The program whose accounts Slate captures (owner scope).
 program = "SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy"
 # gRPC auth token. GRPC_TOKEN env overrides this.

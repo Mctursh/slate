@@ -27,6 +27,8 @@ pub struct Clickhouse {
 pub struct Ingest {
     #[serde(rename = "grpc-endpoint")]
     pub grpc_endpoint: String,
+    #[serde(rename = "grpc-max-decoding-bytes", default = "default_grpc_max_decoding_bytes")]
+    pub grpc_max_decoding_bytes: usize,
     pub program: String,
     // GRPC_TOKEN env overrides this
     #[serde(rename = "x-token", default)]
@@ -74,4 +76,7 @@ fn default_slate() -> String {
 }
 fn default_bind() -> String {
     "127.0.0.1:8899".into()
+}
+fn default_grpc_max_decoding_bytes() -> usize {
+    64 * 1024 * 1024
 }
