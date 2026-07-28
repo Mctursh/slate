@@ -1,8 +1,12 @@
 # Slate
 
+[![CI](https://github.com/Mctursh/slate/actions/workflows/ci.yml/badge.svg)](https://github.com/Mctursh/slate/actions/workflows/ci.yml)
+
 Historical Solana account state, queryable at any past slot.
 
 A normal Solana RPC answers "what does account X look like now." Slate answers "what did account X look like at slot N," for a slot in the past. That history isn't archived anywhere you can query today. Full snapshots are periodic and huge, and the per-slot account writes that flow past on Yellowstone gRPC get dropped once they finalize. Slate captures those writes, keeps them in ClickHouse keyed by (pubkey, slot), and serves them back through the standard Solana JSON-RPC methods with an as-of-slot argument.
+
+Slate is open source and self-hostable. You run it, point it at the program you want to capture, and the data and the source are yours.
 
 > Slate is licensed under AGPL-3.0-only (see `LICENSE`).
 
