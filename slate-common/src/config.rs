@@ -27,7 +27,10 @@ pub struct Clickhouse {
 pub struct Ingest {
     #[serde(rename = "grpc-endpoint")]
     pub grpc_endpoint: String,
-    #[serde(rename = "grpc-max-decoding-bytes", default = "default_grpc_max_decoding_bytes")]
+    #[serde(
+        rename = "grpc-max-decoding-bytes",
+        default = "default_grpc_max_decoding_bytes"
+    )]
     pub grpc_max_decoding_bytes: usize,
     pub program: String,
     // GRPC_TOKEN env overrides this
@@ -45,8 +48,9 @@ pub struct Rpc {
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {path} (copy slate.example.toml to slate.toml)"))?;
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!("reading config file {path} (copy slate.example.toml to slate.toml)")
+        })?;
         toml::from_str(&text).with_context(|| format!("parsing config file {path}"))
     }
 }
@@ -64,7 +68,9 @@ impl Default for Clickhouse {
 
 impl Default for Rpc {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 

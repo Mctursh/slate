@@ -89,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
                 field,
                 oracle,
                 slate,
-            } => println!("  {}  {field}: oracle={oracle}  slate={slate}", Pubkey::from(*pubkey)),
+            } => println!(
+                "  {}  {field}: oracle={oracle}  slate={slate}",
+                Pubkey::from(*pubkey)
+            ),
         }
     }
     if report.diffs.len() > 50 {

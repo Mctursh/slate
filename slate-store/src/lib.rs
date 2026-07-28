@@ -41,7 +41,7 @@ pub struct AccountAtSlot {
 
 pub struct ProgramAccountAtSlot {
     pub accounts: Vec<AccountUpdate>,
-    pub fidelity: Fidelity
+    pub fidelity: Fidelity,
 }
 
 pub struct ProgramAccountsPage {
@@ -53,7 +53,6 @@ pub struct ProgramAccountsPage {
 pub struct ClickHouseClient {
     client: clickhouse::Client,
 }
-
 
 impl ClickHouseClient {
     pub fn new(url: &str) -> Self {
@@ -72,7 +71,6 @@ impl ClickHouseClient {
             .with_password(password);
         ClickHouseClient { client }
     }
-
 
     pub async fn get_account_info(
         &self,
@@ -248,11 +246,15 @@ impl ClickHouseClient {
         Ok(AccountAtSlot { account, fidelity })
     }
 
-    pub async fn get_program_accounts_as_of(&self, owner: &[u8; 32], as_of_slot: u64) -> StoreResult<ProgramAccountAtSlot> {
+    pub async fn get_program_accounts_as_of(
+        &self,
+        owner: &[u8; 32],
+        as_of_slot: u64,
+    ) -> StoreResult<ProgramAccountAtSlot> {
         let accounts = self.get_program_accounts(owner, as_of_slot).await?;
         let fidelity = self.coverage_fidelity(as_of_slot).await?;
         Ok(ProgramAccountAtSlot { accounts, fidelity })
-    } 
+    }
 
     pub async fn earliest_covered(&self) -> StoreResult<Option<u64>> {
         let query = "SELECT segment_lo FROM coverage ORDER BY segment_lo LIMIT 1";
@@ -417,7 +419,11 @@ mod tests {
             .unwrap();
         let mut keys: Vec<[u8; 32]> = res.accounts.iter().map(|a| a.pubkey).collect();
         keys.sort();
-        assert_eq!(keys, vec![pk(0x11)], "only X is still under P1 at a high slot");
+        assert_eq!(
+            keys,
+            vec![pk(0x11)],
+            "only X is still under P1 at a high slot"
+        );
         assert_eq!(
             res.fidelity,
             Fidelity::Uncertain,

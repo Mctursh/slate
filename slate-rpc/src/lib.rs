@@ -29,8 +29,8 @@ pub trait SlateRpc {
         &self,
         owner: String,
         as_of_slot: u64,
-        limit: Option<u64>, 
-        cursor: Option<String>
+        limit: Option<u64>,
+        cursor: Option<String>,
     ) -> RpcResult<serde_json::Value>;
 
     #[method(name = "getBalance")]
@@ -71,7 +71,7 @@ impl SlateRpcServer for Rpc {
         owner: String,
         as_of_slot: u64,
         limit: Option<u64>,
-        cursor: Option<String>
+        cursor: Option<String>,
     ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(owner)?;
 

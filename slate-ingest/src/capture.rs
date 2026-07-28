@@ -49,7 +49,7 @@ impl Capturer {
             current_segment_lo: None,
         }
     }
-    
+
     pub fn from_baseline(store: ClickHouseClient, s_snap: u64) -> Self {
         Self {
             store,
@@ -246,7 +246,10 @@ mod tests {
 
     #[tokio::test]
     async fn commits_on_finalize_and_drops_dead_fork() {
-        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database(
+            "http://localhost:8123",
+            "slate_test",
+        ));
         cap.run(mock_stream()).await.unwrap();
 
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
@@ -292,21 +295,23 @@ mod tests {
     async fn gap_makes_post_gap_reads_untrusted() {
         use slate_store::Fidelity;
 
-        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database(
+            "http://localhost:8123",
+            "slate_test",
+        ));
         cap.run(mock_stream_with_gap()).await.unwrap();
 
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
 
         let ans = store.get_account_info_as_of(&pk(0xB1), 120).await.unwrap();
-        assert_eq!(
-            ans.account.expect("B1 exists as of slot 120").lamports,
-            5
-        );
+        assert_eq!(ans.account.expect("B1 exists as of slot 120").lamports, 5);
         assert_eq!(ans.fidelity, Fidelity::Exact, "120 is inside segment 1");
 
         let ans = store.get_account_info_as_of(&pk(0xB1), 300).await.unwrap();
         assert_eq!(
-            ans.account.expect("B1 still resolves as of slot 300").lamports,
+            ans.account
+                .expect("B1 still resolves as of slot 300")
+                .lamports,
             6,
             "we still return an answer..."
         );
@@ -317,10 +322,7 @@ mod tests {
         );
 
         let ans = store.get_account_info_as_of(&pk(0xB1), 520).await.unwrap();
-        assert_eq!(
-            ans.account.expect("B1 exists as of slot 520").lamports,
-            8
-        );
+        assert_eq!(ans.account.expect("B1 exists as of slot 520").lamports, 8);
         assert_eq!(ans.fidelity, Fidelity::Exact, "520 is inside segment 2");
     }
 
@@ -346,8 +348,10 @@ mod tests {
             .unwrap();
         store.record_coverage(10, 10).await.unwrap();
 
-        let mut cap =
-            Capturer::from_baseline(ClickHouseClient::with_database("http://localhost:8123", "slate_test"), 10);
+        let mut cap = Capturer::from_baseline(
+            ClickHouseClient::with_database("http://localhost:8123", "slate_test"),
+            10,
+        );
         cap.run(vec![
             StreamEvent::Account(AccountWrite {
                 pubkey: pk(0xD1),
@@ -370,7 +374,9 @@ mod tests {
 
         let ans = store.get_account_info_as_of(&pk(0xD2), 30).await.unwrap();
         assert_eq!(
-            ans.account.expect("D2 answerable from the baseline").lamports,
+            ans.account
+                .expect("D2 answerable from the baseline")
+                .lamports,
             200
         );
         assert_eq!(ans.fidelity, Fidelity::Exact);
@@ -402,7 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn gap_drops_unfinalized_buffered_writes() {
-        let mut cap = Capturer::new(ClickHouseClient::with_database("http://localhost:8123", "slate_test"));
+        let mut cap = Capturer::new(ClickHouseClient::with_database(
+            "http://localhost:8123",
+            "slate_test",
+        ));
         cap.run(vec![
             StreamEvent::Account(AccountWrite {
                 pubkey: pk(0xE9),
@@ -426,7 +435,11 @@ mod tests {
 
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
         assert!(
-            store.get_account_info(&pk(0xE9), 1000).await.unwrap().is_none(),
+            store
+                .get_account_info(&pk(0xE9), 1000)
+                .await
+                .unwrap()
+                .is_none(),
             "Gap must drop buffered un-finalized writes"
         );
     }

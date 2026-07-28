@@ -18,7 +18,9 @@ pub async fn read_snapshot_accounts(
     let mut s_snap: u64 = 0;
     for entry in read_dir(dir)? {
         let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         s_snap = s_snap.max(get_slot_from_filename(name)?);
     }
     if s_snap == 0 {
@@ -27,7 +29,9 @@ pub async fn read_snapshot_accounts(
 
     for entry in read_dir(dir)? {
         let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         // AppendVec deletes its backing file on Drop -> read a throwaway copy.
         let tmp = std::env::temp_dir().join(name);
         std::fs::copy(&path, &tmp)?;
@@ -63,7 +67,6 @@ pub async fn read_snapshot_accounts(
     store.record_coverage(s_snap, s_snap).await?;
     Ok(s_snap)
 }
-
 
 fn get_slot_from_filename(filename: &str) -> Result<u64, anyhow::Error> {
     let (slot, _id) = filename

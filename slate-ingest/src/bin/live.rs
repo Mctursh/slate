@@ -16,9 +16,13 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = Config::load(&args.config)?;
-    let ingest = cfg.ingest.context("config is missing the [ingest] section (required by `live`)")?;
+    let ingest = cfg
+        .ingest
+        .context("config is missing the [ingest] section (required by `live`)")?;
 
-    let token = std::env::var("GRPC_TOKEN").ok().or_else(|| ingest.x_token.clone());
+    let token = std::env::var("GRPC_TOKEN")
+        .ok()
+        .or_else(|| ingest.x_token.clone());
 
     let stream_cfg = IngestConfig {
         endpoint: ingest.grpc_endpoint.clone(),
