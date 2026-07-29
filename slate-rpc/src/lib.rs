@@ -3,6 +3,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::ErrorObject,
 };
+use serde::Deserialize;
 use slate_store::{
     AccountAtSlot, AccountUpdate, ClickHouseClient, Fidelity, ProgramAccountAtSlot,
     ProgramAccountsPage,
@@ -15,32 +16,60 @@ use solana_rpc_client_api::response::{
     Response as RpcResponse, RpcKeyedAccount, RpcResponseContext,
 };
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct AccountConfig {
+    pub as_of_slot: Option<u64>,
+    // standard Solana request fields: accepted so Solana clients work, not acted on yet
+    pub commitment: Option<serde_json::Value>,
+    pub encoding: Option<serde_json::Value>,
+    pub data_slice: Option<serde_json::Value>,
+    pub min_context_slot: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct ProgramAccountsConfig {
+    pub as_of_slot: Option<u64>,
+    pub limit: Option<u64>,
+    pub cursor: Option<String>,
+    // standard Solana request fields: accepted so Solana clients work, not acted on yet
+    pub commitment: Option<serde_json::Value>,
+    pub encoding: Option<serde_json::Value>,
+    pub data_slice: Option<serde_json::Value>,
+    pub min_context_slot: Option<serde_json::Value>,
+    pub filters: Option<serde_json::Value>,
+    pub with_context: Option<serde_json::Value>,
+}
+
 #[rpc(server)]
 pub trait SlateRpc {
     #[method(name = "getAccountInfo")]
     async fn get_account_info(
         &self,
         pubkey: String,
-        as_of_slot: u64,
+        config: Option<AccountConfig>,
     ) -> RpcResult<serde_json::Value>;
 
     #[method(name = "getProgramAccounts")]
     async fn get_program_accounts(
         &self,
         owner: String,
-        as_of_slot: u64,
-        limit: Option<u64>,
-        cursor: Option<String>,
+        config: Option<ProgramAccountsConfig>,
     ) -> RpcResult<serde_json::Value>;
 
     #[method(name = "getBalance")]
-    async fn get_balance(&self, pubkey: String, as_of_slot: u64) -> RpcResult<serde_json::Value>;
+    async fn get_balance(
+        &self,
+        pubkey: String,
+        config: Option<AccountConfig>,
+    ) -> RpcResult<serde_json::Value>;
 
     #[method(name = "getMultipleAccounts")]
     async fn get_multiple_accounts(
         &self,
         pubkeys: Vec<String>,
-        as_of_slot: u64,
+        config: Option<AccountConfig>,
     ) -> RpcResult<serde_json::Value>;
 
     #[method(name = "getCoverage")]
@@ -54,14 +83,32 @@ pub struct Rpc {
     pub store: ClickHouseClient,
 }
 
+impl Rpc {
+    async fn resolve_slot(&self, as_of_slot: Option<u64>) -> RpcResult<u64> {
+        match as_of_slot {
+            Some(slot) => Ok(slot),
+            // no captured slot yet: error like getFirstAvailableSlot instead of fabricating slot 0
+            None => self
+                .store
+                .latest_covered()
+                .await
+                .map_err(|_| internal("failed to query coverage"))?
+                .ok_or_else(no_coverage),
+        }
+    }
+}
+
 #[async_trait]
 impl SlateRpcServer for Rpc {
     async fn get_account_info(
         &self,
         pubkey: String,
-        as_of_slot: u64,
+        config: Option<AccountConfig>,
     ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(pubkey)?;
+        let as_of_slot = self
+            .resolve_slot(config.unwrap_or_default().as_of_slot)
+            .await?;
 
         let AccountAtSlot { account, fidelity } = self
             .store
@@ -75,13 +122,14 @@ impl SlateRpcServer for Rpc {
     async fn get_program_accounts(
         &self,
         owner: String,
-        as_of_slot: u64,
-        limit: Option<u64>,
-        cursor: Option<String>,
+        config: Option<ProgramAccountsConfig>,
     ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(owner)?;
+        let config = config.unwrap_or_default();
+        let as_of_slot = self.resolve_slot(config.as_of_slot).await?;
 
-        let Some(limit) = limit else {
+        // cursor is only honored with limit; without a limit we return the full unpaginated set
+        let Some(limit) = config.limit else {
             let ProgramAccountAtSlot { accounts, fidelity } = self
                 .store
                 .get_program_accounts_as_of(&key, as_of_slot)
@@ -90,7 +138,7 @@ impl SlateRpcServer for Rpc {
             return respond(as_of_slot, keyed(accounts), fidelity);
         };
 
-        let cursor = cursor.map(decode_pubkey).transpose()?;
+        let cursor = config.cursor.map(decode_pubkey).transpose()?;
         let ProgramAccountsPage {
             accounts,
             fidelity,
@@ -102,7 +150,7 @@ impl SlateRpcServer for Rpc {
             .map_err(|_| internal("failed to query program accounts"))?;
 
         let mut response = respond(as_of_slot, keyed(accounts), fidelity)?;
-        response["context"]["next_cursor"] =
+        response["context"]["nextCursor"] =
             to_value(next_cursor.map(|c| Pubkey::from(c).to_string()))?;
         Ok(response)
     }
@@ -110,8 +158,11 @@ impl SlateRpcServer for Rpc {
     async fn get_multiple_accounts(
         &self,
         pubkeys: Vec<String>,
-        as_of_slot: u64,
+        config: Option<AccountConfig>,
     ) -> RpcResult<serde_json::Value> {
+        let as_of_slot = self
+            .resolve_slot(config.unwrap_or_default().as_of_slot)
+            .await?;
         let keys = pubkeys
             .iter()
             .map(|k| decode_pubkey(k.to_string()))
@@ -139,8 +190,15 @@ impl SlateRpcServer for Rpc {
         Ok(response)
     }
 
-    async fn get_balance(&self, pubkey: String, as_of_slot: u64) -> RpcResult<serde_json::Value> {
+    async fn get_balance(
+        &self,
+        pubkey: String,
+        config: Option<AccountConfig>,
+    ) -> RpcResult<serde_json::Value> {
         let key = decode_pubkey(pubkey)?;
+        let as_of_slot = self
+            .resolve_slot(config.unwrap_or_default().as_of_slot)
+            .await?;
         let AccountAtSlot { account, fidelity } = self
             .store
             .get_account_info_as_of(&key, as_of_slot)
@@ -170,7 +228,10 @@ impl SlateRpcServer for Rpc {
             .earliest_covered()
             .await
             .map_err(|_| internal("failed to query coverage"))?;
-        Ok(serde_json::json!(floor))
+        match floor {
+            Some(slot) => Ok(serde_json::json!(slot)),
+            None => Err(no_coverage()),
+        }
     }
 }
 
@@ -192,6 +253,10 @@ fn respond<T: serde::Serialize>(
 
 fn internal(msg: &'static str) -> ErrorObject<'static> {
     ErrorObject::owned(-32603, msg, None::<()>)
+}
+
+fn no_coverage() -> ErrorObject<'static> {
+    ErrorObject::owned(-32000, "no coverage recorded yet", None::<()>)
 }
 
 fn keyed(accounts: Vec<AccountUpdate>) -> Vec<RpcKeyedAccount> {
@@ -258,6 +323,7 @@ mod tests {
             executable: 0,
             rent_epoch: 0,
             data: Vec::new(),
+            txn_signature: None,
         };
         store
             .insert_accounts(&[row(0xF1, 111), row(0xF2, 222)])
@@ -266,7 +332,13 @@ mod tests {
 
         let rpc = Rpc { store };
         let v = rpc
-            .get_multiple_accounts(vec![b58(0xF1), b58(0xF9), b58(0xF2)], 200)
+            .get_multiple_accounts(
+                vec![b58(0xF1), b58(0xF9), b58(0xF2)],
+                Some(AccountConfig {
+                    as_of_slot: Some(200),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
 
@@ -280,6 +352,13 @@ mod tests {
             .as_array()
             .expect("context.fidelities is an array");
         assert_eq!(fids.len(), 3);
+        for f in fids {
+            let s = f.as_str().expect("fidelity is a string");
+            assert!(
+                matches!(s, "exact" | "uncertain"),
+                "fidelity serializes to a lowercase wire value, got {s:?}"
+            );
+        }
         assert_eq!(v["context"]["slot"], 200);
     }
 
@@ -295,6 +374,7 @@ mod tests {
             executable: 0,
             rent_epoch: 0,
             data: Vec::new(),
+            txn_signature: None,
         };
         seed.insert_accounts(&[row(0x71), row(0x72), row(0x73), row(0x74), row(0x75)])
             .await
@@ -309,13 +389,21 @@ mod tests {
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
             let v = rpc
-                .get_program_accounts(owner.clone(), 200, Some(2), cursor.clone())
+                .get_program_accounts(
+                    owner.clone(),
+                    Some(ProgramAccountsConfig {
+                        as_of_slot: Some(200),
+                        limit: Some(2),
+                        cursor: cursor.clone(),
+                        ..Default::default()
+                    }),
+                )
                 .await
                 .unwrap();
             for item in v["value"].as_array().expect("value is an array") {
                 walked.push(item["pubkey"].as_str().unwrap().to_string());
             }
-            match v["context"]["next_cursor"].as_str() {
+            match v["context"]["nextCursor"].as_str() {
                 Some(c) => cursor = Some(c.to_string()),
                 None => break,
             }
@@ -344,5 +432,43 @@ mod tests {
         };
         assert!(has(9_000_010, 9_000_020), "first segment present");
         assert!(has(9_000_100, 9_000_150), "second segment present");
+    }
+
+    #[test]
+    fn account_config_rejects_typos_but_tolerates_solana_fields() {
+        use serde_json::{from_value, json};
+        // a misspelled asOfSlot is rejected rather than silently returning latest
+        assert!(from_value::<AccountConfig>(json!({ "asOfSlots": 5 })).is_err());
+        // asOfSlot itself parses
+        let c: AccountConfig = from_value(json!({ "asOfSlot": 5 })).unwrap();
+        assert_eq!(c.as_of_slot, Some(5));
+        // the fields a Solana client (e.g. web3.js) sends are accepted, not rejected
+        let c: AccountConfig = from_value(json!({
+            "asOfSlot": 5,
+            "commitment": "finalized",
+            "encoding": "base64",
+            "dataSlice": { "offset": 0, "length": 8 },
+            "minContextSlot": 10
+        }))
+        .unwrap();
+        assert_eq!(c.as_of_slot, Some(5));
+    }
+
+    #[test]
+    fn program_accounts_config_rejects_typos_but_tolerates_solana_fields() {
+        use serde_json::{from_value, json};
+        assert!(from_value::<ProgramAccountsConfig>(json!({ "limitt": 2 })).is_err());
+        let c: ProgramAccountsConfig = from_value(json!({
+            "asOfSlot": 5,
+            "limit": 2,
+            "cursor": "abc",
+            "commitment": "finalized",
+            "encoding": "base64",
+            "filters": [{ "dataSize": 165 }],
+            "withContext": true,
+            "minContextSlot": 10
+        }))
+        .unwrap();
+        assert_eq!(c.limit, Some(2));
     }
 }

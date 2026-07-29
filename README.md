@@ -44,16 +44,22 @@ flowchart LR
 
 ## RPC methods
 
-Every method takes the pubkey(s) and an `as_of_slot`, and returns the Agave response shape plus a `context.fidelity` field.
+The account methods take the pubkey(s) plus a config object. `asOfSlot` is optional; omit it to get the latest captured slot. Responses use the Agave `{ context, value }` shape with an added `context.fidelity`.
 
-| Method | Params | Notes |
+| Method | Params | Returns |
 | --- | --- | --- |
-| `getAccountInfo` | `pubkey, as_of_slot` | Account state as of the slot, base64. |
-| `getProgramAccounts` | `owner, as_of_slot, [limit], [cursor]` | Accounts owned by the program at the slot. Optional keyset pagination. |
-| `getBalance` | `pubkey, as_of_slot` | Lamports at the slot. |
-| `getMultipleAccounts` | `pubkeys[], as_of_slot` | Batched `getAccountInfo`, `null` per missing position. |
+| `getAccountInfo` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value }` — the account (base64) or `null`. |
+| `getProgramAccounts` | `programId, { asOfSlot?, limit?, cursor? }` | `{ context: { slot, fidelity, nextCursor? }, value: [{ pubkey, account }] }`. Pass `limit` for keyset pagination and thread `nextCursor` until it's `null`. `cursor` is only applied with `limit`. |
+| `getBalance` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value: lamports }`. |
+| `getMultipleAccounts` | `pubkeys[], { asOfSlot? }` | `{ context: { slot, fidelities }, value: [...] }` — accounts in order, `null` per missing, one fidelity per position. |
+| `getCoverage` | none | `{ segments: [{ firstSlot, lastSlot }] }` — captured slot ranges, ascending; gaps are the space between segments. |
+| `getFirstAvailableSlot` | none | The earliest captured slot (number), or error `-32000` when nothing is captured yet. |
 
-Base64 only for now. No `memcmp` / `dataSize` filters or `jsonParsed` encoding yet (see [Roadmap](#roadmap)).
+**Fidelity.** Every account read carries `context.fidelity`. `exact` means the answer sits inside a captured range; `uncertain` means it's below the floor or across a gap, so Slate still returns its best answer but flags that it can't vouch for it. New values may be added later, so treat anything you don't recognize as `uncertain`.
+
+**Compatibility.** For `getAccountInfo`, `getBalance`, and `getMultipleAccounts` the request and response shapes match Solana, so `asOfSlot` and `fidelity` are the only additions. `getProgramAccounts` always wraps its result in the `{ context, value }` envelope (Solana returns a bare array unless you pass `withContext: true`) so the context can carry `fidelity` and `nextCursor`. Standard Solana config fields (`commitment`, `encoding`, `dataSlice`, `minContextSlot`, and `getProgramAccounts` `filters`) are accepted for compatibility but not applied yet; any other field is rejected as invalid params. lamports are JSON numbers like Solana, with the same >2^53 precision caveat. Base64 only for now; no `memcmp` / `dataSize` filters or `jsonParsed` encoding yet (see [Roadmap](#roadmap)).
+
+**Errors.** Standard JSON-RPC 2.0 codes: `-32700` / `-32600` / `-32601` (transport), `-32602` (invalid params, e.g. a malformed pubkey), `-32603` (internal), plus `-32000` (getFirstAvailableSlot on an empty store).
 
 ## Quick start
 
@@ -83,7 +89,7 @@ Query an account as of a past slot:
 
 ```sh
 curl -s localhost:8899 -X POST -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["<pubkey>", 479302991]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["<pubkey>", {"asOfSlot": 479302991}]}'
 ```
 
 The response's `context.fidelity` tells you whether Slate can vouch for that slot.
