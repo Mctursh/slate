@@ -26,9 +26,11 @@ pub struct AccountUpdateInsert {
     pub rent_epoch: u64,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+    pub txn_signature: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Fidelity {
     Exact,
     Uncertain,
@@ -327,6 +329,7 @@ mod tests {
                 executable: 0,
                 rent_epoch: 0,
                 data: data.to_vec(),
+                txn_signature: None,
             }
         }
         let rows = vec![
@@ -459,6 +462,7 @@ mod tests {
             executable: 0,
             rent_epoch: 0,
             data: Vec::new(),
+            txn_signature: None,
         };
         store
             .insert_accounts(&[row(0xE1), row(0xE2), row(0xE3), row(0xE4), row(0xE5)])

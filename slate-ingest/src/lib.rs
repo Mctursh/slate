@@ -56,6 +56,7 @@ pub async fn read_snapshot_accounts(
                     executable: account.executable() as u8,
                     rent_epoch: account.rent_epoch,
                     data: account.data().to_vec(),
+                    txn_signature: None,
                 });
             });
         }

@@ -2944,6 +2944,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "bs58",
  "clap",
  "futures",
  "reqwest",

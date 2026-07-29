@@ -51,6 +51,7 @@ pub async fn fetch_program_baseline(
             executable: acct["executable"].as_bool().unwrap_or(false) as u8,
             rent_epoch: acct["rentEpoch"].as_u64().unwrap_or(0),
             data: base64::engine::general_purpose::STANDARD.decode(data_b64)?,
+            txn_signature: None,
         });
     }
 

@@ -38,6 +38,7 @@ fn adapt_account(a: SubscribeUpdateAccount) -> Option<StreamEvent> {
         write_version: info.write_version,
         data: info.data,
         slot: a.slot,
+        txn_signature: info.txn_signature.filter(|s| !s.is_empty()),
     };
     Some(StreamEvent::Account(account))
 }
@@ -171,7 +172,7 @@ mod tests {
                 rent_epoch: 7,
                 data: b"hi".to_vec(),
                 write_version: 9,
-                ..Default::default()
+                txn_signature: Some(vec![0x33; 64]),
             }),
             slot: 100, // slot lives on the OUTER wrapper, not the info
             ..Default::default()
@@ -188,6 +189,7 @@ mod tests {
                 data: b"hi".to_vec(),
                 slot: 100,
                 write_version: 9,
+                txn_signature: Some(vec![0x33; 64]),
             }))
         );
     }

@@ -12,6 +12,7 @@ pub struct AccountWrite {
     pub data: Vec<u8>,
     pub slot: u64,
     pub write_version: u64,
+    pub txn_signature: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +128,10 @@ fn to_insert(w: &AccountWrite) -> slate_store::AccountUpdateInsert {
         executable: w.executable as u8,
         rent_epoch: w.rent_epoch,
         data: w.data.clone(),
+        txn_signature: w
+            .txn_signature
+            .as_ref()
+            .map(|s| bs58::encode(s).into_string()),
     }
 }
 
@@ -146,6 +151,7 @@ pub fn mock_stream() -> Vec<StreamEvent> {
             data: Vec::new(),
             slot,
             write_version: wv,
+            txn_signature: None,
         }
     }
     use SlotStatus::*;
@@ -200,6 +206,7 @@ pub fn mock_stream_with_gap() -> Vec<StreamEvent> {
             data: Vec::new(),
             slot,
             write_version: wv,
+            txn_signature: None,
         }
     }
     use SlotStatus::Finalized;
@@ -341,6 +348,7 @@ mod tests {
             executable: 0,
             rent_epoch: 0,
             data: Vec::new(),
+            txn_signature: None,
         };
         store
             .insert_accounts(&[baseline(0xD1, 100), baseline(0xD2, 200)])
@@ -362,6 +370,7 @@ mod tests {
                 data: Vec::new(),
                 slot: 50,
                 write_version: 1,
+                txn_signature: None,
             }),
             StreamEvent::Slot {
                 slot: 50,
@@ -422,6 +431,7 @@ mod tests {
                 data: Vec::new(),
                 slot: 900,
                 write_version: 1,
+                txn_signature: None,
             }),
             StreamEvent::Gap,
             StreamEvent::Slot {
