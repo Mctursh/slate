@@ -50,6 +50,12 @@ pub struct ProgramAccountsPage {
     pub next_cursor: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Deserialize, Row)]
+pub struct CoverageSegment {
+    pub first_slot: u64,
+    pub last_slot: u64,
+}
+
 pub struct ClickHouseClient {
     client: clickhouse::Client,
 }
@@ -266,6 +272,16 @@ impl ClickHouseClient {
         let query = "SELECT segment_hi FROM coverage ORDER BY segment_hi DESC LIMIT 1";
         let tip = self.client.query(query).fetch_optional::<u64>().await?;
         Ok(tip)
+    }
+
+    pub async fn coverage_segments(&self) -> StoreResult<Vec<CoverageSegment>> {
+        let query = "SELECT segment_lo AS first_slot, max(segment_hi) AS last_slot FROM coverage GROUP BY segment_lo ORDER BY segment_lo";
+        let segments = self
+            .client
+            .query(query)
+            .fetch_all::<CoverageSegment>()
+            .await?;
+        Ok(segments)
     }
 
     async fn coverage_fidelity(&self, as_of_slot: u64) -> StoreResult<Fidelity> {

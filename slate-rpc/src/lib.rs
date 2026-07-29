@@ -42,6 +42,12 @@ pub trait SlateRpc {
         pubkeys: Vec<String>,
         as_of_slot: u64,
     ) -> RpcResult<serde_json::Value>;
+
+    #[method(name = "getCoverage")]
+    async fn get_coverage(&self) -> RpcResult<serde_json::Value>;
+
+    #[method(name = "getFirstAvailableSlot")]
+    async fn get_first_available_slot(&self) -> RpcResult<serde_json::Value>;
 }
 
 pub struct Rpc {
@@ -143,6 +149,28 @@ impl SlateRpcServer for Rpc {
 
         let value = account.map(|a| a.lamports).unwrap_or(0);
         respond(as_of_slot, value, fidelity)
+    }
+
+    async fn get_coverage(&self) -> RpcResult<serde_json::Value> {
+        let segments = self
+            .store
+            .coverage_segments()
+            .await
+            .map_err(|_| internal("failed to query coverage"))?;
+        let segments: Vec<serde_json::Value> = segments
+            .iter()
+            .map(|s| serde_json::json!({ "firstSlot": s.first_slot, "lastSlot": s.last_slot }))
+            .collect();
+        Ok(serde_json::json!({ "segments": segments }))
+    }
+
+    async fn get_first_available_slot(&self) -> RpcResult<serde_json::Value> {
+        let floor = self
+            .store
+            .earliest_covered()
+            .await
+            .map_err(|_| internal("failed to query coverage"))?;
+        Ok(serde_json::json!(floor))
     }
 }
 
@@ -297,5 +325,24 @@ mod tests {
             walked,
             vec![b58(0x71), b58(0x72), b58(0x73), b58(0x74), b58(0x75)]
         );
+    }
+
+    #[tokio::test]
+    async fn get_coverage_lists_recorded_segments() {
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
+        // High, disjoint slots so they don't collide with other tests' coverage rows.
+        store.record_coverage(9_000_010, 9_000_020).await.unwrap();
+        store.record_coverage(9_000_100, 9_000_150).await.unwrap();
+
+        let rpc = Rpc { store };
+        let v = rpc.get_coverage().await.unwrap();
+        let segs = v["segments"].as_array().expect("segments is an array");
+
+        let has = |lo: u64, hi: u64| {
+            segs.iter()
+                .any(|s| s["firstSlot"] == lo && s["lastSlot"] == hi)
+        };
+        assert!(has(9_000_010, 9_000_020), "first segment present");
+        assert!(has(9_000_100, 9_000_150), "second segment present");
     }
 }
