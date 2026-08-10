@@ -6,7 +6,9 @@
 //! per-slot environment, sanitizing a real tx, and reconciling against getBlock)
 //! comes in Tasks 0.4–0.7.
 
+pub mod block;
 pub mod fixture;
+pub mod oracle;
 
 use std::{
     collections::HashMap,
@@ -16,7 +18,11 @@ use std::{
 use agave_syscalls::create_program_runtime_environment_v1;
 use solana_account::{Account, AccountSharedData};
 use solana_clock::Clock;
+use solana_compute_budget::compute_budget_limits::{
+    ComputeBudgetLimits, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+};
 use solana_epoch_schedule::EpochSchedule;
+use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
@@ -24,12 +30,17 @@ use solana_program_runtime::{
 };
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
-use solana_svm::transaction_processor::{
-    TransactionBatchProcessor, TransactionProcessingEnvironment,
+use solana_svm::{
+    account_loader::CheckedTransactionDetails,
+    transaction_processing_result::TransactionProcessingResult,
+    transaction_processor::{
+        TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
+    },
 };
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use solana_svm_feature_set::SVMFeatureSet;
 use solana_sysvar_id::SysvarId;
+use solana_transaction::sanitized::SanitizedTransaction;
 
 /// Replay walks a single linear chain of slots, so there are no forks to reason
 /// about — the program cache only ever needs "unknown".
@@ -243,6 +254,40 @@ impl Replayer {
             ..Default::default()
         }
     }
+
+    /// Execute one sanitized transaction against `bank` and return its processing
+    /// result. `fee` is the block meta's total fee, used to build the pre-validated
+    /// check result the bank's fee validation would otherwise produce. Runs a batch
+    /// of one and hands back the single result. This is the primitive the per-slot
+    /// loop calls for each transaction, in order.
+    pub fn execute(
+        &self,
+        bank: &ReplayBank,
+        tx: SanitizedTransaction,
+        fee: u64,
+        epoch: u64,
+    ) -> TransactionProcessingResult {
+        let env = self.environment(*tx.message().recent_blockhash(), epoch);
+        // no nonce; default compute budget capped at the max loaded-accounts size.
+        let limits = ComputeBudgetLimits {
+            loaded_accounts_bytes: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+            ..Default::default()
+        };
+        let budget = limits.get_compute_budget_and_limits(
+            limits.loaded_accounts_bytes,
+            FeeDetails::new(fee, 0),
+            true,
+        );
+        let check_results = vec![Ok(CheckedTransactionDetails::new(None, budget))];
+        let mut output = self.processor.load_and_execute_sanitized_transactions(
+            bank,
+            std::slice::from_ref(&tx),
+            check_results,
+            &env,
+            &TransactionProcessingConfig::default(),
+        );
+        output.processing_results.remove(0)
+    }
 }
 
 #[cfg(test)]
@@ -298,15 +343,7 @@ mod tests {
     #[test]
     fn executes_and_reconciles() {
         use solana_account::ReadableAccount;
-        use solana_compute_budget::compute_budget_limits::{
-            ComputeBudgetLimits, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-        };
-        use solana_fee_structure::FeeDetails;
-        use solana_svm::{
-            account_loader::CheckedTransactionDetails,
-            transaction_processing_result::ProcessedTransaction,
-            transaction_processor::TransactionProcessingConfig,
-        };
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
 
         let epoch = fixture::SLOT / 432_000;
 
@@ -317,33 +354,11 @@ mod tests {
         bank.configure_sysvars(fixture::SLOT, fixture::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
-        let tx = fixture::sanitized_transaction();
-        let env = replayer.environment(*tx.message().recent_blockhash(), epoch);
-
-        // per-tx check result: no nonce, default compute budget, 1-signature fee.
-        let limits = ComputeBudgetLimits {
-            loaded_accounts_bytes: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-            ..Default::default()
-        };
-        let budget = limits.get_compute_budget_and_limits(
-            limits.loaded_accounts_bytes,
-            FeeDetails::new(fixture::FEE, 0),
-            true,
-        );
-        let check_results = vec![Ok(CheckedTransactionDetails::new(None, budget))];
-        let txs = [tx];
-
         // --- run it ---
-        let output = replayer.processor.load_and_execute_sanitized_transactions(
-            &bank,
-            &txs,
-            check_results,
-            &env,
-            &TransactionProcessingConfig::default(),
-        );
+        let result = replayer.execute(&bank, fixture::sanitized_transaction(), fixture::FEE, epoch);
 
         // --- reconcile against the getBlock oracle ---
-        let executed = match &output.processing_results[0] {
+        let executed = match &result {
             Ok(ProcessedTransaction::Executed(e)) => e,
             other => panic!("expected an executed transaction, got {other:?}"),
         };
@@ -385,15 +400,7 @@ mod tests {
     #[test]
     fn executes_memo_and_reconciles() {
         use solana_account::ReadableAccount;
-        use solana_compute_budget::compute_budget_limits::{
-            ComputeBudgetLimits, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-        };
-        use solana_fee_structure::FeeDetails;
-        use solana_svm::{
-            account_loader::CheckedTransactionDetails,
-            transaction_processing_result::ProcessedTransaction,
-            transaction_processor::TransactionProcessingConfig,
-        };
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
 
         let m = fixture::memo::SLOT;
         let epoch = m / 432_000;
@@ -404,30 +411,14 @@ mod tests {
         bank.configure_sysvars(m, fixture::memo::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
-        let tx = fixture::memo::sanitized_transaction();
-        let env = replayer.environment(*tx.message().recent_blockhash(), epoch);
-
-        let limits = ComputeBudgetLimits {
-            loaded_accounts_bytes: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-            ..Default::default()
-        };
-        let budget = limits.get_compute_budget_and_limits(
-            limits.loaded_accounts_bytes,
-            FeeDetails::new(fixture::memo::FEE, 0),
-            true,
-        );
-        let check_results = vec![Ok(CheckedTransactionDetails::new(None, budget))];
-        let txs = [tx];
-
-        let output = replayer.processor.load_and_execute_sanitized_transactions(
+        let result = replayer.execute(
             &bank,
-            &txs,
-            check_results,
-            &env,
-            &TransactionProcessingConfig::default(),
+            fixture::memo::sanitized_transaction(),
+            fixture::memo::FEE,
+            epoch,
         );
 
-        let executed = match &output.processing_results[0] {
+        let executed = match &result {
             Ok(ProcessedTransaction::Executed(e)) => e,
             other => panic!("expected an executed transaction, got {other:?}"),
         };
@@ -466,15 +457,7 @@ mod tests {
     #[test]
     fn executes_cpi_and_reconciles() {
         use solana_account::ReadableAccount;
-        use solana_compute_budget::compute_budget_limits::{
-            ComputeBudgetLimits, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-        };
-        use solana_fee_structure::FeeDetails;
-        use solana_svm::{
-            account_loader::CheckedTransactionDetails,
-            transaction_processing_result::ProcessedTransaction,
-            transaction_processor::TransactionProcessingConfig,
-        };
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
 
         let s = fixture::cpi::SLOT;
         let epoch = s / 432_000;
@@ -485,30 +468,14 @@ mod tests {
         bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
-        let tx = fixture::cpi::sanitized_transaction();
-        let env = replayer.environment(*tx.message().recent_blockhash(), epoch);
-
-        let limits = ComputeBudgetLimits {
-            loaded_accounts_bytes: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-            ..Default::default()
-        };
-        let budget = limits.get_compute_budget_and_limits(
-            limits.loaded_accounts_bytes,
-            FeeDetails::new(fixture::cpi::FEE, 0),
-            true,
-        );
-        let check_results = vec![Ok(CheckedTransactionDetails::new(None, budget))];
-        let txs = [tx];
-
-        let output = replayer.processor.load_and_execute_sanitized_transactions(
+        let result = replayer.execute(
             &bank,
-            &txs,
-            check_results,
-            &env,
-            &TransactionProcessingConfig::default(),
+            fixture::cpi::sanitized_transaction(),
+            fixture::cpi::FEE,
+            epoch,
         );
 
-        let executed = match &output.processing_results[0] {
+        let executed = match &result {
             Ok(ProcessedTransaction::Executed(e)) => e,
             other => panic!("expected an executed transaction, got {other:?}"),
         };

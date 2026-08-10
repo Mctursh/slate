@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-reserved-account-keys"
+version = "3.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e8ceb5117fa390898f473b0d165f88482a2b36fb4a47441d8b40e22823207cb"
+dependencies = [
+ "agave-feature-set",
+ "solana-pubkey 3.0.0",
+ "solana-sdk-ids",
+]
+
+[[package]]
 name = "agave-syscalls"
 version = "3.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3780,10 +3791,13 @@ dependencies = [
 name = "slate-replay"
 version = "0.1.0"
 dependencies = [
+ "agave-reserved-account-keys",
  "agave-syscalls",
  "anyhow",
  "base64 0.22.1",
  "bincode",
+ "reqwest",
+ "serde_json",
  "solana-account",
  "solana-bpf-loader-program",
  "solana-clock",
