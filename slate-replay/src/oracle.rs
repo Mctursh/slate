@@ -147,7 +147,7 @@ mod tests {
 
         let tx = fixture::cpi::sanitized_transaction();
         let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
-        let result = replayer.execute(&bank, tx, fixture::cpi::FEE, epoch);
+        let result = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch);
         (account_keys, result)
     }
 

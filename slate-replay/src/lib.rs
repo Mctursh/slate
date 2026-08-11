@@ -16,12 +16,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use agave_feature_set::FeatureSet;
 use agave_syscalls::create_program_runtime_environment_v1;
 use solana_account::{Account, AccountSharedData};
 use solana_clock::Clock;
-use solana_compute_budget::compute_budget_limits::{
-    ComputeBudgetLimits, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-};
+use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
@@ -33,6 +32,7 @@ use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_svm::{
     account_loader::CheckedTransactionDetails,
+    rollback_accounts::RollbackAccounts,
     transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     transaction_processor::{
         TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
@@ -40,6 +40,7 @@ use solana_svm::{
 };
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use solana_svm_feature_set::SVMFeatureSet;
+use solana_svm_transaction::svm_message::SVMMessage;
 use solana_sysvar_id::SysvarId;
 use solana_transaction::sanitized::SanitizedTransaction;
 
@@ -209,6 +210,10 @@ impl TransactionProcessingCallback for ReplayBank {
 pub struct Replayer {
     _fork_graph: Arc<RwLock<SlateForkGraph>>,
     pub processor: TransactionBatchProcessor<SlateForkGraph>,
+    /// Runtime feature set, used to parse each tx's compute-budget limits.
+    feature_set: FeatureSet,
+    /// The SVM view of `feature_set`, held once for the per-batch environment.
+    svm_feature_set: SVMFeatureSet,
 }
 
 impl Replayer {
@@ -220,10 +225,14 @@ impl Replayer {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
         // The real BPF VM environment: the exact syscall set + costs the runtime
         // derives from the feature set. BPFLoader v1/v2 programs execute in here.
-        let feature_set = SVMFeatureSet::all_enabled();
+        // all_enabled for now; the exact per-epoch set (built from the on-chain
+        // feature accounts) comes later. The SVM environment takes the derived
+        // SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
+        let feature_set = FeatureSet::all_enabled();
+        let svm_feature_set = feature_set.runtime_features();
         let budget = SVMTransactionExecutionBudget::default();
         let loader = Arc::new(
-            create_program_runtime_environment_v1(&feature_set, &budget, false, false)
+            create_program_runtime_environment_v1(&svm_feature_set, &budget, false, false)
                 .expect("build v1 program runtime environment"),
         );
         let processor = TransactionBatchProcessor::new(
@@ -236,6 +245,8 @@ impl Replayer {
         Self {
             _fork_graph: fork_graph,
             processor,
+            feature_set,
+            svm_feature_set,
         }
     }
 
@@ -249,7 +260,7 @@ impl Replayer {
             // non-zero so fees aren't disabled; the exact fee comes from the
             // per-tx check results, not from this field.
             blockhash_lamports_per_signature: 5_000,
-            feature_set: SVMFeatureSet::all_enabled(),
+            feature_set: self.svm_feature_set,
             program_runtime_environments_for_execution: self
                 .processor
                 .get_environments_for_epoch(epoch),
@@ -269,26 +280,34 @@ impl Replayer {
     pub fn execute(
         &self,
         bank: &ReplayBank,
-        tx: SanitizedTransaction,
+        tx: &SanitizedTransaction,
         fee: u64,
         epoch: u64,
     ) -> TransactionProcessingResult {
         let env = self.environment(*tx.message().recent_blockhash(), epoch);
-        // no nonce; default compute budget capped at the max loaded-accounts size.
-        let limits = ComputeBudgetLimits {
-            loaded_accounts_bytes: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-            ..Default::default()
+        // Parse the tx's OWN compute-budget instructions for its real CU limit,
+        // price, and loaded-data-size limit — not a default. A tx that exhausts its
+        // requested limit on chain must exhaust it here too. No nonce yet
+        // (durable-nonce txs are unhandled). A malformed budget is rejected on
+        // chain, so we fail it here the same way.
+        let check_result = match process_compute_budget_instructions(
+            SVMMessage::program_instructions_iter(tx),
+            &self.feature_set,
+        ) {
+            Ok(limits) => {
+                let budget = limits.get_compute_budget_and_limits(
+                    limits.loaded_accounts_bytes,
+                    FeeDetails::new(fee, 0),
+                    true,
+                );
+                Ok(CheckedTransactionDetails::new(None, budget))
+            }
+            Err(err) => Err(err),
         };
-        let budget = limits.get_compute_budget_and_limits(
-            limits.loaded_accounts_bytes,
-            FeeDetails::new(fee, 0),
-            true,
-        );
-        let check_results = vec![Ok(CheckedTransactionDetails::new(None, budget))];
         let mut output = self.processor.load_and_execute_sanitized_transactions(
             bank,
-            std::slice::from_ref(&tx),
-            check_results,
+            std::slice::from_ref(tx),
+            vec![check_result],
             &env,
             &TransactionProcessingConfig::default(),
         );
@@ -306,37 +325,69 @@ impl Replayer {
         self.processor.fill_missing_sysvar_cache_entries(bank);
 
         for (i, block_tx) in block.transactions.iter().enumerate() {
-            let tx = match sanitize(&block_tx.transaction) {
+            let tx = match sanitize(&block_tx.transaction, &block_tx.meta.loaded_addresses) {
                 Ok(tx) => tx,
                 Err(err) => return BlockReplay::halted(i, format!("cannot sanitize: {err}")),
             };
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
-            let result = self.execute(bank, tx, block_tx.meta.fee, epoch);
+            let result = self.execute(bank, &tx, block_tx.meta.fee, epoch);
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {
                 return BlockReplay::halted(i, reconciliation.issues.join("; "));
             }
 
-            commit_writes(bank, &result, block.slot);
+            commit_writes(bank, &tx, &result, block.slot);
         }
 
         BlockReplay::complete(block.transactions.len())
     }
 }
 
-/// Apply a successful transaction's account writes back into the bank so later
-/// transactions in the same block see them. A failed-but-executed tx still charges
-/// its fee and rolls the rest back; committing that correctly (the fee-payer
-/// rollback) is still a TODO — until then a block containing a failed tx halts at
-/// the next tx whose payer balance no longer lines up, which is caught, not silent.
-fn commit_writes(bank: &mut ReplayBank, result: &TransactionProcessingResult, slot: u64) {
-    if let Ok(ProcessedTransaction::Executed(executed)) = result
-        && executed.was_successful()
-    {
-        for (key, account) in &executed.loaded_transaction.accounts {
-            bank.insert(*key, account.clone(), slot);
+/// Apply a processed transaction's account changes back into the bank so later
+/// transactions in the same block see them, mirroring how agave commits a batch
+/// (`update_accounts_for_executed_tx`):
+///
+/// - **Executed + successful:** write back only the accounts the tx could have
+///   modified — the writable ones. A read-only account can't change, so
+///   re-storing it would fabricate a write at this slot.
+/// - **Executed but failed:** every state change rolls back except the fee charge
+///   and any advanced nonce, so commit just those rollback accounts. Without this
+///   the payer's fee deduction is lost and the next tx's payer balance no longer
+///   lines up.
+/// - **Fees-only (loaded but not executed):** the fee payer was still charged, so
+///   commit its rollback too.
+/// - **Not processed:** nothing hit the chain, so nothing to commit.
+fn commit_writes(
+    bank: &mut ReplayBank,
+    message: &impl SVMMessage,
+    result: &TransactionProcessingResult,
+    slot: u64,
+) {
+    match result {
+        Ok(ProcessedTransaction::Executed(executed)) => {
+            if executed.was_successful() {
+                for (i, (key, account)) in executed.loaded_transaction.accounts.iter().enumerate() {
+                    if message.is_writable(i) {
+                        bank.insert(*key, account.clone(), slot);
+                    }
+                }
+            } else {
+                commit_rollback(bank, &executed.loaded_transaction.rollback_accounts, slot);
+            }
         }
+        Ok(ProcessedTransaction::FeesOnly(fees_only)) => {
+            commit_rollback(bank, &fees_only.rollback_accounts, slot);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Write a failed / fees-only tx's rollback accounts — the charged fee payer, plus
+/// an advanced nonce if the tx used one — back into the bank.
+fn commit_rollback(bank: &mut ReplayBank, rollback: &RollbackAccounts, slot: u64) {
+    for (address, account) in rollback {
+        bank.insert(*address, account.clone(), slot);
     }
 }
 
@@ -441,7 +492,12 @@ mod tests {
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
         // --- run it ---
-        let result = replayer.execute(&bank, fixture::sanitized_transaction(), fixture::FEE, epoch);
+        let result = replayer.execute(
+            &bank,
+            &fixture::sanitized_transaction(),
+            fixture::FEE,
+            epoch,
+        );
 
         // --- reconcile against the getBlock oracle ---
         let executed = match &result {
@@ -499,7 +555,7 @@ mod tests {
 
         let result = replayer.execute(
             &bank,
-            fixture::memo::sanitized_transaction(),
+            &fixture::memo::sanitized_transaction(),
             fixture::memo::FEE,
             epoch,
         );
@@ -556,7 +612,7 @@ mod tests {
 
         let result = replayer.execute(
             &bank,
-            fixture::cpi::sanitized_transaction(),
+            &fixture::cpi::sanitized_transaction(),
             fixture::cpi::FEE,
             epoch,
         );
@@ -723,5 +779,143 @@ mod tests {
         assert_eq!(balance(&src), src_balance - amount1 - fee);
         assert_eq!(balance(&mid), amount1 - amount2 - fee);
         assert_eq!(balance(&dst), amount2);
+    }
+
+    #[test]
+    fn honors_the_transactions_compute_unit_limit() {
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let compute_budget = solana_sdk_ids::compute_budget::id();
+        let payer = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+
+        // A transfer prefixed with an explicit SetComputeUnitLimit.
+        let build = |cu_limit: u32| -> VersionedTransaction {
+            let mut cu_data = vec![2u8]; // ComputeBudget SetComputeUnitLimit (1-byte disc)
+            cu_data.extend_from_slice(&cu_limit.to_le_bytes());
+            let cu_ix = Instruction {
+                program_id: compute_budget,
+                accounts: vec![],
+                data: cu_data,
+            };
+            let mut tr_data = vec![2u8, 0, 0, 0]; // System Transfer (4-byte disc)
+            tr_data.extend_from_slice(&1_000_000u64.to_le_bytes());
+            let tr_ix = Instruction {
+                program_id: system,
+                accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(dst, false)],
+                data: tr_data,
+            };
+            let message =
+                Message::new_with_blockhash(&[cu_ix, tr_ix], Some(&payer), &Hash::default());
+            VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: VersionedMessage::Legacy(message),
+            }
+        };
+
+        let succeeds = |cu_limit: u32| -> bool {
+            let slot = 300;
+            let epoch = slot / 432_000;
+            let mut bank = ReplayBank::default();
+            bank.insert(
+                payer,
+                AccountSharedData::from(Account {
+                    lamports: 10_000_000,
+                    data: vec![],
+                    owner: system,
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+                slot,
+            );
+            let replayer = Replayer::new(slot, epoch);
+            register_builtins(&mut bank, &replayer.processor);
+            let tx = sanitize(&build(cu_limit), &crate::block::LoadedAddresses::default()).unwrap();
+            let result = replayer.execute(&bank, &tx, 5_000, epoch);
+            matches!(&result, Ok(ProcessedTransaction::Executed(e)) if e.was_successful())
+        };
+
+        // A transfer needs ~150 CU: a tiny limit must exhaust and fail; ample succeeds.
+        assert!(!succeeds(10), "10 CU can't fit a transfer, tx must fail");
+        assert!(succeeds(50_000), "50k CU is ample, tx must succeed");
+    }
+
+    #[test]
+    fn commits_the_fee_payer_rollback_for_a_failed_tx() {
+        use solana_account::ReadableAccount;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let payer = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+        let slot = 300;
+        let epoch = slot / 432_000;
+        let fee = 5_000u64;
+        let start = 1_000_000u64;
+
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            payer,
+            AccountSharedData::from(Account {
+                lamports: start,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        let replayer = Replayer::new(slot, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+
+        // Transfer ten times what the payer holds: it loads and executes, then
+        // fails on insufficient funds. The fee is charged; the transfer rolls back.
+        let mut data = vec![2u8, 0, 0, 0]; // System Transfer (4-byte disc)
+        data.extend_from_slice(&(start * 10).to_le_bytes());
+        let ix = Instruction {
+            program_id: system,
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(dst, false)],
+            data,
+        };
+        let message = Message::new_with_blockhash(&[ix], Some(&payer), &Hash::default());
+        let tx = sanitize(
+            &VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: VersionedMessage::Legacy(message),
+            },
+            &crate::block::LoadedAddresses::default(),
+        )
+        .unwrap();
+
+        let result = replayer.execute(&bank, &tx, fee, epoch);
+
+        // Executed but not successful — the branch that used to commit nothing.
+        assert!(
+            matches!(&result, Ok(ProcessedTransaction::Executed(e)) if !e.was_successful()),
+            "over-transfer should execute then fail, got {result:?}"
+        );
+
+        commit_writes(&mut bank, &tx, &result, slot);
+
+        // Fee charged, transfer reverted: payer down exactly the fee, dst never funded.
+        let (payer_acct, _) = bank
+            .get_account_shared_data(&payer)
+            .expect("payer still present");
+        assert_eq!(
+            payer_acct.lamports(),
+            start - fee,
+            "payer should be charged the fee and nothing else"
+        );
+        assert!(
+            bank.get_account_shared_data(&dst).is_none(),
+            "recipient must not exist — the transfer rolled back"
+        );
     }
 }
