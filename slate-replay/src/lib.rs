@@ -30,6 +30,7 @@ use solana_program_runtime::{
 };
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
+use solana_slot_hashes::SlotHashes;
 use solana_svm::{
     account_loader::CheckedTransactionDetails,
     rollback_accounts::RollbackAccounts,
@@ -124,6 +125,21 @@ impl ReplayBank {
             EpochSchedule::id(),
             bincode::serialize(&EpochSchedule::without_warmup()).unwrap(),
         );
+        // SlotHashes: present but empty here. A vote tx validates the slot it votes
+        // on against this sysvar, so real replay must fill it with the actual recent
+        // (slot, hash) history from the snapshot + per-slot updates; `set_slot_hashes`
+        // does that. Empty is a valid starting point for txs that don't read it.
+        self.set_slot_hashes(&[]);
+    }
+
+    /// Populate the SlotHashes sysvar from recent `(slot, hash)` pairs (newest
+    /// first, as the runtime keeps them). Vote transactions read it to check the
+    /// slot they vote on is real.
+    pub fn set_slot_hashes(&mut self, entries: &[(u64, Hash)]) {
+        self.set_sysvar_account(
+            SlotHashes::id(),
+            bincode::serialize(&SlotHashes::new(entries)).unwrap(),
+        );
     }
 
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
@@ -190,6 +206,17 @@ pub fn register_builtins(
             0,
             "compute_budget_program".len(),
             solana_compute_budget_program::Entrypoint::vm,
+        ),
+    );
+    // Vote program (native builtin) — vote txs are the bulk of a real block.
+    bank.add_builtin(
+        processor,
+        solana_sdk_ids::vote::id(),
+        "vote_program",
+        ProgramCacheEntry::new_builtin(
+            0,
+            "vote_program".len(),
+            solana_vote_program::vote_processor::Entrypoint::vm,
         ),
     );
 }
@@ -450,6 +477,35 @@ mod tests {
             .expect("system program should be registered");
         assert!(acct.executable());
         assert_eq!(*acct.owner(), solana_sdk_ids::native_loader::id());
+    }
+
+    #[test]
+    fn registers_vote_builtin() {
+        use solana_account::ReadableAccount;
+        let mut bank = fixture::seed_bank();
+        let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
+        register_builtins(&mut bank, &replayer.processor);
+
+        let (acct, _) = bank
+            .get_account_shared_data(&solana_sdk_ids::vote::id())
+            .expect("vote program should be registered");
+        assert!(acct.executable());
+        assert_eq!(*acct.owner(), solana_sdk_ids::native_loader::id());
+    }
+
+    #[test]
+    fn configures_slot_hashes_sysvar() {
+        use solana_account::ReadableAccount;
+        let mut bank = ReplayBank::default();
+        let hash = Hash::new_unique();
+        bank.set_slot_hashes(&[(7, hash)]);
+
+        let (acct, _) = bank
+            .get_account_shared_data(&SlotHashes::id())
+            .expect("slot hashes sysvar present");
+        assert_eq!(*acct.owner(), solana_sdk_ids::sysvar::id());
+        let decoded: SlotHashes = bincode::deserialize(acct.data()).unwrap();
+        assert_eq!(decoded, SlotHashes::new(&[(7, hash)]));
     }
 
     #[test]
@@ -916,6 +972,95 @@ mod tests {
         assert!(
             bank.get_account_shared_data(&dst).is_none(),
             "recipient must not exist — the transfer rolled back"
+        );
+    }
+
+    #[test]
+    fn executes_a_vote_through_the_builtin() {
+        use solana_instruction::Instruction;
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+        use solana_vote_interface::instruction::{
+            CreateVoteAccountConfig, create_account_with_config, tower_sync,
+        };
+        use solana_vote_interface::state::{TowerSync, VoteInit};
+
+        let current_slot = 10u64;
+        let voted_slot = 9u64;
+        let epoch = current_slot / 432_000;
+        let system = solana_sdk_ids::system_program::id();
+        let payer = Pubkey::new_unique();
+        let vote_pubkey = Pubkey::new_unique();
+        // One identity plays node, authorized voter, and withdrawer.
+        let identity = Pubkey::new_unique();
+        let voted_hash = Hash::new_unique();
+
+        let wallet = |lamports| {
+            AccountSharedData::from(Account {
+                lamports,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            })
+        };
+        let mut bank = ReplayBank::default();
+        bank.insert(payer, wallet(1_000_000_000), current_slot);
+        bank.insert(vote_pubkey, wallet(0), current_slot); // tx1 creates it
+
+        let replayer = Replayer::new(current_slot, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+        bank.configure_sysvars(current_slot, 1_700_000_000);
+        bank.set_slot_hashes(&[(voted_slot, voted_hash)]);
+        replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+
+        let run = |bank: &mut ReplayBank, ixs: &[Instruction]| -> TransactionProcessingResult {
+            let msg = Message::new(ixs, Some(&payer));
+            let tx = VersionedTransaction {
+                signatures: vec![Signature::default(); msg.header.num_required_signatures as usize],
+                message: VersionedMessage::Legacy(msg),
+            };
+            let sanitized = sanitize(&tx, &crate::block::LoadedAddresses::default()).unwrap();
+            let result = replayer.execute(bank, &sanitized, 5_000, epoch);
+            commit_writes(bank, &sanitized, &result, current_slot);
+            result
+        };
+
+        // Tx1: create the account and let the Vote program initialize its state,
+        // so we never hand-build a VoteState.
+        let vote_init = VoteInit {
+            node_pubkey: identity,
+            authorized_voter: identity,
+            authorized_withdrawer: identity,
+            commission: 0,
+        };
+        let create = create_account_with_config(
+            &payer,
+            &vote_pubkey,
+            &vote_init,
+            30_000_000,
+            CreateVoteAccountConfig::default(),
+        );
+        let r1 = run(&mut bank, &create);
+        assert!(
+            matches!(&r1, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "create + initialize should succeed (proves the Vote builtin runs): {r1:?}"
+        );
+
+        // Tx2: vote for `voted_slot` via TowerSync (what mainnet uses; the legacy
+        // Vote instruction is deprecated under the current feature set). The program
+        // reads SlotHashes from the sysvar cache to check the slot is real, so this
+        // only passes because we seeded SlotHashes with (voted_slot, voted_hash).
+        let vote_ix = tower_sync(
+            &vote_pubkey,
+            &identity,
+            TowerSync::new_from_slot(voted_slot, voted_hash),
+        );
+        let r2 = run(&mut bank, &[vote_ix]);
+        assert!(
+            matches!(&r2, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "tower-sync vote should succeed against a matching SlotHashes (proves SlotHashes is read): {r2:?}"
         );
     }
 }
