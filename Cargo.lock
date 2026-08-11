@@ -3806,16 +3806,21 @@ dependencies = [
  "solana-epoch-schedule",
  "solana-fee-structure",
  "solana-hash 3.1.0",
+ "solana-instruction",
+ "solana-message",
  "solana-program-runtime",
  "solana-pubkey 4.2.0",
  "solana-rent",
  "solana-sdk-ids",
+ "solana-signature",
  "solana-svm",
  "solana-svm-callback",
  "solana-svm-feature-set",
  "solana-system-program",
  "solana-sysvar-id",
  "solana-transaction",
+ "tar",
+ "zstd",
 ]
 
 [[package]]

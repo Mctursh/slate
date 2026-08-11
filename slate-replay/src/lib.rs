@@ -9,6 +9,7 @@
 pub mod block;
 pub mod fixture;
 pub mod oracle;
+pub mod snapshot;
 
 use std::{
     collections::HashMap,
@@ -32,7 +33,7 @@ use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_svm::{
     account_loader::CheckedTransactionDetails,
-    transaction_processing_result::TransactionProcessingResult,
+    transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     transaction_processor::{
         TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
     },
@@ -41,6 +42,11 @@ use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use solana_svm_feature_set::SVMFeatureSet;
 use solana_sysvar_id::SysvarId;
 use solana_transaction::sanitized::SanitizedTransaction;
+
+use crate::{
+    block::{Block, sanitize},
+    oracle::reconcile,
+};
 
 /// Replay walks a single linear chain of slots, so there are no forks to reason
 /// about — the program cache only ever needs "unknown".
@@ -288,6 +294,86 @@ impl Replayer {
         );
         output.processing_results.remove(0)
     }
+
+    /// Replay every transaction in `block` in order against `bank`, reconciling
+    /// each against the block meta and committing a successful tx's writes back so
+    /// the next tx sees them. Stops at the first transaction it can't replay (a
+    /// v0/lookup-table tx, unsupported for now) or whose result diverges from the
+    /// chain — a divergence leaves the bank unreliable, so continuing is pointless.
+    /// `bank` must already be seeded and have its builtins registered.
+    pub fn replay_block(&self, bank: &mut ReplayBank, block: &Block, epoch: u64) -> BlockReplay {
+        bank.configure_sysvars(block.slot, block.block_time);
+        self.processor.fill_missing_sysvar_cache_entries(bank);
+
+        for (i, block_tx) in block.transactions.iter().enumerate() {
+            let tx = match sanitize(&block_tx.transaction) {
+                Ok(tx) => tx,
+                Err(err) => return BlockReplay::halted(i, format!("cannot sanitize: {err}")),
+            };
+            let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
+
+            let result = self.execute(bank, tx, block_tx.meta.fee, epoch);
+            let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
+            if !reconciliation.matched() {
+                return BlockReplay::halted(i, reconciliation.issues.join("; "));
+            }
+
+            commit_writes(bank, &result, block.slot);
+        }
+
+        BlockReplay::complete(block.transactions.len())
+    }
+}
+
+/// Apply a successful transaction's account writes back into the bank so later
+/// transactions in the same block see them. A failed-but-executed tx still charges
+/// its fee and rolls the rest back; committing that correctly (the fee-payer
+/// rollback) is still a TODO — until then a block containing a failed tx halts at
+/// the next tx whose payer balance no longer lines up, which is caught, not silent.
+fn commit_writes(bank: &mut ReplayBank, result: &TransactionProcessingResult, slot: u64) {
+    if let Ok(ProcessedTransaction::Executed(executed)) = result
+        && executed.was_successful()
+    {
+        for (key, account) in &executed.loaded_transaction.accounts {
+            bank.insert(*key, account.clone(), slot);
+        }
+    }
+}
+
+/// The outcome of replaying a block: how many transactions committed cleanly, and
+/// where it stopped if it didn't finish.
+#[derive(Debug)]
+pub struct BlockReplay {
+    pub replayed: usize,
+    pub halt: Option<Halt>,
+}
+
+/// Where and why a block replay stopped early.
+#[derive(Debug)]
+pub struct Halt {
+    pub tx_index: usize,
+    pub reason: String,
+}
+
+impl BlockReplay {
+    fn complete(replayed: usize) -> Self {
+        Self {
+            replayed,
+            halt: None,
+        }
+    }
+
+    fn halted(tx_index: usize, reason: String) -> Self {
+        Self {
+            replayed: tx_index,
+            halt: Some(Halt { tx_index, reason }),
+        }
+    }
+
+    /// Whether the whole block replayed and reconciled.
+    pub fn is_complete(&self) -> bool {
+        self.halt.is_none()
+    }
 }
 
 #[cfg(test)]
@@ -523,5 +609,119 @@ mod tests {
             "replay CU (chain was {})",
             fixture::cpi::COMPUTE_UNITS
         );
+    }
+
+    #[test]
+    fn replays_a_block_and_commits() {
+        use solana_account::ReadableAccount;
+
+        let s = fixture::cpi::SLOT;
+        let epoch = s / 432_000;
+        let mut bank = fixture::cpi::seed_bank();
+        let replayer = Replayer::new(s, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+
+        let block = fixture::cpi::block();
+        let outcome = replayer.replay_block(&mut bank, &block, epoch);
+
+        assert!(
+            outcome.is_complete(),
+            "block should replay clean, halted: {:?}",
+            outcome.halt
+        );
+        assert_eq!(outcome.replayed, 1);
+
+        // The commit landed in the bank: the CPI recipient now holds its post
+        // balance, so a following tx in the same block would read it.
+        let (recipient, _) = bank
+            .get_account_shared_data(&fixture::cpi::WALLET2.parse().unwrap())
+            .expect("recipient present after commit");
+        assert_eq!(recipient.lamports(), fixture::cpi::WALLET2_POST);
+    }
+
+    #[test]
+    fn seeds_from_snapshot_and_replays_chained_transfers() {
+        use solana_account::ReadableAccount;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        // The real test-validator snapshot we developed the loader against.
+        const SNAPSHOT: &[u8] = include_bytes!("test_snapshot.tar.zst");
+        let system = solana_sdk_ids::system_program::id();
+
+        // Fund from the richest dataless system-owned account in the snapshot.
+        let accounts = snapshot::load_accounts(SNAPSHOT, None).unwrap();
+        let (src, src_balance) = accounts
+            .iter()
+            .filter(|(_, (a, _))| *a.owner() == system && a.data().is_empty())
+            .map(|(k, (a, _))| (*k, a.lamports()))
+            .max_by_key(|&(_, bal)| bal)
+            .expect("a funded system wallet in the snapshot");
+
+        let mid = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+        let (amount1, amount2, fee) = (2_000_000u64, 1_000_000u64, 5_000u64);
+
+        let slot = 201; // just after the snapshot's slot (200)
+        let epoch = slot / 432_000;
+        let mut bank = snapshot::seed_bank_from_snapshot(SNAPSHOT, None).unwrap();
+        let replayer = Replayer::new(slot, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+
+        let transfer = |from: &Pubkey, to: &Pubkey, lamports: u64| -> VersionedTransaction {
+            let mut data = vec![2u8, 0, 0, 0]; // SystemInstruction::Transfer discriminant
+            data.extend_from_slice(&lamports.to_le_bytes());
+            let ix = Instruction {
+                program_id: system,
+                accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
+                data,
+            };
+            let message = Message::new_with_blockhash(&[ix], Some(from), &Hash::default());
+            VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: VersionedMessage::Legacy(message),
+            }
+        };
+        let meta = |pre: [u64; 3], post: [u64; 3]| block::TxMeta {
+            err: None,
+            fee,
+            compute_units_consumed: 150,
+            pre_balances: pre.to_vec(),
+            post_balances: post.to_vec(),
+            loaded_addresses: block::LoadedAddresses::default(),
+        };
+
+        // src -> mid, then mid -> dst. mid's pre-balance in tx2 only lines up if
+        // tx1 committed first, so this exercises the tx-to-tx commit chaining.
+        let block = block::Block {
+            slot,
+            parent_slot: slot - 1,
+            blockhash: Hash::default(),
+            block_time: 1_700_000_000,
+            transactions: vec![
+                block::BlockTx {
+                    transaction: transfer(&src, &mid, amount1),
+                    meta: meta(
+                        [src_balance, 0, 1],
+                        [src_balance - amount1 - fee, amount1, 1],
+                    ),
+                },
+                block::BlockTx {
+                    transaction: transfer(&mid, &dst, amount2),
+                    meta: meta([amount1, 0, 1], [amount1 - amount2 - fee, amount2, 1]),
+                },
+            ],
+        };
+
+        let outcome = replayer.replay_block(&mut bank, &block, epoch);
+        assert!(outcome.is_complete(), "block halted: {:?}", outcome.halt);
+        assert_eq!(outcome.replayed, 2);
+
+        let balance = |pk: &Pubkey| bank.get_account_shared_data(pk).unwrap().0.lamports();
+        assert_eq!(balance(&src), src_balance - amount1 - fee);
+        assert_eq!(balance(&mid), amount1 - amount2 - fee);
+        assert_eq!(balance(&dst), amount2);
     }
 }

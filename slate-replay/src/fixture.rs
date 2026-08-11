@@ -190,6 +190,47 @@ pub mod cpi {
             .expect("transaction sanitizes")
     }
 
+    pub fn versioned_transaction() -> solana_transaction::versioned::VersionedTransaction {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(TX_BASE64)
+            .expect("valid base64");
+        bincode::deserialize(&bytes).expect("versioned transaction")
+    }
+
+    /// The real getBlock meta for this tx, in canonical account order:
+    /// [payer, wallet1, wallet2, System, ComputeBudget, FdDd].
+    pub fn meta() -> crate::block::TxMeta {
+        crate::block::TxMeta {
+            err: None,
+            fee: FEE,
+            compute_units_consumed: COMPUTE_UNITS,
+            pre_balances: vec![PAYER_PRE, WALLET1_PRE, WALLET2_PRE, 1, 1, PROGRAM_LAMPORTS],
+            post_balances: vec![
+                PAYER_POST,
+                WALLET1_POST,
+                WALLET2_POST,
+                1,
+                1,
+                PROGRAM_LAMPORTS,
+            ],
+            loaded_addresses: crate::block::LoadedAddresses::default(),
+        }
+    }
+
+    /// This fixture as a one-transaction block, for exercising the replay loop.
+    pub fn block() -> crate::block::Block {
+        crate::block::Block {
+            slot: SLOT,
+            parent_slot: SLOT - 1,
+            blockhash: solana_hash::Hash::default(),
+            block_time: BLOCK_TIME,
+            transactions: vec![crate::block::BlockTx {
+                transaction: versioned_transaction(),
+                meta: meta(),
+            }],
+        }
+    }
+
     pub fn seed_bank() -> ReplayBank {
         let mut bank = ReplayBank::default();
         bank.insert(
