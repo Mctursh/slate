@@ -310,6 +310,20 @@ impl Replayer {
         fee: u64,
         epoch: u64,
     ) -> TransactionProcessingResult {
+        self.execute_with(&self.processor, bank, tx, fee, epoch)
+    }
+
+    /// Like [`Replayer::execute`] but against an explicit `processor`. The per-slot
+    /// loop passes a `new_from` processor so each slot executes against a fresh
+    /// sysvar cache while sharing the program cache and builtins.
+    fn execute_with(
+        &self,
+        processor: &TransactionBatchProcessor<SlateForkGraph>,
+        bank: &ReplayBank,
+        tx: &SanitizedTransaction,
+        fee: u64,
+        epoch: u64,
+    ) -> TransactionProcessingResult {
         let env = self.environment(*tx.message().recent_blockhash(), epoch);
         // Parse the tx's OWN compute-budget instructions for its real CU limit,
         // price, and loaded-data-size limit — not a default. A tx that exhausts its
@@ -330,7 +344,7 @@ impl Replayer {
             }
             Err(err) => Err(err),
         };
-        let mut output = self.processor.load_and_execute_sanitized_transactions(
+        let mut output = processor.load_and_execute_sanitized_transactions(
             bank,
             std::slice::from_ref(tx),
             vec![check_result],
@@ -347,8 +361,19 @@ impl Replayer {
     /// chain — a divergence leaves the bank unreliable, so continuing is pointless.
     /// `bank` must already be seeded and have its builtins registered.
     pub fn replay_block(&self, bank: &mut ReplayBank, block: &Block, epoch: u64) -> BlockReplay {
+        self.replay_block_with(&self.processor, bank, block, epoch)
+    }
+
+    /// Replay `block` against an explicit `processor` (see [`Replayer::execute_with`]).
+    fn replay_block_with(
+        &self,
+        processor: &TransactionBatchProcessor<SlateForkGraph>,
+        bank: &mut ReplayBank,
+        block: &Block,
+        epoch: u64,
+    ) -> BlockReplay {
         bank.configure_sysvars(block.slot, block.block_time);
-        self.processor.fill_missing_sysvar_cache_entries(bank);
+        processor.fill_missing_sysvar_cache_entries(bank);
 
         for (i, block_tx) in block.transactions.iter().enumerate() {
             let tx = match sanitize(&block_tx.transaction, &block_tx.meta.loaded_addresses) {
@@ -357,7 +382,7 @@ impl Replayer {
             };
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
-            let result = self.execute(bank, &tx, block_tx.meta.fee, epoch);
+            let result = self.execute_with(processor, bank, &tx, block_tx.meta.fee, epoch);
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {
                 return BlockReplay::halted(i, reconciliation.issues.join("; "));
@@ -367,6 +392,34 @@ impl Replayer {
         }
 
         BlockReplay::complete(block.transactions.len())
+    }
+
+    /// Replay a contiguous range of blocks in slot order against one `bank`, which
+    /// rolls forward from block to block (each block's committed writes are visible
+    /// to the next). Each block gets a fresh per-slot processor via `new_from`, so
+    /// the sysvar cache (Clock, etc.) advances with the slot while the program cache
+    /// and builtins carry over — programs aren't reloaded every slot. Stops at the
+    /// first block that doesn't fully replay and reports where.
+    ///
+    /// Intra-epoch only: crossing an epoch boundary needs feature-activation and
+    /// reward machinery that isn't built yet, and the feature set is fixed at
+    /// construction. `bank` must already be seeded with builtins registered.
+    pub fn replay_range(&self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
+        for (completed, block) in blocks.iter().enumerate() {
+            let epoch = block.slot / 432_000;
+            let processor = self.processor.new_from(block.slot, epoch);
+            let block_replay = self.replay_block_with(&processor, bank, block, epoch);
+            if !block_replay.is_complete() {
+                return RangeReplay {
+                    blocks_completed: completed,
+                    halt: Some((block.slot, block_replay)),
+                };
+            }
+        }
+        RangeReplay {
+            blocks_completed: blocks.len(),
+            halt: None,
+        }
     }
 }
 
@@ -448,6 +501,21 @@ impl BlockReplay {
     }
 
     /// Whether the whole block replayed and reconciled.
+    pub fn is_complete(&self) -> bool {
+        self.halt.is_none()
+    }
+}
+
+/// The outcome of replaying a range of blocks: how many completed, and where it
+/// stopped if a block diverged — the slot plus that block's [`BlockReplay`].
+#[derive(Debug)]
+pub struct RangeReplay {
+    pub blocks_completed: usize,
+    pub halt: Option<(u64, BlockReplay)>,
+}
+
+impl RangeReplay {
+    /// Whether every block in the range replayed and reconciled.
     pub fn is_complete(&self) -> bool {
         self.halt.is_none()
     }
@@ -1116,5 +1184,99 @@ mod tests {
             matches!(&r2, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
             "tower-sync vote should succeed against a matching SlotHashes (proves SlotHashes is read): {r2:?}"
         );
+    }
+
+    #[test]
+    fn replays_a_range_rolling_the_bank_forward() {
+        use solana_account::ReadableAccount;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let src = Pubkey::new_unique();
+        let mid = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+        let fee = 5_000u64;
+        let src_pre = 10_000_000u64;
+        let a1 = 3_000_000u64;
+        let a2 = 1_000_000u64;
+        let base_slot = 300u64;
+
+        // A one-transfer block plus the meta the oracle reconciles against
+        // (account order is [from, to, system]).
+        let transfer_block = |from: Pubkey, to: Pubkey, amount: u64, from_pre: u64, slot: u64| {
+            let mut data = vec![2u8, 0, 0, 0]; // System Transfer
+            data.extend_from_slice(&amount.to_le_bytes());
+            let ix = Instruction {
+                program_id: system,
+                accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+                data,
+            };
+            let message = Message::new(&[ix], Some(&from));
+            let tx = VersionedTransaction {
+                signatures: vec![
+                    Signature::default();
+                    message.header.num_required_signatures as usize
+                ],
+                message: VersionedMessage::Legacy(message),
+            };
+            Block {
+                slot,
+                parent_slot: slot - 1,
+                blockhash: Hash::default(),
+                block_time: 0,
+                transactions: vec![crate::block::BlockTx {
+                    transaction: tx,
+                    meta: crate::block::TxMeta {
+                        err: None,
+                        fee,
+                        compute_units_consumed: 0,
+                        pre_balances: vec![from_pre, 0, 1],
+                        post_balances: vec![from_pre - amount - fee, amount, 1],
+                        loaded_addresses: crate::block::LoadedAddresses::default(),
+                    },
+                }],
+            }
+        };
+
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            src,
+            AccountSharedData::from(Account {
+                lamports: src_pre,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            base_slot,
+        );
+        let replayer = Replayer::new(base_slot, base_slot / 432_000);
+        register_builtins(&mut bank, &replayer.processor);
+
+        // Block N: src -> mid. Block N+1: mid -> dst, which only reconciles if
+        // block N's write to `mid` rolled forward into the next slot.
+        let blocks = [
+            transfer_block(src, mid, a1, src_pre, base_slot),
+            transfer_block(mid, dst, a2, a1, base_slot + 1),
+        ];
+        let range = replayer.replay_range(&mut bank, &blocks);
+        assert!(
+            range.is_complete(),
+            "both blocks should replay: {:?}",
+            range.halt
+        );
+        assert_eq!(range.blocks_completed, 2);
+
+        let balance = |pk: &Pubkey| {
+            bank.get_account_shared_data(pk)
+                .map(|(a, _)| a.lamports())
+                .unwrap_or(0)
+        };
+        assert_eq!(balance(&src), src_pre - a1 - fee);
+        assert_eq!(balance(&mid), a1 - a2 - fee);
+        assert_eq!(balance(&dst), a2);
     }
 }

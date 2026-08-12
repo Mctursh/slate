@@ -3,6 +3,8 @@
 //! embedded fixture); the thin reqwest wrapper that fetches a slot lives with
 //! the loop, since network I/O is the orchestrator's job, not the engine's.
 
+use std::collections::HashSet;
+
 use agave_reserved_account_keys::ReservedAccountKeys;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -232,6 +234,33 @@ pub fn sanitize(
     .context("transaction failed to sanitize")
 }
 
+/// The set of accounts a range of blocks touches — the seed set to pull from the
+/// snapshot. It's the union of every transaction's static account keys and the
+/// addresses it loaded from lookup tables, plus every feature account so the
+/// per-slot feature set can be computed.
+///
+/// Deliberately NOT owner-filtered: our program's transactions read accounts other
+/// transactions write, so scoping the seed to one program yields stale reads. The
+/// footprint bounds memory by skipping dormant untouched accounts, never by
+/// narrowing the read-set.
+///
+/// Two things it does not add: sysvars (Clock/Rent/EpochSchedule are synthesized;
+/// SlotHashes/StakeHistory content is a separate snapshot-seeded step), and an
+/// upgradeable program's programdata account, which is resolved when the program
+/// is loaded, not here.
+pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
+    let mut set = HashSet::new();
+    for block in blocks {
+        for tx in &block.transactions {
+            set.extend(tx.transaction.message.static_account_keys().iter().copied());
+            set.extend(tx.meta.loaded_addresses.writable.iter().copied());
+            set.extend(tx.meta.loaded_addresses.readonly.iter().copied());
+        }
+    }
+    set.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +293,53 @@ mod tests {
         // legacy tx: no lookup-table addresses
         assert!(t0.meta.loaded_addresses.writable.is_empty());
         assert!(t0.meta.loaded_addresses.readonly.is_empty());
+    }
+
+    #[test]
+    fn footprint_covers_static_loaded_and_features() {
+        let json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let block = Block::from_getblock(437_680_849, &json["result"]).unwrap();
+        let statics: Vec<Pubkey> = block.transactions[0]
+            .transaction
+            .message
+            .static_account_keys()
+            .to_vec();
+
+        // Re-wrap tx0 with synthetic loaded addresses to exercise that path (the
+        // fixture is all legacy, so its real loaded set is empty).
+        let w = Pubkey::new_unique();
+        let r = Pubkey::new_unique();
+        let synthetic = Block {
+            slot: 1,
+            parent_slot: 0,
+            blockhash: Hash::default(),
+            block_time: 0,
+            transactions: vec![BlockTx {
+                transaction: block.transactions[0].transaction.clone(),
+                meta: TxMeta {
+                    err: None,
+                    fee: 0,
+                    compute_units_consumed: 0,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    loaded_addresses: LoadedAddresses {
+                        writable: vec![w],
+                        readonly: vec![r],
+                    },
+                },
+            }],
+        };
+
+        let fp = footprint(std::slice::from_ref(&synthetic));
+        for key in &statics {
+            assert!(fp.contains(key), "static key {key} missing from footprint");
+        }
+        assert!(fp.contains(&w), "loaded writable missing");
+        assert!(fp.contains(&r), "loaded readonly missing");
+        assert!(
+            fp.contains(agave_feature_set::FEATURE_NAMES.keys().next().unwrap()),
+            "feature accounts missing"
+        );
     }
 
     #[test]
