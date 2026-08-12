@@ -32,15 +32,13 @@ agave-feature-set = { version = "3.1.14", features = ["agave-unstable-api"] }
 solana-compute-budget-instruction = { version = "3.1.12", features = ["agave-unstable-api"] }
 solana-svm-transaction = "3.1.14"
 agave-syscalls = "3.1.14"
-solana-compute-budget-program = { version = "3.1.14", features = ["agave-unstable-api"] }
-solana-bpf-loader-program = "3.1.14"
-solana-vote-program = "3.1.14"
 solana-slot-hashes = "3.1.0"
 solana-fee-structure = "3.0.0"
 solana-svm-feature-set = "3.1.14"
 solana-hash = "3.1.0"
 
 anyhow = "1"
+solana-builtins = { version = "3", features = ["agave-unstable-api"] }
 
 [dev-dependencies]
 solana-message = "3"

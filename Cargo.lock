@@ -3800,11 +3800,10 @@ dependencies = [
  "reqwest",
  "serde_json",
  "solana-account",
- "solana-bpf-loader-program",
+ "solana-builtins",
  "solana-clock",
  "solana-compute-budget",
  "solana-compute-budget-instruction",
- "solana-compute-budget-program",
  "solana-epoch-schedule",
  "solana-fee-structure",
  "solana-hash 3.1.0",
@@ -3825,7 +3824,6 @@ dependencies = [
  "solana-transaction",
  "solana-transaction-error",
  "solana-vote-interface",
- "solana-vote-program",
  "tar",
  "zstd",
 ]
@@ -4202,6 +4200,26 @@ dependencies = [
  "solana-measure",
  "solana-pubkey 3.0.0",
  "tempfile",
+]
+
+[[package]]
+name = "solana-builtins"
+version = "3.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc47a5aefa70261825037efd942c2c78a600f4dcc110d59808b359c5d37aa941"
+dependencies = [
+ "agave-feature-set",
+ "solana-bpf-loader-program",
+ "solana-compute-budget-program",
+ "solana-hash 3.1.0",
+ "solana-loader-v4-program",
+ "solana-program-runtime",
+ "solana-pubkey 3.0.0",
+ "solana-sdk-ids",
+ "solana-system-program",
+ "solana-vote-program",
+ "solana-zk-elgamal-proof-program",
+ "solana-zk-token-proof-program",
 ]
 
 [[package]]
@@ -5541,7 +5559,6 @@ dependencies = [
  "solana-hash 3.1.0",
  "solana-instruction",
  "solana-keypair",
- "solana-metrics",
  "solana-packet",
  "solana-program-runtime",
  "solana-pubkey 3.0.0",
@@ -5564,6 +5581,23 @@ dependencies = [
  "borsh",
  "bytemuck",
  "bytemuck_derive",
+]
+
+[[package]]
+name = "solana-zk-elgamal-proof-program"
+version = "3.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14f30c80edc4aac841745f7e93bbf1afc27d2b496b8ae9fe9777935151cb9352"
+dependencies = [
+ "agave-feature-set",
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "solana-instruction",
+ "solana-program-runtime",
+ "solana-sdk-ids",
+ "solana-svm-log-collector",
+ "solana-zk-sdk",
 ]
 
 [[package]]
@@ -5600,6 +5634,57 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
+name = "solana-zk-token-proof-program"
+version = "3.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "962938a9994cc6d54b46b5f0d6a978024f4847272f560f8f11edd1575a0d8e8f"
+dependencies = [
+ "agave-feature-set",
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "solana-instruction",
+ "solana-program-runtime",
+ "solana-sdk-ids",
+ "solana-svm-log-collector",
+ "solana-zk-token-sdk",
+]
+
+[[package]]
+name = "solana-zk-token-sdk"
+version = "3.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e5fe47f0389206960e272a6f1af3b06c2b32551be77f9e4254564b6d1177b83"
+dependencies = [
+ "aes-gcm-siv",
+ "base64 0.22.1",
+ "bincode",
+ "bytemuck",
+ "bytemuck_derive",
+ "curve25519-dalek",
+ "itertools 0.12.1",
+ "merlin",
+ "num-derive",
+ "num-traits",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha3",
+ "solana-curve25519",
+ "solana-derivation-path",
+ "solana-instruction",
+ "solana-pubkey 3.0.0",
+ "solana-sdk-ids",
+ "solana-seed-derivable",
+ "solana-seed-phrase",
+ "solana-signature",
+ "solana-signer",
+ "subtle",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 

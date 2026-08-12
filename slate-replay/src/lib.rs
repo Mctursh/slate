@@ -154,71 +154,66 @@ impl ReplayBank {
     }
 }
 
-/// Register the builtins the current fixture needs. A bare System transfer needs
-/// only the System program.
+/// Register the native builtin programs the SVM runs directly (System, Vote, the
+/// BPF loaders, ComputeBudget, loader-v4, the ZK proof programs), straight from
+/// agave's canonical `solana_builtins::BUILTINS` list so the set stays exactly in
+/// sync with the runtime.
+///
+/// Stake, Config, and AddressLookupTable are deliberately absent: they've been
+/// migrated to Core BPF, so they run as ordinary BPF programs loaded from their
+/// on-chain bytecode through the loaders above, not as native builtins. That's
+/// also why no 3.x crate for them exists to register.
+///
+/// Every entry is registered because we run with all features enabled. Once we
+/// compute the exact per-slot feature set, gate on `enable_feature_id` so a
+/// program only counts as a builtin from the slot its feature activated.
 pub fn register_builtins(
     bank: &mut ReplayBank,
     processor: &TransactionBatchProcessor<SlateForkGraph>,
 ) {
-    // System program (native builtin).
-    bank.add_builtin(
-        processor,
-        solana_system_program::id(),
-        "system_program",
-        ProgramCacheEntry::new_builtin(
-            0,
-            "system_program".len(),
-            solana_system_program::system_processor::Entrypoint::vm,
-        ),
-    );
-    // The BPF loaders — required so programs owned by them can be loaded + run.
-    for (id, name) in [
-        (
-            solana_sdk_ids::bpf_loader_upgradeable::id(),
-            "solana_bpf_loader_upgradeable_program",
-        ),
-        (
-            solana_sdk_ids::bpf_loader::id(),
-            "solana_bpf_loader_program",
-        ),
-        (
-            solana_sdk_ids::bpf_loader_deprecated::id(),
-            "solana_bpf_loader_deprecated_program",
-        ),
-    ] {
+    for builtin in solana_builtins::BUILTINS {
         bank.add_builtin(
             processor,
-            id,
-            name,
-            ProgramCacheEntry::new_builtin(
-                0,
-                name.len(),
-                solana_bpf_loader_program::Entrypoint::vm,
-            ),
+            builtin.program_id,
+            builtin.name,
+            ProgramCacheEntry::new_builtin(0, builtin.name.len(), builtin.entrypoint),
         );
     }
-    // ComputeBudget (native builtin) — txs that set a CU limit/price invoke it.
-    bank.add_builtin(
-        processor,
-        solana_sdk_ids::compute_budget::id(),
-        "compute_budget_program",
-        ProgramCacheEntry::new_builtin(
-            0,
-            "compute_budget_program".len(),
-            solana_compute_budget_program::Entrypoint::vm,
-        ),
-    );
-    // Vote program (native builtin) — vote txs are the bulk of a real block.
-    bank.add_builtin(
-        processor,
-        solana_sdk_ids::vote::id(),
-        "vote_program",
-        ProgramCacheEntry::new_builtin(
-            0,
-            "vote_program".len(),
-            solana_vote_program::vote_processor::Entrypoint::vm,
-        ),
-    );
+}
+
+/// A feature account's activation slot: `Some(slot)` when the account is owned by
+/// the feature program and its `Feature { activated_at }` is set, `None` otherwise
+/// (wrong owner, too small, unparsable, or not yet activated). `Feature` is a lone
+/// `Option<u64>` field, so it decodes straight as one; an inactive account's
+/// zero-padded body simply fails to decode as `Some`, which is the answer we want.
+fn feature_activation(account: &AccountSharedData) -> Option<u64> {
+    use solana_account::ReadableAccount;
+    // 9 == Feature::size_of() (1-byte Option tag + u64).
+    if *account.owner() != solana_sdk_ids::feature::id() || account.data().len() < 9 {
+        return None;
+    }
+    bincode::deserialize::<Option<u64>>(account.data())
+        .ok()
+        .flatten()
+}
+
+/// Build the feature set active at `slot` from the feature accounts already in
+/// `bank` (seeded from the snapshot), instead of `FeatureSet::all_enabled()`. A
+/// feature counts as active only if its account carries an activation slot at or
+/// before `slot`. This is the exact set the runtime executed against; feature-
+/// gated program behavior (and the derived syscall set) depends on getting it
+/// right, which `all_enabled` doesn't for a historical slot.
+pub fn build_feature_set(bank: &ReplayBank, slot: u64) -> FeatureSet {
+    let mut feature_set = FeatureSet::default(); // everything inactive to start
+    for feature_id in agave_feature_set::FEATURE_NAMES.keys() {
+        if let Some((account, _)) = bank.get_account_shared_data(feature_id)
+            && let Some(activated_slot) = feature_activation(&account)
+            && activated_slot <= slot
+        {
+            feature_set.activate(feature_id, activated_slot);
+        }
+    }
+    feature_set
 }
 
 // All methods default to "no epoch stake / no precompiles"; replay fills
@@ -244,18 +239,22 @@ pub struct Replayer {
 }
 
 impl Replayer {
-    /// Build an execution-ready processor for `slot`/`epoch`. Passing `None` for
-    /// both loaders gives the default empty (no-syscall) VM environment, which is
-    /// fine for builtin-only txs like a System transfer; BPF programs need a real
-    /// loader here later.
+    /// Build an execution-ready processor for `slot`/`epoch` with every feature
+    /// enabled. Fine for the fixtures and any builtin-only path; a faithful replay
+    /// of a real slot uses [`Replayer::new_with_feature_set`] with the exact set
+    /// from [`build_feature_set`].
     pub fn new(slot: u64, epoch: u64) -> Self {
+        Self::new_with_feature_set(slot, epoch, FeatureSet::all_enabled())
+    }
+
+    /// Build the processor against an explicit `feature_set` — the exact per-slot
+    /// set derived from the on-chain feature accounts. The VM environment's syscall
+    /// set and costs, and the compute-budget parser, both key off it, so feature-
+    /// gated execution matches what ran on chain.
+    pub fn new_with_feature_set(slot: u64, epoch: u64, feature_set: FeatureSet) -> Self {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
-        // The real BPF VM environment: the exact syscall set + costs the runtime
-        // derives from the feature set. BPFLoader v1/v2 programs execute in here.
-        // all_enabled for now; the exact per-epoch set (built from the on-chain
-        // feature accounts) comes later. The SVM environment takes the derived
-        // SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
-        let feature_set = FeatureSet::all_enabled();
+        // The SVM environment takes the derived SVMFeatureSet; the compute-budget
+        // parser takes the runtime FeatureSet. Both are held for reuse per batch.
         let svm_feature_set = feature_set.runtime_features();
         let budget = SVMTransactionExecutionBudget::default();
         let loader = Arc::new(
@@ -480,17 +479,30 @@ mod tests {
     }
 
     #[test]
-    fn registers_vote_builtin() {
+    fn registers_the_full_builtin_set() {
         use solana_account::ReadableAccount;
         let mut bank = fixture::seed_bank();
         let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
         register_builtins(&mut bank, &replayer.processor);
 
-        let (acct, _) = bank
-            .get_account_shared_data(&solana_sdk_ids::vote::id())
-            .expect("vote program should be registered");
-        assert!(acct.executable());
-        assert_eq!(*acct.owner(), solana_sdk_ids::native_loader::id());
+        // Every builtin agave lists is registered, executable, and native-owned.
+        for builtin in solana_builtins::BUILTINS {
+            let (acct, _) = bank
+                .get_account_shared_data(&builtin.program_id)
+                .unwrap_or_else(|| panic!("{} not registered", builtin.name));
+            assert!(acct.executable(), "{} should be executable", builtin.name);
+            assert_eq!(*acct.owner(), solana_sdk_ids::native_loader::id());
+        }
+        // Vote and loader-v4 specifically — loader-v4 was missing from the old
+        // hand-written set, so this pins the expansion.
+        assert!(
+            bank.get_account_shared_data(&solana_sdk_ids::vote::id())
+                .is_some()
+        );
+        assert!(
+            bank.get_account_shared_data(&solana_sdk_ids::loader_v4::id())
+                .is_some()
+        );
     }
 
     #[test]
@@ -506,6 +518,48 @@ mod tests {
         assert_eq!(*acct.owner(), solana_sdk_ids::sysvar::id());
         let decoded: SlotHashes = bincode::deserialize(acct.data()).unwrap();
         assert_eq!(decoded, SlotHashes::new(&[(7, hash)]));
+    }
+
+    #[test]
+    fn builds_the_feature_set_from_accounts() {
+        let slot = 1_000u64;
+        let feature_program = solana_sdk_ids::feature::id();
+
+        // Real feature ids; which ones don't matter, only that they're distinct.
+        let ids: Vec<Pubkey> = agave_feature_set::FEATURE_NAMES
+            .keys()
+            .take(4)
+            .copied()
+            .collect();
+        let (active, future, inactive, absent) = (ids[0], ids[1], ids[2], ids[3]);
+
+        let feature_account = |activated_at: Option<u64>| {
+            let mut data = vec![0u8; 9]; // Feature::size_of()
+            bincode::serialize_into(&mut data[..], &activated_at).unwrap();
+            AccountSharedData::from(Account {
+                lamports: 1_000_000,
+                data,
+                owner: feature_program,
+                executable: false,
+                rent_epoch: 0,
+            })
+        };
+
+        let mut bank = ReplayBank::default();
+        bank.insert(active, feature_account(Some(500)), slot); // active: 500 <= 1000
+        bank.insert(future, feature_account(Some(2_000)), slot); // future: 2000 > 1000
+        bank.insert(inactive, feature_account(None), slot); // present but never activated
+        // `absent` is never inserted.
+
+        let fs = build_feature_set(&bank, slot);
+        assert!(fs.is_active(&active), "activated at 500 <= slot 1000");
+        assert_eq!(fs.activated_slot(&active), Some(500));
+        assert!(
+            !fs.is_active(&future),
+            "activation slot 2000 is after slot 1000"
+        );
+        assert!(!fs.is_active(&inactive), "activated_at is None");
+        assert!(!fs.is_active(&absent), "no feature account at all");
     }
 
     #[test]
