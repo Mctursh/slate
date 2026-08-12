@@ -9,6 +9,7 @@
 pub mod block;
 pub mod fixture;
 pub mod oracle;
+pub mod persist;
 pub mod snapshot;
 
 use std::{
@@ -75,11 +76,47 @@ impl ForkGraph for SlateForkGraph {
 pub struct ReplayBank {
     /// pubkey -> (account, slot it was last written)
     accounts: HashMap<Pubkey, (AccountSharedData, u64)>,
+    /// Transaction-committed writes in commit order, for the persistence layer.
+    /// Setup writes (seeds, builtins, sysvars) are deliberately not logged.
+    writes: Vec<WriteRecord>,
+    /// Monotonic counter so same-slot writes to one account order correctly.
+    write_version: u64,
+}
+
+/// One transaction-committed account write: the account's state at the slot it
+/// was written, tagged with a monotonic write version. This is what the
+/// persistence layer turns into rows, owner-filtered to the indexed program.
+#[derive(Clone)]
+pub struct WriteRecord {
+    pub slot: u64,
+    pub write_version: u64,
+    pub pubkey: Pubkey,
+    pub account: AccountSharedData,
 }
 
 impl ReplayBank {
     pub fn insert(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
         self.accounts.insert(key, (account, slot));
+    }
+
+    /// Commit a transaction's write: log it (for persistence) and update the
+    /// account map. Distinct from [`ReplayBank::insert`], which is for setup
+    /// (seeds, builtins, sysvars) that isn't a chain write and mustn't be persisted.
+    fn commit_write(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
+        self.write_version += 1;
+        self.writes.push(WriteRecord {
+            slot,
+            write_version: self.write_version,
+            pubkey: key,
+            account: account.clone(),
+        });
+        self.insert(key, account, slot);
+    }
+
+    /// The transaction-committed writes captured so far, in commit order. The
+    /// persistence layer owner-filters these to the program being indexed.
+    pub fn writes(&self) -> &[WriteRecord] {
+        &self.writes
     }
 
     /// Register a builtin (native) program: put its loader-owned account in the
@@ -448,7 +485,7 @@ fn commit_writes(
             if executed.was_successful() {
                 for (i, (key, account)) in executed.loaded_transaction.accounts.iter().enumerate() {
                     if message.is_writable(i) {
-                        bank.insert(*key, account.clone(), slot);
+                        bank.commit_write(*key, account.clone(), slot);
                     }
                 }
             } else {
@@ -466,7 +503,7 @@ fn commit_writes(
 /// an advanced nonce if the tx used one — back into the bank.
 fn commit_rollback(bank: &mut ReplayBank, rollback: &RollbackAccounts, slot: u64) {
     for (address, account) in rollback {
-        bank.insert(*address, account.clone(), slot);
+        bank.commit_write(*address, account.clone(), slot);
     }
 }
 

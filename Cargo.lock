@@ -3799,6 +3799,7 @@ dependencies = [
  "bincode",
  "reqwest",
  "serde_json",
+ "slate-store",
  "solana-account",
  "solana-builtins",
  "solana-clock",
@@ -3825,6 +3826,7 @@ dependencies = [
  "solana-transaction-error",
  "solana-vote-interface",
  "tar",
+ "tokio",
  "zstd",
 ]
 
