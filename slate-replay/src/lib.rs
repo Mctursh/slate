@@ -26,6 +26,7 @@ use solana_compute_budget_instruction::instructions_processor::process_compute_b
 use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
+use solana_precompile_error::PrecompileError;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
     loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
@@ -254,9 +255,30 @@ pub fn build_feature_set(bank: &ReplayBank, slot: u64) -> FeatureSet {
     feature_set
 }
 
-// All methods default to "no epoch stake / no precompiles"; replay fills
-// these in later (epoch stake for reward-adjacent execution, precompiles).
-impl InvokeContextCallback for ReplayBank {}
+// Precompile verification (ed25519 / secp256k1 / secp256r1) is wired to
+// agave-precompiles, so a tx carrying a precompile instruction is verified rather
+// than failing. Every precompile-enabling feature is active at the epoch-808
+// floor, so all of them count as enabled. Epoch stake stays at the default 0,
+// fine for anything that doesn't touch rewards.
+impl InvokeContextCallback for ReplayBank {
+    fn is_precompile(&self, program_id: &Pubkey) -> bool {
+        agave_precompiles::is_precompile(program_id, |_| true)
+    }
+
+    fn process_precompile(
+        &self,
+        program_id: &Pubkey,
+        data: &[u8],
+        instruction_datas: Vec<&[u8]>,
+    ) -> Result<(), PrecompileError> {
+        match agave_precompiles::get_precompile(program_id, |_| true) {
+            Some(precompile) => {
+                precompile.verify(data, &instruction_datas, &FeatureSet::all_enabled())
+            }
+            None => Err(PrecompileError::InvalidPublicKey),
+        }
+    }
+}
 
 impl TransactionProcessingCallback for ReplayBank {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, u64)> {
@@ -1318,5 +1340,43 @@ mod tests {
         assert_eq!(balance(&src), src_pre - a1 - fee);
         assert_eq!(balance(&mid), a1 - a2 - fee);
         assert_eq!(balance(&dst), a2);
+    }
+
+    #[test]
+    fn wires_precompile_verification() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let bank = ReplayBank::default();
+        let ed25519 = solana_sdk_ids::ed25519_program::id();
+
+        // is_precompile recognizes the ed25519 program but not an arbitrary id.
+        assert!(bank.is_precompile(&ed25519));
+        assert!(!bank.is_precompile(&Pubkey::new_unique()));
+
+        // A valid ed25519 signature over a message, built into a self-contained
+        // precompile instruction, verifies through process_precompile.
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let message = b"slate precompile test";
+        let signature = signing_key.sign(message).to_bytes();
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let ix = solana_ed25519_program::new_ed25519_instruction_with_signature(
+            message, &signature, &pubkey,
+        );
+
+        assert!(
+            bank.process_precompile(&ed25519, &ix.data, vec![ix.data.as_slice()])
+                .is_ok(),
+            "a valid ed25519 signature should verify"
+        );
+
+        // Corrupting the signed message makes verification fail.
+        let mut corrupted = ix.data.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        assert!(
+            bank.process_precompile(&ed25519, &corrupted, vec![corrupted.as_slice()])
+                .is_err(),
+            "a corrupted precompile instruction must fail"
+        );
     }
 }

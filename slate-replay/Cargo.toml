@@ -39,6 +39,8 @@ solana-hash = "3.1.0"
 
 anyhow = "1"
 solana-builtins = { version = "3", features = ["agave-unstable-api"] }
+agave-precompiles = { version = "3.1.12", features = ["agave-unstable-api"] }
+solana-precompile-error = "3"
 slate-store = { path = "../slate-store" }
 
 [dev-dependencies]
@@ -46,4 +48,6 @@ solana-message = "3"
 solana-instruction = "3"
 solana-signature = "3"
 solana-vote-interface = { version = "4", features = ["bincode"] }
+solana-ed25519-program = "3"
+ed25519-dalek = "2"
 tokio = { workspace = true }
