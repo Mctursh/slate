@@ -301,6 +301,15 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
         }
     }
     set.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
+    // Sysvars the SVM's sysvar cache serves but replay does NOT synthesize:
+    // their values are historical (StakeHistory's stake-activation curve,
+    // EpochRewards, LastRestartSlot), so they have to be seeded from the snapshot.
+    // Clock / Rent / EpochSchedule / SlotHashes are left out because
+    // configure_sysvars rebuilds those fresh per slot. Without these, a stake tx
+    // that reads StakeHistory from the cache would get nothing.
+    set.insert(solana_sdk_ids::sysvar::stake_history::id());
+    set.insert(solana_sdk_ids::sysvar::epoch_rewards::id());
+    set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
     set
 }
 
@@ -339,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn footprint_covers_static_loaded_and_features() {
+    fn footprint_covers_static_loaded_features_and_sysvars() {
         let json: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
         let block = Block::from_getblock(437_680_849, &json["result"]).unwrap();
         let statics: Vec<Pubkey> = block.transactions[0]
@@ -384,6 +393,20 @@ mod tests {
             fp.contains(agave_feature_set::FEATURE_NAMES.keys().next().unwrap()),
             "feature accounts missing"
         );
+        // Non-synthesized cache sysvars must be seeded from the snapshot, so the
+        // footprint has to name them regardless of what the transactions touch.
+        assert!(
+            fp.contains(&solana_sdk_ids::sysvar::stake_history::id()),
+            "StakeHistory sysvar missing from footprint"
+        );
+        assert!(
+            fp.contains(&solana_sdk_ids::sysvar::epoch_rewards::id()),
+            "EpochRewards sysvar missing from footprint"
+        );
+        assert!(
+            fp.contains(&solana_sdk_ids::sysvar::last_restart_slot::id()),
+            "LastRestartSlot sysvar missing from footprint"
+        );
     }
 
     #[test]
@@ -420,6 +443,57 @@ mod tests {
             sanitized.message().account_keys().len(),
             t0.meta.pre_balances.len(),
         );
+    }
+
+    #[test]
+    fn detects_a_durable_nonce_tx() {
+        use solana_message::{
+            MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
+            legacy::Message,
+        };
+
+        let authority = Pubkey::new_unique();
+        let nonce = Pubkey::new_unique();
+        let recent_blockhashes = solana_sdk_ids::sysvar::recent_blockhashes::id();
+        let system = solana_sdk_ids::system_program::id();
+
+        // A legacy durable-nonce tx: authority is the writable signer, the nonce
+        // account is a writable non-signer (the last two unsigned keys are readonly),
+        // and the first instruction is System AdvanceNonceAccount. `build` lets the
+        // negative case reuse the exact same shape with a different discriminant.
+        let build = |data: Vec<u8>| VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: VersionedMessage::Legacy(Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 2,
+                },
+                account_keys: vec![authority, nonce, recent_blockhashes, system],
+                recent_blockhash: Hash::default(),
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 3,      // system program
+                    accounts: vec![1, 2, 0],  // nonce, recent_blockhashes, authority
+                    data,
+                }],
+            }),
+        };
+
+        // AdvanceNonceAccount is SystemInstruction discriminant 4.
+        let nonce_tx = build(4u32.to_le_bytes().to_vec());
+        let sanitized =
+            sanitize(&nonce_tx, &LoadedAddresses::default()).expect("nonce tx sanitizes");
+        assert_eq!(
+            sanitized.get_durable_nonce(),
+            Some(&nonce),
+            "the nonce account should be surfaced as the durable nonce"
+        );
+
+        // Same shape, but the first instruction is Transfer (2): not a nonce tx.
+        let plain_tx = build(2u32.to_le_bytes().to_vec());
+        let sanitized =
+            sanitize(&plain_tx, &LoadedAddresses::default()).expect("transfer sanitizes");
+        assert_eq!(sanitized.get_durable_nonce(), None);
     }
 
     #[test]

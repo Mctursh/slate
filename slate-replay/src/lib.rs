@@ -387,9 +387,8 @@ impl Replayer {
         let env = self.environment(*tx.message().recent_blockhash(), epoch);
         // Parse the tx's OWN compute-budget instructions for its real CU limit,
         // price, and loaded-data-size limit — not a default. A tx that exhausts its
-        // requested limit on chain must exhaust it here too. No nonce yet
-        // (durable-nonce txs are unhandled). A malformed budget is rejected on
-        // chain, so we fail it here the same way.
+        // requested limit on chain must exhaust it here too. A malformed budget is
+        // rejected on chain, so we fail it here the same way.
         let check_result = match process_compute_budget_instructions(
             SVMMessage::program_instructions_iter(tx),
             &self.feature_set,
@@ -400,7 +399,15 @@ impl Replayer {
                     FeeDetails::new(fee, 0),
                     true,
                 );
-                Ok(CheckedTransactionDetails::new(None, budget))
+                // A durable-nonce tx's first instruction is System
+                // AdvanceNonceAccount, and its "blockhash" is really the nonce held
+                // in a nonce account. get_durable_nonce returns that account; handing
+                // it to the SVM lets it advance the nonce and, on failure, still roll
+                // it back advanced, which a regular tx's fee-only rollback would not.
+                // The block is trusted, so we don't re-check the nonce value, just
+                // point the SVM at the account.
+                let nonce = tx.get_durable_nonce().copied();
+                Ok(CheckedTransactionDetails::new(nonce, budget))
             }
             Err(err) => Err(err),
         };
