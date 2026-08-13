@@ -94,18 +94,25 @@ fn account_file_slot(path: &Path) -> Option<u64> {
     path.file_name()?.to_str()?.split('.').next()?.parse().ok()
 }
 
-/// Load every live account from a snapshot archive, keyed by pubkey with the slot
-/// it was last written. Highest-slot value wins; a zero-lamport account at its
+/// Load live accounts from a snapshot archive, keyed by pubkey with the slot it
+/// was last written. Highest-slot value wins; a zero-lamport account at its
 /// highest slot has been deleted and is dropped.
 ///
-/// For the mainnet snapshot (millions of accounts) this must take a FOOTPRINT set
-/// to load only what the range touches. That footprint is the union of EVERY tx's
-/// account keys over the range — NOT owner/program-filtered. Our program's txs
-/// read accounts other txs update, so owner-scoping the seed yields stale reads.
-/// Program-filtering is only ever applied to what we persist, never to the seed.
+/// Two independent keep-filters, unioned in one pass:
+/// - `footprint` — load only these pubkeys (for the mainnet snapshot's millions of
+///   accounts, the range's read-set). It is the union of EVERY tx's account keys,
+///   NOT owner/program-filtered: our program's txs read accounts other txs write,
+///   so owner-scoping the seed would yield stale reads.
+/// - `keep_owned_by` — ALSO keep every account this program owns, regardless of
+///   footprint. That is the S_snap baseline the persist layer needs (the narrow
+///   store), captured in the same scan. Owner-filtering here is only ever for what
+///   we persist, never a narrowing of the seed.
+///
+/// An account is kept if it is in the footprint OR owned by `keep_owned_by`.
 pub fn load_accounts<R: Read>(
     reader: R,
     footprint: Option<&HashSet<Pubkey>>,
+    keep_owned_by: Option<&Pubkey>,
 ) -> Result<HashMap<Pubkey, (AccountSharedData, u64)>> {
     let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
     let mut archive = tar::Archive::new(decoder);
@@ -120,8 +127,11 @@ pub fn load_accounts<R: Read>(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).context("read account file")?;
         for (pubkey, account) in parse_append_vec(&bytes) {
-            // Skip during parse (bounds memory) anything outside the footprint.
-            if footprint.is_some_and(|footprint| !footprint.contains(&pubkey)) {
+            // Keep during parse (bounds memory) anything in the footprint (seed) or
+            // owned by the baseline program (persist).
+            let keep = footprint.is_none_or(|f| f.contains(&pubkey))
+                || keep_owned_by.is_some_and(|owner| account.owner() == owner);
+            if !keep {
                 continue;
             }
             match accounts.get(&pubkey) {
@@ -151,6 +161,7 @@ pub fn load_accounts_from_file(
     load_accounts(
         File::open(path).with_context(|| format!("open snapshot {path:?}"))?,
         footprint,
+        None,
     )
 }
 
@@ -163,7 +174,7 @@ pub fn seed_bank_from_snapshot<R: Read>(
     footprint: Option<&HashSet<Pubkey>>,
 ) -> Result<ReplayBank> {
     let mut bank = ReplayBank::default();
-    for (pubkey, (account, slot)) in load_accounts(reader, footprint)? {
+    for (pubkey, (account, slot)) in load_accounts(reader, footprint, None)? {
         bank.insert(pubkey, account, slot);
     }
     Ok(bank)
@@ -179,7 +190,7 @@ mod tests {
 
     #[test]
     fn loads_accounts_from_a_real_snapshot() {
-        let accounts = load_accounts(SNAPSHOT, None).unwrap();
+        let accounts = load_accounts(SNAPSHOT, None, None).unwrap();
 
         // Genesis alone seeds well over a hundred builtin/sysvar accounts.
         assert!(

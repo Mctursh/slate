@@ -6,6 +6,7 @@
 //! per-slot environment, sanitizing a real tx, and reconciling against getBlock)
 //! comes in Tasks 0.4–0.7.
 
+pub mod backfill;
 pub mod block;
 pub mod fixture;
 pub mod oracle;
@@ -923,7 +924,7 @@ mod tests {
         let system = solana_sdk_ids::system_program::id();
 
         // Fund from the richest dataless system-owned account in the snapshot.
-        let accounts = snapshot::load_accounts(SNAPSHOT, None).unwrap();
+        let accounts = snapshot::load_accounts(SNAPSHOT, None, None).unwrap();
         let (src, src_balance) = accounts
             .iter()
             .filter(|(_, (a, _))| *a.owner() == system && a.data().is_empty())

@@ -6,8 +6,10 @@
 //! filters the replay's write log down to that program and writes one row per
 //! (account, slot) it changed, which is exactly what an as-of-slot query needs.
 
+use std::collections::HashMap;
+
 use slate_store::{AccountUpdateInsert, ClickHouseClient, StoreResult};
-use solana_account::ReadableAccount;
+use solana_account::{AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 
 use crate::WriteRecord;
@@ -29,6 +31,34 @@ pub fn program_account_rows(writes: &[WriteRecord], owner: &Pubkey) -> Vec<Accou
             executable: w.account.executable() as u8,
             rent_epoch: w.account.rent_epoch(),
             data: w.account.data().to_vec(),
+            txn_signature: None,
+        })
+        .collect()
+}
+
+/// The snapshot baseline for `owner`: every account the program owns in the loaded
+/// snapshot set, stamped at the snapshot slot `s_snap`. This is the state the
+/// replayed changes build on — without it, an account that existed at S_snap but
+/// wasn't touched during the range would be absent from the store, and a covered
+/// as-of query would wrongly read it as "does not exist". Write version 0: a single
+/// baseline version at S_snap, with every replayed change landing at a later slot.
+pub fn baseline_rows(
+    accounts: &HashMap<Pubkey, (AccountSharedData, u64)>,
+    owner: &Pubkey,
+    s_snap: u64,
+) -> Vec<AccountUpdateInsert> {
+    accounts
+        .iter()
+        .filter(|(_, (account, _))| account.owner() == owner)
+        .map(|(pubkey, (account, _))| AccountUpdateInsert {
+            pubkey: pubkey.to_bytes(),
+            slot: s_snap,
+            write_version: 0,
+            owner: account.owner().to_bytes(),
+            lamports: account.lamports(),
+            executable: account.executable() as u8,
+            rent_epoch: account.rent_epoch(),
+            data: account.data().to_vec(),
             txn_signature: None,
         })
         .collect()
@@ -99,6 +129,30 @@ mod tests {
         assert_eq!(rows[0].owner, target.to_bytes());
         assert_eq!(rows[1].slot, 7, "one row per slot the account changed");
         assert_eq!(rows[1].lamports, 30);
+    }
+
+    #[test]
+    fn baseline_rows_are_owner_filtered_and_stamped_at_snapshot() {
+        let owner = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let pk = Pubkey::new_unique();
+
+        let mut accounts = HashMap::new();
+        // Snapshot slot 150, but the baseline must be stamped at S_snap (200).
+        accounts.insert(pk, (account(owner, 42, b"x"), 150u64));
+        // Wrong owner — dropped.
+        accounts.insert(Pubkey::new_unique(), (account(other, 99, b"y"), 150u64));
+
+        let rows = baseline_rows(&accounts, &owner, 200);
+        assert_eq!(rows.len(), 1, "only the program's accounts");
+        assert_eq!(rows[0].pubkey, pk.to_bytes());
+        assert_eq!(
+            rows[0].slot, 200,
+            "stamped at S_snap, not the record's slot 150"
+        );
+        assert_eq!(rows[0].write_version, 0);
+        assert_eq!(rows[0].lamports, 42);
+        assert_eq!(rows[0].owner, owner.to_bytes());
     }
 
     // End-to-end against a local ClickHouse (the `slate_test` db). Run with:
