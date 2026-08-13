@@ -36,8 +36,8 @@ pub struct BlockTx {
     pub meta: TxMeta,
 }
 
-/// The getBlock meta fields the oracle checks a replay against. Token balances,
-/// inner instructions, and logs are omitted until something consumes them.
+/// The getBlock meta fields the oracle checks a replay against. Inner instructions
+/// and logs are omitted until something consumes them.
 pub struct TxMeta {
     /// The on-chain error, rendered; `None` means the transaction succeeded.
     pub err: Option<String>,
@@ -47,6 +47,9 @@ pub struct TxMeta {
     pub post_balances: Vec<u64>,
     /// Addresses pulled in from lookup tables (empty for legacy transactions).
     pub loaded_addresses: LoadedAddresses,
+    /// Post-transaction SPL token amounts, one per touched token account (empty
+    /// when the tx touches no token accounts). The oracle checks these too.
+    pub post_token_balances: Vec<TokenBalance>,
 }
 
 impl TxMeta {
@@ -54,6 +57,15 @@ impl TxMeta {
     pub fn succeeded(&self) -> bool {
         self.err.is_none()
     }
+}
+
+/// One token account's post amount from getBlock's `postTokenBalances`.
+/// `account_index` indexes the transaction's account list (the same order as
+/// `post_balances`); `amount` is the raw token amount (not UI-scaled).
+pub struct TokenBalance {
+    pub account_index: u8,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 
 #[derive(Default)]
@@ -119,9 +131,40 @@ fn parse_tx(t: &serde_json::Value) -> Result<BlockTx> {
         pre_balances: parse_u64_array(&m["preBalances"]).context("meta preBalances")?,
         post_balances: parse_u64_array(&m["postBalances"]).context("meta postBalances")?,
         loaded_addresses: parse_loaded_addresses(&m["loadedAddresses"])?,
+        post_token_balances: parse_token_balances(&m["postTokenBalances"])?,
     };
 
     Ok(BlockTx { transaction, meta })
+}
+
+fn parse_token_balances(v: &serde_json::Value) -> Result<Vec<TokenBalance>> {
+    // Absent when the tx touches no token accounts; treat as empty.
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    v.as_array()
+        .context("postTokenBalances not an array")?
+        .iter()
+        .map(|entry| {
+            Ok(TokenBalance {
+                account_index: entry["accountIndex"]
+                    .as_u64()
+                    .context("token balance missing accountIndex")?
+                    as u8,
+                mint: entry["mint"]
+                    .as_str()
+                    .context("token balance missing mint")?
+                    .parse()
+                    .context("token balance mint is not a pubkey")?,
+                // uiTokenAmount.amount is the raw amount, sent as a string.
+                amount: entry["uiTokenAmount"]["amount"]
+                    .as_str()
+                    .context("token balance missing uiTokenAmount.amount")?
+                    .parse()
+                    .context("token amount is not a u64")?,
+            })
+        })
+        .collect()
 }
 
 fn parse_u64_array(v: &serde_json::Value) -> Result<Vec<u64>> {
@@ -326,6 +369,7 @@ mod tests {
                         writable: vec![w],
                         readonly: vec![r],
                     },
+                    post_token_balances: vec![],
                 },
             }],
         };
@@ -339,6 +383,27 @@ mod tests {
         assert!(
             fp.contains(agave_feature_set::FEATURE_NAMES.keys().next().unwrap()),
             "feature accounts missing"
+        );
+    }
+
+    #[test]
+    fn parses_token_balances_from_meta() {
+        let balances = serde_json::json!([
+            {
+                "accountIndex": 3,
+                "mint": "So11111111111111111111111111111111111111112",
+                "uiTokenAmount": { "amount": "12345" }
+            }
+        ]);
+        let tbs = parse_token_balances(&balances).unwrap();
+        assert_eq!(tbs.len(), 1);
+        assert_eq!(tbs[0].account_index, 3);
+        assert_eq!(tbs[0].amount, 12_345);
+        // absent (null) means the tx touched no token accounts.
+        assert!(
+            parse_token_balances(&serde_json::Value::Null)
+                .unwrap()
+                .is_empty()
         );
     }
 

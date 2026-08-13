@@ -963,6 +963,7 @@ mod tests {
             pre_balances: pre.to_vec(),
             post_balances: post.to_vec(),
             loaded_addresses: block::LoadedAddresses::default(),
+            post_token_balances: vec![],
         };
 
         // src -> mid, then mid -> dst. mid's pre-balance in tx2 only lines up if
@@ -1274,6 +1275,7 @@ mod tests {
                         pre_balances: vec![from_pre, 0, 1],
                         post_balances: vec![from_pre - amount - fee, amount, 1],
                         loaded_addresses: crate::block::LoadedAddresses::default(),
+                        post_token_balances: vec![],
                     },
                 }],
             }

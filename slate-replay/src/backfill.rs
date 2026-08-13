@@ -149,6 +149,7 @@ mod tests {
                             pre_balances: vec![from_pre, 0, 1],
                             post_balances: vec![from_pre - amount - fee, amount, 1],
                             loaded_addresses: LoadedAddresses::default(),
+                            post_token_balances: vec![],
                         },
                     }],
                 }

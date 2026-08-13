@@ -214,6 +214,7 @@ pub mod cpi {
                 PROGRAM_LAMPORTS,
             ],
             loaded_addresses: crate::block::LoadedAddresses::default(),
+            post_token_balances: vec![],
         }
     }
 
