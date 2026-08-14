@@ -225,6 +225,33 @@ pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
     Block::from_getblock(slot, result)
 }
 
+/// Ask the RPC which slots in `[start, end]` actually produced a block (getBlocks).
+/// The ~5% of skipped slots never produced one, so getBlock would error on them;
+/// getBlocks returns only the real ones. getBlocks caps the span at 500k slots, so
+/// a larger backfill would have to page, which the caller doesn't do yet.
+pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<u64>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBlocks",
+        "params": [start, end],
+    });
+    let resp: serde_json::Value = reqwest::blocking::Client::new()
+        .post(rpc_url)
+        .json(&request)
+        .send()?
+        .json()?;
+    let result = resp
+        .get("result")
+        .with_context(|| format!("getBlocks returned no result: {resp}"))?;
+    result
+        .as_array()
+        .with_context(|| format!("getBlocks result was not an array: {result}"))?
+        .iter()
+        .map(|v| v.as_u64().context("getBlocks returned a non-integer slot"))
+        .collect()
+}
+
 /// An [`AddressLoader`] that hands back the lookup-table addresses getBlock
 /// already resolved for a v0 transaction, instead of re-deriving them from the
 /// on-chain address-table accounts. Those addresses are part of the committed
@@ -618,5 +645,18 @@ mod tests {
         assert_eq!(block.slot, 437_680_849);
         assert_eq!(block.parent_slot, 437_680_848);
         assert!(!block.transactions.is_empty());
+    }
+
+    #[test]
+    #[ignore = "hits a mainnet archive RPC; run with SLATE_RPC set"]
+    fn fetch_confirmed_slots_live() {
+        let url = std::env::var("SLATE_RPC").expect("set SLATE_RPC to an archive RPC url");
+        // The fixture slot is a real confirmed block, so getBlocks over a tight
+        // range around it must list it.
+        let slots = fetch_confirmed_slots(&url, 437_680_848, 437_680_849).unwrap();
+        assert!(
+            slots.contains(&437_680_849),
+            "getBlocks should list the known block, got {slots:?}"
+        );
     }
 }

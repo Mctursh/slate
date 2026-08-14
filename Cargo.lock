@@ -3914,6 +3914,19 @@ name = "slate"
 version = "0.1.0"
 
 [[package]]
+name = "slate-backfill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "slate-common",
+ "slate-replay",
+ "slate-store",
+ "solana-pubkey 4.3.0",
+ "tokio",
+]
+
+[[package]]
 name = "slate-common"
 version = "0.1.0"
 dependencies = [
