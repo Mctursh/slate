@@ -4,6 +4,10 @@
 //! through the SVM (seeded from the snapshot) and write the program's per-slot
 //! account history into ClickHouse. This is the one-command entry point over the
 //! `slate_replay::backfill` engine.
+//!
+//! `--dry-run` skips the snapshot and execution: it fetches, parses, and
+//! sanitizes the range and reports what it looks like, so a target range can be
+//! validated before committing to a large snapshot download.
 
 use std::{fs::File, str::FromStr};
 
@@ -12,7 +16,7 @@ use clap::Parser;
 use slate_common::config::Config;
 use slate_replay::{
     backfill::backfill,
-    block::{Block, fetch_block, fetch_confirmed_slots},
+    block::{Block, fetch_block, fetch_confirmed_slots, sanitize},
 };
 use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
@@ -22,30 +26,32 @@ use solana_pubkey::Pubkey;
     about = "Reconstruct a program's historical account state by replaying a slot range"
 )]
 struct Args {
-    /// Path to the full snapshot the range starts from.
-    snapshot: String,
+    /// Path to the full snapshot the range starts from (omit with --dry-run).
+    #[arg(required_unless_present = "dry_run")]
+    snapshot: Option<String>,
     /// Slot the snapshot was taken at. Replay covers (from, to].
     #[arg(long)]
     from: u64,
     /// Last slot to replay, inclusive.
     #[arg(long)]
     to: u64,
-    /// Program whose accounts to index (base58 pubkey).
-    #[arg(long)]
-    program: String,
+    /// Program whose accounts to index, base58 (omit with --dry-run).
+    #[arg(long, required_unless_present = "dry_run")]
+    program: Option<String>,
     /// JSON-RPC URL to fetch blocks from (getBlocks + getBlock).
     #[arg(long)]
     rpc: String,
     /// Slate config file, for the ClickHouse connection.
     #[arg(long, default_value = "slate.toml")]
     config: String,
+    /// Fetch, parse, and sanitize the range without a snapshot or execution, then
+    /// report what it looks like. A preflight to run before downloading a snapshot.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let cfg = Config::load(&args.config)?;
-    let program = Pubkey::from_str(&args.program)
-        .with_context(|| format!("invalid program pubkey {}", args.program))?;
 
     // Fetch the range's blocks up front, before any async runtime exists:
     // fetch_block uses a blocking HTTP client that panics nested inside tokio.
@@ -62,8 +68,21 @@ fn main() -> anyhow::Result<()> {
         .map(|slot| fetch_block(&args.rpc, slot))
         .collect::<anyhow::Result<Vec<Block>>>()?;
 
-    let snapshot = File::open(&args.snapshot)
-        .with_context(|| format!("opening snapshot {}", args.snapshot))?;
+    if args.dry_run {
+        return dry_run_report(&blocks);
+    }
+
+    let snapshot_path = args
+        .snapshot
+        .context("<snapshot> is required for a real run")?;
+    let program_str = args
+        .program
+        .context("--program is required for a real run")?;
+    let program = Pubkey::from_str(&program_str)
+        .with_context(|| format!("invalid program pubkey {program_str}"))?;
+    let cfg = Config::load(&args.config)?;
+    let snapshot = File::open(&snapshot_path)
+        .with_context(|| format!("opening snapshot {snapshot_path}"))?;
 
     // Seed, replay, and persist. This part is async because the store writes are.
     tokio::runtime::Runtime::new()?.block_on(async {
@@ -87,4 +106,47 @@ fn main() -> anyhow::Result<()> {
         }
         anyhow::Ok(())
     })
+}
+
+/// Report what the fetched range looks like and whether every transaction
+/// sanitizes, without a snapshot or any execution. This exercises the whole
+/// pre-execution path (getBlock parse + v0/ALT resolution + sanitize) on real
+/// blocks, so a range that would halt the real run shows up here first.
+fn dry_run_report(blocks: &[Block]) -> anyhow::Result<()> {
+    let mut total = 0usize;
+    let (mut v0_alt, mut failed, mut token) = (0usize, 0usize, 0usize);
+    let mut sanitize_failures = Vec::new();
+
+    for block in blocks {
+        for (i, tx) in block.transactions.iter().enumerate() {
+            total += 1;
+            let loaded = &tx.meta.loaded_addresses;
+            if !loaded.writable.is_empty() || !loaded.readonly.is_empty() {
+                v0_alt += 1;
+            }
+            if tx.meta.err.is_some() {
+                failed += 1;
+            }
+            if !tx.meta.post_token_balances.is_empty() {
+                token += 1;
+            }
+            if let Err(e) = sanitize(&tx.transaction, loaded) {
+                sanitize_failures.push(format!("slot {} tx {i}: {e}", block.slot));
+            }
+        }
+    }
+
+    println!("dry run: {} blocks, {total} transactions", blocks.len());
+    println!("  v0+ALT (lookup-loaded): {v0_alt}");
+    println!("  chain-failed:           {failed}");
+    println!("  token-touching:         {token}");
+    if sanitize_failures.is_empty() {
+        println!("  sanitize: all {total} transactions sanitized cleanly");
+    } else {
+        println!("  sanitize: {} FAILED", sanitize_failures.len());
+        for f in &sanitize_failures {
+            println!("    {f}");
+        }
+    }
+    Ok(())
 }
