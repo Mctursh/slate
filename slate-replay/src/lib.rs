@@ -169,6 +169,24 @@ impl ReplayBank {
         // (slot, hash) history from the snapshot + per-slot updates; `set_slot_hashes`
         // does that. Empty is a valid starting point for txs that don't read it.
         self.set_slot_hashes(&[]);
+        // RecentBlockhashes is deprecated, but AdvanceNonceAccount still errors if
+        // it is empty (the system processor checks `recent_blockhashes.is_empty()`),
+        // so a durable-nonce transaction fails to execute without it. One
+        // placeholder entry satisfies that non-empty check; the advanced nonce's
+        // value comes from the environment blockhash (the processor reads
+        // `environment_config.blockhash`), not this list, so the content is
+        // vestigial for replay.
+        #[allow(deprecated)]
+        {
+            let placeholder = Hash::new_from_array([1u8; 32]);
+            let recent = solana_sysvar::recent_blockhashes::RecentBlockhashes::from_iter([
+                solana_sysvar::recent_blockhashes::IterItem(0, &placeholder, 5_000),
+            ]);
+            self.set_sysvar_account(
+                solana_sdk_ids::sysvar::recent_blockhashes::id(),
+                bincode::serialize(&recent).unwrap(),
+            );
+        }
     }
 
     /// Populate the SlotHashes sysvar from recent `(slot, hash)` pairs (newest
@@ -369,8 +387,9 @@ impl Replayer {
         tx: &SanitizedTransaction,
         fee: u64,
         epoch: u64,
+        blockhash: Hash,
     ) -> TransactionProcessingResult {
-        self.execute_with(&self.processor, bank, tx, fee, epoch)
+        self.execute_with(&self.processor, bank, tx, fee, epoch, blockhash)
     }
 
     /// Like [`Replayer::execute`] but against an explicit `processor`. The per-slot
@@ -383,8 +402,14 @@ impl Replayer {
         tx: &SanitizedTransaction,
         fee: u64,
         epoch: u64,
+        blockhash: Hash,
     ) -> TransactionProcessingResult {
-        let env = self.environment(*tx.message().recent_blockhash(), epoch);
+        // The environment blockhash is the block's, NOT the tx's recent_blockhash.
+        // A durable-nonce tx carries the nonce itself as its recent_blockhash, but
+        // the nonce advances from the blockhash the bank is on at this slot (the
+        // block's previousBlockhash). For non-nonce txs the environment blockhash is
+        // otherwise unobserved, so sourcing it from the block is correct and safe.
+        let env = self.environment(blockhash, epoch);
         // Parse the tx's OWN compute-budget instructions for its real CU limit,
         // price, and loaded-data-size limit — not a default. A tx that exhausts its
         // requested limit on chain must exhaust it here too. A malformed budget is
@@ -449,7 +474,14 @@ impl Replayer {
             };
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
-            let result = self.execute_with(processor, bank, &tx, block_tx.meta.fee, epoch);
+            let result = self.execute_with(
+                processor,
+                bank,
+                &tx,
+                block_tx.meta.fee,
+                epoch,
+                block.previous_blockhash,
+            );
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {
                 return BlockReplay::halted(i, reconciliation.issues.join("; "));
@@ -742,6 +774,7 @@ mod tests {
             &fixture::sanitized_transaction(),
             fixture::FEE,
             epoch,
+            Hash::default(),
         );
 
         // --- reconcile against the getBlock oracle ---
@@ -803,6 +836,7 @@ mod tests {
             &fixture::memo::sanitized_transaction(),
             fixture::memo::FEE,
             epoch,
+            Hash::default(),
         );
 
         let executed = match &result {
@@ -860,6 +894,7 @@ mod tests {
             &fixture::cpi::sanitized_transaction(),
             fixture::cpi::FEE,
             epoch,
+            Hash::default(),
         );
 
         let executed = match &result {
@@ -1001,6 +1036,7 @@ mod tests {
             slot,
             parent_slot: slot - 1,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
             block_time: 1_700_000_000,
             transactions: vec![
                 block::BlockTx {
@@ -1081,7 +1117,7 @@ mod tests {
             let replayer = Replayer::new(slot, epoch);
             register_builtins(&mut bank, &replayer.processor);
             let tx = sanitize(&build(cu_limit), &crate::block::LoadedAddresses::default()).unwrap();
-            let result = replayer.execute(&bank, &tx, 5_000, epoch);
+            let result = replayer.execute(&bank, &tx, 5_000, epoch, Hash::default());
             matches!(&result, Ok(ProcessedTransaction::Executed(e)) if e.was_successful())
         };
 
@@ -1140,7 +1176,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = replayer.execute(&bank, &tx, fee, epoch);
+        let result = replayer.execute(&bank, &tx, fee, epoch, Hash::default());
 
         // Executed but not successful — the branch that used to commit nothing.
         assert!(
@@ -1163,6 +1199,127 @@ mod tests {
             bank.get_account_shared_data(&dst).is_none(),
             "recipient must not exist — the transfer rolled back"
         );
+    }
+
+    #[test]
+    fn advances_the_nonce_on_a_failed_durable_nonce_tx() {
+        use solana_account::ReadableAccount;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_nonce::{
+            state::{DurableNonce, State},
+            versions::Versions,
+        };
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let recent_blockhashes = solana_sdk_ids::sysvar::recent_blockhashes::id();
+        let payer = Pubkey::new_unique(); // fee payer AND nonce authority
+        let nonce_key = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+        let slot = 300;
+        let epoch = slot / 432_000;
+        let fee = 5_000u64;
+        let start = 1_000_000u64;
+
+        // A nonce account holding a durable nonce derived from some old blockhash.
+        let stored = DurableNonce::from_blockhash(&Hash::new_from_array([9u8; 32]));
+        let nonce_data =
+            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee))).unwrap();
+
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            payer,
+            AccountSharedData::from(Account {
+                lamports: start,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        bank.insert(
+            nonce_key,
+            AccountSharedData::from(Account {
+                lamports: 1_500_000,
+                data: nonce_data,
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        let replayer = Replayer::new(slot, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+        // AdvanceNonceAccount reads RecentBlockhashes from the sysvar cache, so it
+        // has to be configured and pulled in before the tx runs.
+        bank.configure_sysvars(slot, 1_700_000_000);
+        replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+
+        // Durable-nonce tx: advance the nonce, then over-transfer so the tx fails.
+        // Its recent_blockhash IS the stored nonce, which is how a durable-nonce tx
+        // is formed and how the runtime rolls the advanced nonce forward on failure.
+        let advance = Instruction {
+            program_id: system,
+            accounts: vec![
+                AccountMeta::new(nonce_key, false),
+                AccountMeta::new_readonly(recent_blockhashes, false),
+                AccountMeta::new_readonly(payer, true),
+            ],
+            data: vec![4, 0, 0, 0], // AdvanceNonceAccount
+        };
+        let mut xfer = vec![2u8, 0, 0, 0]; // Transfer
+        xfer.extend_from_slice(&(start * 10).to_le_bytes());
+        let transfer = Instruction {
+            program_id: system,
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(dst, false)],
+            data: xfer,
+        };
+        let message =
+            Message::new_with_blockhash(&[advance, transfer], Some(&payer), stored.as_hash());
+        let tx = sanitize(
+            &VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: VersionedMessage::Legacy(message),
+            },
+            &crate::block::LoadedAddresses::default(),
+        )
+        .unwrap();
+
+        // The block's blockhash — what a durable nonce advances FROM. Deliberately
+        // different from the tx's recent_blockhash (the nonce) so the test proves
+        // the advance uses the block's blockhash, not the tx's.
+        let block_blockhash = Hash::new_from_array([7u8; 32]);
+        let result = replayer.execute(&bank, &tx, fee, epoch, block_blockhash);
+        assert!(
+            matches!(&result, Ok(ProcessedTransaction::Executed(e)) if !e.was_successful()),
+            "durable-nonce tx should execute then fail on the transfer, got {result:?}"
+        );
+
+        commit_writes(&mut bank, &tx, &result, slot);
+
+        // The payoff: the transfer failed, but the nonce still advanced (a regular
+        // failed tx leaves it untouched), and the fee payer was charged.
+        let (nonce_acct, _) = bank
+            .get_account_shared_data(&nonce_key)
+            .expect("nonce account present");
+        let advanced: Versions = bincode::deserialize(nonce_acct.data()).unwrap();
+        let State::Initialized(data) = advanced.state() else {
+            panic!("nonce should still be initialized");
+        };
+        assert_ne!(
+            data.durable_nonce, stored,
+            "the nonce must advance even though the tx failed"
+        );
+        assert_eq!(
+            data.durable_nonce,
+            DurableNonce::from_blockhash(&block_blockhash),
+            "the nonce advances from the block's blockhash, not the tx's nonce value"
+        );
+        let (payer_acct, _) = bank.get_account_shared_data(&payer).unwrap();
+        assert_eq!(payer_acct.lamports(), start - fee, "fee payer charged the fee");
     }
 
     #[test]
@@ -1212,7 +1369,7 @@ mod tests {
                 message: VersionedMessage::Legacy(msg),
             };
             let sanitized = sanitize(&tx, &crate::block::LoadedAddresses::default()).unwrap();
-            let result = replayer.execute(bank, &sanitized, 5_000, epoch);
+            let result = replayer.execute(bank, &sanitized, 5_000, epoch, Hash::default());
             commit_writes(bank, &sanitized, &result, current_slot);
             result
         };
@@ -1294,6 +1451,7 @@ mod tests {
                 slot,
                 parent_slot: slot - 1,
                 blockhash: Hash::default(),
+                previous_blockhash: Hash::default(),
                 block_time: 0,
                 transactions: vec![crate::block::BlockTx {
                     transaction: tx,

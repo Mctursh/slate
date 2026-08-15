@@ -26,6 +26,11 @@ pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
     pub blockhash: Hash,
+    /// The parent block's blockhash (getBlock `previousBlockhash`) — the blockhash
+    /// the bank is on while it processes this slot. This is what a durable nonce
+    /// advances from, so it, not any individual tx's recent_blockhash, is the
+    /// environment blockhash for the block's transactions.
+    pub previous_blockhash: Hash,
     pub block_time: i64,
     pub transactions: Vec<BlockTx>,
 }
@@ -86,6 +91,11 @@ impl Block {
             .context("getBlock missing blockhash")?
             .parse::<Hash>()
             .context("getBlock blockhash is not a valid hash")?;
+        let previous_blockhash = result["previousBlockhash"]
+            .as_str()
+            .context("getBlock missing previousBlockhash")?
+            .parse::<Hash>()
+            .context("getBlock previousBlockhash is not a valid hash")?;
         let block_time = result["blockTime"]
             .as_i64()
             .context("getBlock missing blockTime")?;
@@ -102,6 +112,7 @@ impl Block {
             slot,
             parent_slot,
             blockhash,
+            previous_blockhash,
             block_time,
             transactions,
         })
@@ -392,6 +403,7 @@ mod tests {
             slot: 1,
             parent_slot: 0,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
             block_time: 0,
             transactions: vec![BlockTx {
                 transaction: block.transactions[0].transaction.clone(),

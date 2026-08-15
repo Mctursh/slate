@@ -3,9 +3,13 @@
 //!
 //! Manifest-free by design. We walk the `accounts/<slot>.<id>` AppendVec files
 //! directly and keep the highest-slot value per pubkey. The 136-byte per-account
-//! record layout is stable across agave versions; the manifest bincode (bank
-//! fields) is what drifts, so we never parse it. The snapshot's slot comes from
-//! the archive filename, not the manifest.
+//! record layout (StoredMeta + AccountMeta + obsolete hash) is stable across agave
+//! versions: verified byte-identical from 1.18 through 3.1, which brackets the 2.x
+//! that wrote the epoch-808 snapshot. The archiver writes each storage at its
+//! `current_len` (agave-snapshots `archive.rs` sets the tar entry to the storage
+//! reader's length, not the on-disk capacity), so a snapshot file has no trailing
+//! slack to bound. The manifest bincode (bank fields) is what drifts, so we never
+//! parse it; the snapshot's slot comes from the archive filename.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,8 +48,10 @@ fn read_pubkey(bytes: &[u8], at: usize) -> Pubkey {
 }
 
 /// Walk one AppendVec's bytes into (pubkey, account) pairs. Stops at the end or at
-/// the first record that doesn't fit within `bytes` (trailing slack past the
-/// file's valid length, which we don't get from the manifest).
+/// the first record that doesn't fit within `bytes`. The archiver trims each
+/// storage to `current_len`, so a real snapshot file ends exactly on a record
+/// boundary with no slack; the doesn't-fit and 10-MiB checks are a defensive guard
+/// for a truncated or corrupt download, not the normal stop condition.
 fn parse_append_vec(bytes: &[u8]) -> Vec<(Pubkey, AccountSharedData)> {
     let mut accounts = Vec::new();
     let mut offset = 0usize;

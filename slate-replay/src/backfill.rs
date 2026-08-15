@@ -136,6 +136,7 @@ mod tests {
                     slot,
                     parent_slot: slot - 1,
                     blockhash: Hash::default(),
+                    previous_blockhash: Hash::default(),
                     block_time: 1_700_000_000,
                     transactions: vec![BlockTx {
                         transaction: VersionedTransaction {
