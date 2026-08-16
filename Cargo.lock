@@ -3919,6 +3919,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "reqwest",
  "slate-common",
  "slate-replay",
  "slate-store",

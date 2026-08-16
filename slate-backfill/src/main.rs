@@ -9,14 +9,14 @@
 //! sanitizes the range and reports what it looks like, so a target range can be
 //! validated before committing to a large snapshot download.
 
-use std::{fs::File, str::FromStr};
+use std::{fs::File, io::Read, str::FromStr};
 
 use anyhow::Context;
 use clap::Parser;
 use slate_common::config::Config;
 use slate_replay::{
     backfill::backfill,
-    block::{Block, fetch_block, fetch_confirmed_slots, sanitize},
+    block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
 };
 use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
@@ -53,36 +53,50 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Fetch the range's blocks up front, before any async runtime exists:
-    // fetch_block uses a blocking HTTP client that panics nested inside tokio.
-    // getBlocks first, so we only request slots that actually produced a block.
-    let slots = fetch_confirmed_slots(&args.rpc, args.from + 1, args.to)?;
-    println!(
-        "fetching {} blocks in ({}, {}]",
-        slots.len(),
-        args.from,
-        args.to
-    );
-    let blocks = slots
-        .into_iter()
-        .map(|slot| fetch_block(&args.rpc, slot))
-        .collect::<anyhow::Result<Vec<Block>>>()?;
+    // Preflight: fail fast on cheap local checks and unreachable services before
+    // fetching a single block, so a typo or a down dependency costs seconds rather
+    // than an hour into a run.
+    if args.from >= args.to {
+        anyhow::bail!(
+            "--from ({}) must be below --to ({}); the range (from, to] would be empty",
+            args.from,
+            args.to
+        );
+    }
+    let head =
+        current_slot(&args.rpc).with_context(|| format!("RPC unreachable at {}", args.rpc))?;
+    if args.to > head {
+        anyhow::bail!(
+            "--to ({}) is past the chain head ({head}); pick slots that exist",
+            args.to
+        );
+    }
 
     if args.dry_run {
+        let blocks = fetch_range(&args)?;
         return dry_run_report(&blocks);
     }
 
-    let snapshot_path = args
-        .snapshot
-        .context("<snapshot> is required for a real run")?;
+    // A real run validates the program, snapshot, config, and ClickHouse before the
+    // expensive fetch, so none of them can fail an hour in.
     let program_str = args
         .program
+        .as_ref()
         .context("--program is required for a real run")?;
-    let program = Pubkey::from_str(&program_str)
+    let program = Pubkey::from_str(program_str)
         .with_context(|| format!("invalid program pubkey {program_str}"))?;
+    let snapshot_path = args
+        .snapshot
+        .as_ref()
+        .context("<snapshot> is required for a real run")?;
+    check_snapshot_file(snapshot_path)?;
     let cfg = Config::load(&args.config)?;
-    let snapshot = File::open(&snapshot_path)
-        .with_context(|| format!("opening snapshot {snapshot_path}"))?;
+    check_clickhouse(&cfg.clickhouse.url)?;
+    println!("preflight ok: RPC, program, snapshot, config, and ClickHouse all check out");
+
+    let blocks = fetch_range(&args)?;
+    let snapshot =
+        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?;
 
     // Seed, replay, and persist. This part is async because the store writes are.
     tokio::runtime::Runtime::new()?.block_on(async {
@@ -106,6 +120,47 @@ fn main() -> anyhow::Result<()> {
         }
         anyhow::Ok(())
     })
+}
+
+/// Fetch every confirmed block in `(from, to]`. Blocking, so it must run before
+/// any tokio runtime exists (`fetch_block` panics nested inside one).
+fn fetch_range(args: &Args) -> anyhow::Result<Vec<Block>> {
+    let slots = fetch_confirmed_slots(&args.rpc, args.from + 1, args.to)?;
+    println!(
+        "fetching {} blocks in ({}, {}]",
+        slots.len(),
+        args.from,
+        args.to
+    );
+    slots
+        .into_iter()
+        .map(|slot| fetch_block(&args.rpc, slot))
+        .collect()
+}
+
+/// Confirm the snapshot exists and starts with the zstd frame magic, so a wrong
+/// path or a non-`.tar.zst` file fails now instead of deep in the loader.
+fn check_snapshot_file(path: &str) -> anyhow::Result<()> {
+    let mut file = File::open(path).with_context(|| format!("cannot open snapshot {path}"))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .with_context(|| format!("snapshot {path} is too small to be a .tar.zst"))?;
+    // zstd frame magic number, little-endian 0xFD2FB528.
+    if magic != [0x28, 0xB5, 0x2F, 0xFD] {
+        anyhow::bail!("snapshot {path} is not a zstd stream; expected a .tar.zst full snapshot");
+    }
+    Ok(())
+}
+
+/// Probe ClickHouse's HTTP `/ping` endpoint so a down or misconfigured store
+/// fails before the range is fetched and replayed.
+fn check_clickhouse(url: &str) -> anyhow::Result<()> {
+    let ping = format!("{}/ping", url.trim_end_matches('/'));
+    reqwest::blocking::get(&ping)
+        .with_context(|| format!("ClickHouse unreachable at {url}"))?
+        .error_for_status()
+        .with_context(|| format!("ClickHouse at {url} responded with an error"))?;
+    Ok(())
 }
 
 /// Report what the fetched range looks like and whether every transaction

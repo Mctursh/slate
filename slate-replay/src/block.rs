@@ -263,6 +263,20 @@ pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<
         .collect()
 }
 
+/// The chain's current slot (getSlot). Doubles as an RPC reachability probe and
+/// lets a caller reject a target range that runs past the chain head.
+pub fn current_slot(rpc_url: &str) -> Result<u64> {
+    let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getSlot" });
+    let resp: serde_json::Value = reqwest::blocking::Client::new()
+        .post(rpc_url)
+        .json(&request)
+        .send()?
+        .json()?;
+    resp.get("result")
+        .and_then(|v| v.as_u64())
+        .with_context(|| format!("getSlot returned no slot: {resp}"))
+}
+
 /// An [`AddressLoader`] that hands back the lookup-table addresses getBlock
 /// already resolved for a v0 transaction, instead of re-deriving them from the
 /// on-chain address-table accounts. Those addresses are part of the committed
