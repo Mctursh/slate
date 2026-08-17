@@ -85,6 +85,10 @@ pub struct ReplayBank {
     writes: Vec<WriteRecord>,
     /// Monotonic counter so same-slot writes to one account order correctly.
     write_version: u64,
+    /// While recording a slot (`Some`), the pre-slot value of each account the slot
+    /// writes (`None` = it didn't exist), captured on the first write. This drives the
+    /// lattice-hash roll: mix each changed account out at its old value, in at its new.
+    slot_dirty: Option<HashMap<Pubkey, Option<AccountSharedData>>>,
 }
 
 /// One transaction-committed account write: the account's state at the slot it
@@ -100,6 +104,12 @@ pub struct WriteRecord {
 
 impl ReplayBank {
     pub fn insert(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
+        // While recording a slot, remember the account's pre-slot value the first time
+        // it's written this slot, so the lattice can mix it out before mixing the new in.
+        if self.slot_dirty.as_ref().is_some_and(|d| !d.contains_key(&key)) {
+            let old = self.accounts.get(&key).map(|(a, _)| a.clone());
+            self.slot_dirty.as_mut().unwrap().insert(key, old);
+        }
         self.accounts.insert(key, (account, slot));
     }
 
@@ -121,6 +131,27 @@ impl ReplayBank {
     /// persistence layer owner-filters these to the program being indexed.
     pub fn writes(&self) -> &[WriteRecord] {
         &self.writes
+    }
+
+    /// Start recording which accounts a slot writes (with their pre-slot values), so
+    /// the lattice hash can be rolled by the slot's changes. Call before configuring
+    /// sysvars and replaying the slot's transactions.
+    pub fn begin_slot(&mut self) {
+        self.slot_dirty = Some(HashMap::new());
+    }
+
+    /// Take every account written since [`ReplayBank::begin_slot`], as `(pubkey,
+    /// pre-slot value, post-slot value)`; a `None` pre-slot value means the slot
+    /// created the account. Stops recording.
+    pub fn take_slot_changes(
+        &mut self,
+    ) -> Vec<(Pubkey, Option<AccountSharedData>, AccountSharedData)> {
+        self.slot_dirty
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(key, old)| self.accounts.get(&key).map(|(new, _)| (key, old, new.clone())))
+            .collect()
     }
 
     /// Register a builtin (native) program: put its loader-owned account in the
