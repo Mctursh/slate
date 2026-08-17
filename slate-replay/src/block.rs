@@ -365,6 +365,25 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     set
 }
 
+/// The programData accounts for every key in `footprint`, derived as the
+/// upgradeable-loader PDA of that key. An upgradeable program's bytecode lives in
+/// a separate programData account (a PDA of the program id under the upgradeable
+/// loader) that is NEVER a declared account key, so the footprint misses it and
+/// the SVM can't load the program without it. We can't tell which keys are
+/// programs before the scan, so we derive the PDA for ALL of them and let the
+/// snapshot decide: a real program's programData is present and gets seeded; a
+/// non-program key derives to an address the snapshot doesn't hold, which is
+/// harmlessly skipped. The derivation is deterministic, so no RPC or second pass
+/// is needed. Any program a tx invokes (top-level or via CPI) is a declared key,
+/// so this covers CPI targets too.
+pub fn programdata_addresses(footprint: &HashSet<Pubkey>) -> HashSet<Pubkey> {
+    let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
+    footprint
+        .iter()
+        .map(|key| Pubkey::find_program_address(&[key.as_ref()], &loader).0)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +478,18 @@ mod tests {
         assert!(
             fp.contains(&solana_sdk_ids::sysvar::last_restart_slot::id()),
             "LastRestartSlot sysvar missing from footprint"
+        );
+    }
+
+    #[test]
+    fn programdata_addresses_derive_the_upgradeable_pda() {
+        // Raydium v4 and its real programData account, confirmed on-chain.
+        let raydium: Pubkey = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".parse().unwrap();
+        let expected: Pubkey = "A7ZG7ByDi8DpzT9Ab7CiXhvgYTJQmaDPJkMDoPitaCQV".parse().unwrap();
+        let pd = programdata_addresses(&HashSet::from([raydium]));
+        assert!(
+            pd.contains(&expected),
+            "the upgradeable-loader PDA of Raydium v4 should be its programData account"
         );
     }
 

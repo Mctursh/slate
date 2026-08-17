@@ -112,11 +112,18 @@ fn main() -> anyhow::Result<()> {
                 "done: {} blocks replayed and persisted; coverage ({}, {}]",
                 result.blocks_completed, args.from, args.to
             ),
-            Some((slot, _)) => println!(
-                "halted at slot {slot} after {} completed blocks; \
-                 coverage recorded up to the last good slot",
-                result.blocks_completed
-            ),
+            Some((slot, block_replay)) => {
+                let detail = block_replay
+                    .halt
+                    .as_ref()
+                    .map(|h| format!("tx {}: {}", h.tx_index, h.reason))
+                    .unwrap_or_else(|| "unknown reason".into());
+                println!(
+                    "halted at slot {slot} after {} completed blocks, on {detail}; \
+                     coverage recorded up to the last good slot",
+                    result.blocks_completed
+                );
+            }
         }
         anyhow::Ok(())
     })

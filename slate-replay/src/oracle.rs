@@ -46,8 +46,24 @@ pub fn reconcile(
         Ok(ProcessedTransaction::Executed(executed)) => {
             let replay_ok = executed.was_successful();
             if replay_ok != meta.succeeded() {
+                // When our replay failed but the chain succeeded, the execution
+                // error is the whole diagnosis, so include it.
+                let detail = if replay_ok {
+                    String::new()
+                } else {
+                    let logs = executed
+                        .execution_details
+                        .log_messages
+                        .as_ref()
+                        .map(|l| format!("\n  replay logs:\n    {}", l.join("\n    ")))
+                        .unwrap_or_default();
+                    format!(
+                        " (replay error: {:?}){logs}",
+                        executed.execution_details.status
+                    )
+                };
                 issues.push(format!(
-                    "status: replay {}, chain {}",
+                    "status: replay {}, chain {}{detail}",
                     outcome(replay_ok),
                     outcome(meta.succeeded()),
                 ));

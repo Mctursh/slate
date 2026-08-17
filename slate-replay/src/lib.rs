@@ -39,7 +39,8 @@ use solana_svm::{
     rollback_accounts::RollbackAccounts,
     transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     transaction_processor::{
-        TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
+        ExecutionRecordingConfig, TransactionBatchProcessor, TransactionProcessingConfig,
+        TransactionProcessingEnvironment,
     },
 };
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
@@ -164,24 +165,32 @@ impl ReplayBank {
             EpochSchedule::id(),
             bincode::serialize(&EpochSchedule::without_warmup()).unwrap(),
         );
-        // SlotHashes: present but empty here. A vote tx validates the slot it votes
-        // on against this sysvar, so real replay must fill it with the actual recent
-        // (slot, hash) history from the snapshot + per-slot updates; `set_slot_hashes`
-        // does that. Empty is a valid starting point for txs that don't read it.
-        self.set_slot_hashes(&[]);
+        // SlotHashes holds real bank hashes and is seeded from the snapshot: programs
+        // read it for on-chain randomness, and RPC can't reproduce bank hashes, so the
+        // snapshot is the only source. Its value is exactly correct for the first
+        // replayed block (s_snap+1). Only default it to empty when the snapshot didn't
+        // supply one — never clobber the real value. (Rolling it forward per replayed
+        // slot, so blocks past the first stay exact, is future work: it needs computed
+        // bank hashes for the newly replayed slots.)
+        if self.get_account_shared_data(&SlotHashes::id()).is_none() {
+            self.set_slot_hashes(&[]);
+        }
         // RecentBlockhashes is deprecated, but AdvanceNonceAccount still errors if
-        // it is empty (the system processor checks `recent_blockhashes.is_empty()`),
-        // so a durable-nonce transaction fails to execute without it. One
-        // placeholder entry satisfies that non-empty check; the advanced nonce's
-        // value comes from the environment blockhash (the processor reads
-        // `environment_config.blockhash`), not this list, so the content is
-        // vestigial for replay.
+        // it is empty, so a durable-nonce tx needs it non-empty. Such a tx also
+        // passes it as an account, so the oracle checks its lamports: the chain
+        // keeps it at its full 150 entries (6008 bytes ⇒ 42_706_560 rent-exempt
+        // lamports), so a 1-entry stub mismatched and halted the replay. Fill it to
+        // the real 150 entries so its size — and thus the rent-exempt lamports
+        // set_sysvar_account computes — match the chain. The content is otherwise
+        // vestigial: the advanced nonce's value comes from the environment
+        // blockhash, not this list.
         #[allow(deprecated)]
         {
             let placeholder = Hash::new_from_array([1u8; 32]);
-            let recent = solana_sysvar::recent_blockhashes::RecentBlockhashes::from_iter([
-                solana_sysvar::recent_blockhashes::IterItem(0, &placeholder, 5_000),
-            ]);
+            let recent = solana_sysvar::recent_blockhashes::RecentBlockhashes::from_iter(
+                (0..150u64)
+                    .map(|i| solana_sysvar::recent_blockhashes::IterItem(i, &placeholder, 5_000)),
+            );
             self.set_sysvar_account(
                 solana_sdk_ids::sysvar::recent_blockhashes::id(),
                 bincode::serialize(&recent).unwrap(),
@@ -200,8 +209,14 @@ impl ReplayBank {
     }
 
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
+        // On-chain sysvar accounts are rent-exempt for their exact size, so use the
+        // rent-exempt minimum for `data`, not a placeholder. A tx that passes a
+        // sysvar as an account (e.g. a durable-nonce tx passing RecentBlockhashes)
+        // has its balance checked against the chain by the oracle; a wrong balance
+        // would falsely halt the replay.
+        let lamports = Rent::default().minimum_balance(data.len());
         let account = AccountSharedData::from(Account {
-            lamports: 1,
+            lamports,
             data,
             owner: solana_sdk_ids::sysvar::id(),
             executable: false,
@@ -436,12 +451,24 @@ impl Replayer {
             }
             Err(err) => Err(err),
         };
+        // Record program logs so a divergence can be diagnosed by comparing the
+        // replay's log stream against the chain's getBlock logMessages. CPI and
+        // return-data recording stay off; only the log stream is needed.
+        let config = TransactionProcessingConfig {
+            recording_config: ExecutionRecordingConfig {
+                enable_log_recording: true,
+                enable_cpi_recording: false,
+                enable_return_data_recording: false,
+                enable_transaction_balance_recording: false,
+            },
+            ..Default::default()
+        };
         let mut output = processor.load_and_execute_sanitized_transactions(
             bank,
             std::slice::from_ref(tx),
             vec![check_result],
             &env,
-            &TransactionProcessingConfig::default(),
+            &config,
         );
         output.processing_results.remove(0)
     }
@@ -472,6 +499,17 @@ impl Replayer {
                 Ok(tx) => tx,
                 Err(err) => return BlockReplay::halted(i, format!("cannot sanitize: {err}")),
             };
+            // Vote transactions touch only vote accounts and the validator's fee
+            // payer, never the indexed program's accounts, so replaying and
+            // reconciling them is pure consensus noise for a program-scoped backfill.
+            // Skip them (as account-archive services exclude votes); this also avoids
+            // needing real SlotHashes content, which a vote reads to validate the slot
+            // it votes on.
+            if SVMMessage::program_instructions_iter(&tx)
+                .any(|(program_id, _)| *program_id == solana_sdk_ids::vote::id())
+            {
+                continue;
+            }
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
             let result = self.execute_with(

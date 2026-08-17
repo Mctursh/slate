@@ -38,7 +38,19 @@ pub async fn backfill(
     store: &ClickHouseClient,
 ) -> Result<RangeReplay> {
     // Wide seed (footprint) ∪ baseline (program-owned), in a single snapshot scan.
-    let footprint = block::footprint(blocks);
+    let mut footprint = block::footprint(blocks);
+    // Also seed the programData (bytecode) accounts of every upgradeable program
+    // the range invokes: they're PDAs of the program ids, never declared keys, so
+    // the footprint alone misses them and the SVM can't load the programs.
+    let programdata = block::programdata_addresses(&footprint);
+    footprint.extend(programdata);
+    // Seed the SlotHashes sysvar from the snapshot too. Programs read it for on-chain
+    // randomness — its entries are real bank hashes — and it's read via syscall, never
+    // passed as an account, so the footprint never captures it. The snapshot's value
+    // (bank hashes up to s_snap) is exactly what the first replayed block (s_snap+1)
+    // must see; without it an empty SlotHashes makes such a program panic reading a
+    // nonexistent entry.
+    footprint.insert(solana_sdk_ids::sysvar::slot_hashes::id());
     let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
     let baseline = persist::baseline_rows(&accounts, program, s_snap);
 
