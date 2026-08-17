@@ -21,7 +21,7 @@ use std::{
 
 use agave_feature_set::FeatureSet;
 use agave_syscalls::create_program_runtime_environment_v1;
-use solana_account::{Account, AccountSharedData};
+use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_clock::Clock;
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_epoch_schedule::EpochSchedule;
@@ -32,6 +32,7 @@ use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
     loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
 };
+use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_slot_hashes::SlotHashes;
@@ -51,6 +52,7 @@ use solana_sysvar_id::SysvarId;
 use solana_transaction::sanitized::SanitizedTransaction;
 
 use crate::{
+    bankhash::BankHashRoller,
     block::{Block, sanitize},
     oracle::reconcile,
 };
@@ -89,6 +91,10 @@ pub struct ReplayBank {
     /// writes (`None` = it didn't exist), captured on the first write. This drives the
     /// lattice-hash roll: mix each changed account out at its old value, in at its new.
     slot_dirty: Option<HashMap<Pubkey, Option<AccountSharedData>>>,
+    /// The bank-hash roll, when active (`Some` for a real backfill, bootstrapped from
+    /// the snapshot manifest). Holds the running lattice + bank hash and advances one
+    /// slot at a time. `None` for tests that don't need forward bank hashes.
+    bankhash_roller: Option<BankHashRoller>,
 }
 
 /// One transaction-committed account write: the account's state at the slot it
@@ -152,6 +158,43 @@ impl ReplayBank {
             .into_iter()
             .filter_map(|(key, old)| self.accounts.get(&key).map(|(new, _)| (key, old, new.clone())))
             .collect()
+    }
+
+    /// Start the bank-hash roll from the snapshot manifest's lattice hash and bank hash
+    /// at s_snap. Once set, each replayed slot advances the roll.
+    pub fn bootstrap_bankhash(&mut self, lt_hash: LtHash, bank_hash: Hash) {
+        self.bankhash_roller = Some(BankHashRoller::new(lt_hash, bank_hash));
+    }
+
+    /// The last finalized slot's bank hash — what gets prepended into SlotHashes for
+    /// the next slot — or `None` if the roll isn't active.
+    pub fn parent_bank_hash(&self) -> Option<Hash> {
+        self.bankhash_roller.as_ref().map(|r| r.bank_hash())
+    }
+
+    /// Roll the lattice over this slot's changed accounts and compute the slot's bank
+    /// hash, advancing the roll. `None` (and no-op) if the roll isn't active.
+    pub fn finalize_slot_bankhash(
+        &mut self,
+        signature_count: u64,
+        blockhash: &Hash,
+    ) -> Option<Hash> {
+        let changes = self.take_slot_changes();
+        self.bankhash_roller
+            .as_mut()
+            .map(|r| r.roll_slot(&changes, signature_count, blockhash))
+    }
+
+    /// Prepend `(slot, bank_hash)` to the SlotHashes sysvar, exactly as the runtime's
+    /// `update_slot_hashes` does at the start of a slot. `SlotHashes::add` keeps the
+    /// entries newest-first and truncates to the 512-entry maximum.
+    pub fn roll_slot_hashes(&mut self, slot: u64, bank_hash: Hash) {
+        let mut slot_hashes = self
+            .get_account_shared_data(&SlotHashes::id())
+            .and_then(|(account, _)| bincode::deserialize::<SlotHashes>(account.data()).ok())
+            .unwrap_or_else(|| SlotHashes::new(&[]));
+        slot_hashes.add(slot, bank_hash);
+        self.set_sysvar_account(SlotHashes::id(), bincode::serialize(&slot_hashes).unwrap());
     }
 
     /// Register a builtin (native) program: put its loader-owned account in the
@@ -523,7 +566,18 @@ impl Replayer {
         block: &Block,
         epoch: u64,
     ) -> BlockReplay {
+        // With the bank-hash roll active, record the slot's writes and prepend the
+        // parent's bank hash into SlotHashes (as the runtime's update_slot_hashes does
+        // at slot start), so this slot's txs — including votes, which validate against
+        // SlotHashes — read the real recent history.
+        let rolling = bank.parent_bank_hash().is_some();
+        if rolling {
+            bank.begin_slot();
+        }
         bank.configure_sysvars(block.slot, block.block_time);
+        if let Some(parent_hash) = bank.parent_bank_hash() {
+            bank.roll_slot_hashes(block.parent_slot, parent_hash);
+        }
         processor.fill_missing_sysvar_cache_entries(bank);
 
         for (i, block_tx) in block.transactions.iter().enumerate() {
@@ -531,17 +585,6 @@ impl Replayer {
                 Ok(tx) => tx,
                 Err(err) => return BlockReplay::halted(i, format!("cannot sanitize: {err}")),
             };
-            // Vote transactions touch only vote accounts and the validator's fee
-            // payer, never the indexed program's accounts, so replaying and
-            // reconciling them is pure consensus noise for a program-scoped backfill.
-            // Skip them (as account-archive services exclude votes); this also avoids
-            // needing real SlotHashes content, which a vote reads to validate the slot
-            // it votes on.
-            if SVMMessage::program_instructions_iter(&tx)
-                .any(|(program_id, _)| *program_id == solana_sdk_ids::vote::id())
-            {
-                continue;
-            }
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
             let result = self.execute_with(
@@ -558,6 +601,17 @@ impl Replayer {
             }
 
             commit_writes(bank, &tx, &result, block.slot);
+        }
+
+        // Roll the lattice over everything this slot wrote and compute the slot's bank
+        // hash; it becomes the parent for the next slot's SlotHashes prepend.
+        if rolling {
+            let signature_count = block
+                .transactions
+                .iter()
+                .map(|tx| tx.transaction.signatures.len() as u64)
+                .sum();
+            bank.finalize_slot_bankhash(signature_count, &block.blockhash);
         }
 
         BlockReplay::complete(block.transactions.len())

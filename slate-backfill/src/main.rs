@@ -17,6 +17,7 @@ use slate_common::config::Config;
 use slate_replay::{
     backfill::backfill,
     block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
+    snapshot::{read_manifest_hashes, read_manifest_lt_hash},
 };
 use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
@@ -95,6 +96,23 @@ fn main() -> anyhow::Result<()> {
     println!("preflight ok: RPC, program, snapshot, config, and ClickHouse all check out");
 
     let blocks = fetch_range(&args)?;
+
+    // Bootstrap the bank-hash roll from the snapshot manifest — the lattice hash and
+    // bank hash at s_snap — so SlotHashes rolls forward with real bank hashes and the
+    // programs that read it (and votes) reconcile past the first block.
+    let manifest = read_manifest_hashes(
+        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?,
+        args.from,
+    )
+    .context("reading the snapshot manifest bank hash")?;
+    let lt_hash = read_manifest_lt_hash(
+        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?,
+        args.from,
+    )
+    .context("reading the snapshot manifest lattice hash")?
+    .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
+    let bootstrap = Some((lt_hash, manifest.bank_hash));
+
     let snapshot =
         File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?;
 
@@ -106,7 +124,7 @@ fn main() -> anyhow::Result<()> {
             &cfg.clickhouse.user,
             &cfg.clickhouse.password,
         );
-        let result = backfill(snapshot, args.from, &blocks, &program, &store).await?;
+        let result = backfill(snapshot, args.from, &blocks, &program, &store, bootstrap).await?;
         match &result.halt {
             None => println!(
                 "done: {} blocks replayed and persisted; coverage ({}, {}]",

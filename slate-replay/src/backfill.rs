@@ -7,6 +7,8 @@ use std::io::Read;
 
 use anyhow::Result;
 use slate_store::ClickHouseClient;
+use solana_hash::Hash;
+use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 use crate::{
@@ -36,6 +38,7 @@ pub async fn backfill(
     blocks: &[Block],
     program: &Pubkey,
     store: &ClickHouseClient,
+    bootstrap: Option<(LtHash, Hash)>,
 ) -> Result<RangeReplay> {
     // Wide seed (footprint) ∪ baseline (program-owned), in a single snapshot scan.
     let mut footprint = block::footprint(blocks);
@@ -57,6 +60,11 @@ pub async fn backfill(
     let mut bank = ReplayBank::default();
     for (pubkey, (account, slot)) in &accounts {
         bank.insert(*pubkey, account.clone(), *slot);
+    }
+    // Start the bank-hash roll from the manifest's lattice + bank hash at s_snap, so
+    // SlotHashes rolls forward with real bank hashes as the range replays.
+    if let Some((lt_hash, bank_hash)) = bootstrap {
+        bank.bootstrap_bankhash(lt_hash, bank_hash);
     }
 
     let result = if let Some(first) = blocks.first() {
@@ -175,7 +183,7 @@ mod tests {
         ];
 
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
-        let outcome = backfill(SNAPSHOT, s_snap, &blocks, &system, &store)
+        let outcome = backfill(SNAPSHOT, s_snap, &blocks, &system, &store, None)
             .await
             .expect("backfill");
         assert!(outcome.is_complete(), "backfill halted: {:?}", outcome.halt);
