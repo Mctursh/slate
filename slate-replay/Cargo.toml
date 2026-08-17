@@ -37,6 +37,13 @@ solana-fee-structure = "3.0.0"
 solana-svm-feature-set = "3.1.14"
 solana-hash = "3.1.0"
 solana-sysvar = { version = "3.1.1", features = ["serde"] }
+# Bank-hash computation (lattice-hash regime). LtHash is agave's standalone
+# solana-lattice-hash crate — zero solana deps, consensus-frozen format, pinned to
+# the epoch-807 target so it's byte-exact. blake3 feeds the per-account element;
+# sha2 is the hashv combine.
+solana-lattice-hash = "=2.2.20"
+blake3 = "1"
+sha2 = "0.10"
 
 anyhow = "1"
 solana-builtins = { version = "3", features = ["agave-unstable-api"] }

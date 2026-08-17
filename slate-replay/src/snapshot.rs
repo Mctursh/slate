@@ -21,6 +21,7 @@ use std::{
 use anyhow::{Context, Result};
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_hash::Hash;
+use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 use crate::ReplayBank;
@@ -289,6 +290,63 @@ fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
     // + slots_per_year(8) + accounts_data_len(8)
     p = p.checked_add(8 + 16 + 8 + 8 + 8)?;
     read_u64(p) // slot
+}
+
+/// The trailer size of the manifest's `accounts_lt_hash` field when present: a 1-byte
+/// `Option` tag (`0x01`) followed by 1024 little-endian u16 lanes (2048 bytes).
+const LT_HASH_TRAILER: usize = 1 + 2048;
+
+/// Read the accounts lattice hash from a snapshot manifest. In v2.2.x it's the LAST
+/// field of the manifest — `Option<[u16; 1024]>` — so when present it's the final
+/// 2049 bytes: an `0x01` tag then the 2048 lattice bytes, then EOF. Returns `None` if
+/// it was serialized as `None` (the `accounts_lt_hash` feature wasn't active for that
+/// snapshot's slot). Streams the whole manifest to reach its tail but keeps only the
+/// last bytes in memory, never the ~1 GiB body.
+pub fn read_manifest_lt_hash<R: Read>(reader: R, snapshot_slot: u64) -> Result<Option<LtHash>> {
+    let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
+    let mut archive = tar::Archive::new(decoder);
+    let manifest_path = format!("snapshots/{snapshot_slot}/{snapshot_slot}");
+
+    for entry in archive.entries().context("read tar entries")? {
+        let mut entry = entry.context("tar entry")?;
+        let is_manifest = entry
+            .path()
+            .context("entry path")?
+            .to_str()
+            .is_some_and(|p| p == manifest_path);
+        if !is_manifest {
+            continue;
+        }
+        // Roll a window of the last LT_HASH_TRAILER bytes across the streamed manifest.
+        let mut tail = Vec::with_capacity(LT_HASH_TRAILER + 64 * 1024);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = entry.read(&mut buf).context("read manifest")?;
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+            if tail.len() > LT_HASH_TRAILER {
+                tail.drain(0..tail.len() - LT_HASH_TRAILER);
+            }
+        }
+        return Ok(parse_lt_hash_trailer(&tail));
+    }
+    anyhow::bail!("manifest {manifest_path} not found in snapshot")
+}
+
+/// Decode the manifest's `Option<accounts_lt_hash>` trailer: `0x01` + 2048 LE bytes ⇒
+/// `Some(LtHash)`, `0x00` (or too-short) ⇒ `None`.
+fn parse_lt_hash_trailer(tail: &[u8]) -> Option<LtHash> {
+    if tail.len() < LT_HASH_TRAILER || tail[tail.len() - LT_HASH_TRAILER] != 1 {
+        return None;
+    }
+    let bytes = &tail[tail.len() - 2048..];
+    let mut lanes = [0u16; 1024];
+    for (lane, chunk) in lanes.iter_mut().zip(bytes.chunks_exact(2)) {
+        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
+    }
+    Some(LtHash(lanes))
 }
 
 #[cfg(test)]

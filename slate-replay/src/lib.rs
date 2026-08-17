@@ -7,6 +7,7 @@
 //! comes in Tasks 0.4–0.7.
 
 pub mod backfill;
+pub mod bankhash;
 pub mod block;
 pub mod fixture;
 pub mod oracle;
