@@ -21,7 +21,7 @@ use std::{
 
 use agave_feature_set::FeatureSet;
 use agave_syscalls::create_program_runtime_environment_v1;
-use solana_account::{Account, AccountSharedData, ReadableAccount};
+use solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount};
 use solana_clock::Clock;
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_epoch_schedule::EpochSchedule;
@@ -225,46 +225,116 @@ impl ReplayBank {
     /// txs will add SlotHashes / StakeHistory.
     pub fn configure_sysvars(&mut self, slot: u64, unix_timestamp: i64) {
         let epoch = slot / 432_000; // mainnet: no warmup
-        let clock = Clock {
-            slot,
-            // epoch_start_timestamp / leader_schedule_epoch are unused by a plain
-            // transfer; Phase 1 computes them exactly per slot.
-            epoch_start_timestamp: unix_timestamp,
-            epoch,
-            leader_schedule_epoch: epoch,
-            unix_timestamp,
+        // Clock: derive from the snapshot's real Clock — the epoch fields
+        // (epoch, epoch_start_timestamp, leader_schedule_epoch) are constant within an
+        // epoch, so only slot and unix_timestamp advance. Reproducing them exactly is
+        // what the bank-hash roll needs. Fall back to a synthesized Clock when none is
+        // loaded (fixtures/tests that don't seed one).
+        let clock = match self
+            .get_account_shared_data(&Clock::id())
+            .and_then(|(account, _)| bincode::deserialize::<Clock>(account.data()).ok())
+        {
+            Some(mut clock) => {
+                clock.slot = slot;
+                clock.unix_timestamp = unix_timestamp;
+                clock
+            }
+            None => Clock {
+                slot,
+                epoch,
+                epoch_start_timestamp: unix_timestamp,
+                leader_schedule_epoch: epoch,
+                unix_timestamp,
+            },
         };
         self.set_sysvar_account(Clock::id(), bincode::serialize(&clock).unwrap());
-        self.set_sysvar_account(Rent::id(), bincode::serialize(&Rent::default()).unwrap());
-        self.set_sysvar_account(
-            EpochSchedule::id(),
-            bincode::serialize(&EpochSchedule::without_warmup()).unwrap(),
-        );
-        // SlotHashes holds real bank hashes and is seeded from the snapshot: programs
-        // read it for on-chain randomness, and RPC can't reproduce bank hashes, so the
-        // snapshot is the only source. Its value is exactly correct for the first
-        // replayed block (s_snap+1). Only default it to empty when the snapshot didn't
-        // supply one — never clobber the real value. (Rolling it forward per replayed
-        // slot, so blocks past the first stay exact, is future work: it needs computed
-        // bank hashes for the newly replayed slots.)
+        // Rent / EpochSchedule are constant and seeded from the snapshot; only
+        // synthesize them when absent (tests). Overwriting a loaded value would be a
+        // spurious change in the lattice.
+        if self.get_account_shared_data(&Rent::id()).is_none() {
+            self.set_sysvar_account(Rent::id(), bincode::serialize(&Rent::default()).unwrap());
+        }
+        if self.get_account_shared_data(&EpochSchedule::id()).is_none() {
+            self.set_sysvar_account(
+                EpochSchedule::id(),
+                bincode::serialize(&EpochSchedule::without_warmup()).unwrap(),
+            );
+        }
+        // SlotHashes is seeded from the snapshot (real bank hashes) and prepended per
+        // slot by roll_slot_hashes; only default it to empty when absent.
         if self.get_account_shared_data(&SlotHashes::id()).is_none() {
             self.set_slot_hashes(&[]);
         }
-        // RecentBlockhashes is deprecated, but AdvanceNonceAccount still errors if
-        // it is empty, so a durable-nonce tx needs it non-empty. Such a tx also
-        // passes it as an account, so the oracle checks its lamports: the chain
-        // keeps it at its full 150 entries (6008 bytes ⇒ 42_706_560 rent-exempt
-        // lamports), so a 1-entry stub mismatched and halted the replay. Fill it to
-        // the real 150 entries so its size — and thus the rent-exempt lamports
-        // set_sysvar_account computes — match the chain. The content is otherwise
-        // vestigial: the advanced nonce's value comes from the environment
-        // blockhash, not this list.
+        // RecentBlockhashes is seeded from the snapshot and rolled at freeze
+        // (freeze_slot). When absent (tests) fill a 150-entry placeholder: it's
+        // deprecated, but AdvanceNonceAccount errors if it's empty, and its full size
+        // fixes the rent-exempt lamports the oracle checks.
         #[allow(deprecated)]
+        if self
+            .get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
+            .is_none()
         {
             let placeholder = Hash::new_from_array([1u8; 32]);
             let recent = solana_sysvar::recent_blockhashes::RecentBlockhashes::from_iter(
                 (0..150u64)
                     .map(|i| solana_sysvar::recent_blockhashes::IterItem(i, &placeholder, 5_000)),
+            );
+            self.set_sysvar_account(
+                solana_sdk_ids::sysvar::recent_blockhashes::id(),
+                bincode::serialize(&recent).unwrap(),
+            );
+        }
+    }
+
+    /// Apply the account writes the runtime does at slot freeze that the bank-hash
+    /// lattice must include: extend SlotHistory with this slot, and prepend this
+    /// slot's blockhash to RecentBlockhashes. Both roll forward from the snapshot's
+    /// real value. No-op for the sysvars the snapshot didn't supply (tests).
+    pub fn freeze_slot(&mut self, slot: u64, blockhash: Hash, fee_reward: Option<(Pubkey, u64)>) {
+        // Leader fee credit: the runtime pays the slot's leader 50% of its fees at
+        // freeze (burning the rest). getBlock's "Fee" reward gives the exact amount.
+        if let Some((leader, lamports)) = fee_reward {
+            if let Some((mut account, _)) = self.get_account_shared_data(&leader) {
+                account.set_lamports(account.lamports() + lamports);
+                self.insert(leader, account, slot);
+            }
+        }
+        if let Some(mut history) = self
+            .get_account_shared_data(&solana_sdk_ids::sysvar::slot_history::id())
+            .and_then(|(account, _)| {
+                bincode::deserialize::<solana_sysvar::slot_history::SlotHistory>(account.data()).ok()
+            })
+        {
+            history.add(slot);
+            self.set_sysvar_account(
+                solana_sdk_ids::sysvar::slot_history::id(),
+                bincode::serialize(&history).unwrap(),
+            );
+        }
+        #[allow(deprecated)]
+        if let Some(current) = self
+            .get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
+            .and_then(|(account, _)| {
+                bincode::deserialize::<solana_sysvar::recent_blockhashes::RecentBlockhashes>(
+                    account.data(),
+                )
+                .ok()
+            })
+        {
+            // Newest first, this slot's blockhash prepended, capped at 150 like the
+            // runtime. Mainnet's fee is fixed, so every entry carries 5000.
+            let entries: Vec<(Hash, u64)> = std::iter::once((blockhash, 5_000u64))
+                .chain(
+                    current
+                        .iter()
+                        .map(|e| (e.blockhash, e.fee_calculator.lamports_per_signature)),
+                )
+                .take(150)
+                .collect();
+            let recent = solana_sysvar::recent_blockhashes::RecentBlockhashes::from_iter(
+                entries.iter().enumerate().map(|(i, (hash, lamports))| {
+                    solana_sysvar::recent_blockhashes::IterItem(i as u64, hash, *lamports)
+                }),
             );
             self.set_sysvar_account(
                 solana_sdk_ids::sysvar::recent_blockhashes::id(),
@@ -603,15 +673,19 @@ impl Replayer {
             commit_writes(bank, &tx, &result, block.slot);
         }
 
-        // Roll the lattice over everything this slot wrote and compute the slot's bank
-        // hash; it becomes the parent for the next slot's SlotHashes prepend.
+        // Apply the runtime's freeze-time sysvar writes (SlotHistory, RecentBlockhashes),
+        // then roll the lattice over everything this slot wrote and compute the slot's
+        // bank hash; it becomes the parent for the next slot's SlotHashes prepend.
         if rolling {
+            bank.freeze_slot(block.slot, block.blockhash, block.fee_reward);
             let signature_count = block
                 .transactions
                 .iter()
                 .map(|tx| tx.transaction.signatures.len() as u64)
                 .sum();
-            bank.finalize_slot_bankhash(signature_count, &block.blockhash);
+            if let Some(bank_hash) = bank.finalize_slot_bankhash(signature_count, &block.blockhash) {
+                eprintln!("slot {} computed bank_hash {bank_hash}", block.slot);
+            }
         }
 
         BlockReplay::complete(block.transactions.len())
@@ -1175,6 +1249,7 @@ mod tests {
                     meta: meta([amount1, 0, 1], [amount1 - amount2 - fee, amount2, 1]),
                 },
             ],
+            fee_reward: None,
         };
 
         let outcome = replayer.replay_block(&mut bank, &block, epoch);
@@ -1589,6 +1664,7 @@ mod tests {
                         post_token_balances: vec![],
                     },
                 }],
+                fee_reward: None,
             }
         };
 

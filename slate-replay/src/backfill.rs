@@ -173,6 +173,7 @@ mod tests {
                             post_token_balances: vec![],
                         },
                     }],
+                    fee_reward: None,
                 }
             };
 

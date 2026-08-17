@@ -33,6 +33,11 @@ pub struct Block {
     pub previous_blockhash: Hash,
     pub block_time: i64,
     pub transactions: Vec<BlockTx>,
+    /// The slot's leader fee reward from getBlock `rewards` (the "Fee" entry): the
+    /// leader's identity pubkey and the lamports credited to it at freeze. The runtime
+    /// pays the leader 50% of the slot's fees (burning the rest), an account write that
+    /// the bank-hash lattice must include. `None` if the block carried no fee reward.
+    pub fee_reward: Option<(Pubkey, u64)>,
 }
 
 /// A transaction and the on-chain result we reconcile our replay against.
@@ -108,6 +113,17 @@ impl Block {
             transactions.push(parse_tx(t).with_context(|| format!("transaction[{i}]"))?);
         }
 
+        // The leader fee reward (rewardType "Fee"): the leader's pubkey and the lamports
+        // credited to it at freeze. Mid-epoch this is the block's only reward.
+        let fee_reward = result["rewards"]
+            .as_array()
+            .and_then(|rewards| rewards.iter().find(|r| r["rewardType"].as_str() == Some("Fee")))
+            .and_then(|r| {
+                let pubkey = r["pubkey"].as_str()?.parse::<Pubkey>().ok()?;
+                let lamports = u64::try_from(r["lamports"].as_i64()?).ok()?;
+                Some((pubkey, lamports))
+            });
+
         Ok(Block {
             slot,
             parent_slot,
@@ -115,6 +131,7 @@ impl Block {
             previous_blockhash,
             block_time,
             transactions,
+            fee_reward,
         })
     }
 }
@@ -221,7 +238,7 @@ pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
         "params": [slot, {
             "encoding": "base64",
             "transactionDetails": "full",
-            "rewards": false,
+            "rewards": true,
             "maxSupportedTransactionVersion": 0,
         }],
     });
@@ -351,14 +368,26 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
             set.extend(tx.meta.loaded_addresses.writable.iter().copied());
             set.extend(tx.meta.loaded_addresses.readonly.iter().copied());
         }
+        // The leader credited this slot's fees — freeze writes it, so the lattice needs
+        // its pre-slot value seeded.
+        if let Some((leader, _)) = block.fee_reward {
+            set.insert(leader);
+        }
     }
     set.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
-    // Sysvars the SVM's sysvar cache serves but replay does NOT synthesize:
-    // their values are historical (StakeHistory's stake-activation curve,
-    // EpochRewards, LastRestartSlot), so they have to be seeded from the snapshot.
-    // Clock / Rent / EpochSchedule / SlotHashes are left out because
-    // configure_sysvars rebuilds those fresh per slot. Without these, a stake tx
-    // that reads StakeHistory from the cache would get nothing.
+    // Seed every sysvar we need from the snapshot rather than synthesize it. The
+    // bank-hash roll needs each per-slot sysvar write to be bit-exact, so replay
+    // starts from the real value at s_snap and applies the runtime's minimal delta:
+    // Clock keeps its epoch fields and just advances slot/timestamp; SlotHistory and
+    // RecentBlockhashes roll one entry forward; Rent/EpochSchedule don't change. The
+    // historical ones (StakeHistory's stake curve, EpochRewards, LastRestartSlot)
+    // likewise can't be synthesized. SlotHashes is added in backfill (it also seeds
+    // the programData PDAs there).
+    set.insert(solana_sdk_ids::sysvar::clock::id());
+    set.insert(solana_sdk_ids::sysvar::slot_history::id());
+    set.insert(solana_sdk_ids::sysvar::recent_blockhashes::id());
+    set.insert(solana_sdk_ids::sysvar::rent::id());
+    set.insert(solana_sdk_ids::sysvar::epoch_schedule::id());
     set.insert(solana_sdk_ids::sysvar::stake_history::id());
     set.insert(solana_sdk_ids::sysvar::epoch_rewards::id());
     set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
@@ -453,6 +482,7 @@ mod tests {
                     post_token_balances: vec![],
                 },
             }],
+            fee_reward: None,
         };
 
         let fp = footprint(std::slice::from_ref(&synthetic));

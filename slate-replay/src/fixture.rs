@@ -230,6 +230,7 @@ pub mod cpi {
                 transaction: versioned_transaction(),
                 meta: meta(),
             }],
+            fee_reward: None,
         }
     }
 
