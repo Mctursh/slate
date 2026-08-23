@@ -208,14 +208,26 @@ impl ReplayBank {
         name: &str,
         entry: ProgramCacheEntry,
     ) {
-        let account = AccountSharedData::from(Account {
-            lamports: 1,
-            data: name.as_bytes().to_vec(),
-            owner: solana_sdk_ids::native_loader::id(),
-            executable: true,
-            rent_epoch: 0,
-        });
-        self.insert(program_id, account, 0);
+        // Only synthesize a stub account when the real on-chain one isn't already
+        // present (loaded from the snapshot). The real builtin account's data is
+        // its runtime name — e.g. system program is "solana_system_program" (21
+        // bytes) — which differs from the `solana_builtins` short name
+        // ("system_program", 14 bytes). Overwriting the loaded account with a
+        // name-stub changes its serialized length, and since builtins are passed
+        // as instruction accounts, that shifts every following account in the VM
+        // input region by the size delta (8 bytes here, after BPF u128 alignment).
+        // Programs that persist raw input-region pointers (Neon EVM's holder)
+        // then store shifted pointers, corrupting their state and the bank hash.
+        if !self.accounts.contains_key(&program_id) {
+            let account = AccountSharedData::from(Account {
+                lamports: 1,
+                data: name.as_bytes().to_vec(),
+                owner: solana_sdk_ids::native_loader::id(),
+                executable: true,
+                rent_epoch: 0,
+            });
+            self.insert(program_id, account, 0);
+        }
         processor.add_builtin(program_id, entry);
     }
 
@@ -883,6 +895,44 @@ mod tests {
         assert_eq!(*acct.owner(), solana_sdk_ids::sysvar::id());
         let decoded: SlotHashes = bincode::deserialize(acct.data()).unwrap();
         assert_eq!(decoded, SlotHashes::new(&[(7, hash)]));
+    }
+
+    #[test]
+    fn register_builtins_keeps_the_real_snapshot_builtin_account() {
+        use solana_account::ReadableAccount;
+        let system = solana_sdk_ids::system_program::id();
+
+        // The real on-chain system_program account carries its runtime name
+        // "solana_system_program" (21 bytes) as data — that's what a snapshot
+        // footprint loads. `solana_builtins` knows it by the short name
+        // "system_program" (14 bytes). If register_builtins stubbed over the
+        // loaded account, its serialized length would drop by 8 (after BPF u128
+        // alignment) and every following instruction account would shift in the
+        // VM input region — the slot-030 +8 pointer bug.
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            system,
+            AccountSharedData::from(Account {
+                lamports: 1,
+                data: b"solana_system_program".to_vec(),
+                owner: solana_sdk_ids::native_loader::id(),
+                executable: true,
+                rent_epoch: 0,
+            }),
+            349_042_767,
+        );
+
+        let replayer = Replayer::new(0, 0);
+        register_builtins(&mut bank, &replayer.processor);
+
+        let (acct, _) = bank
+            .get_account_shared_data(&system)
+            .expect("system_program present");
+        assert_eq!(
+            acct.data(),
+            b"solana_system_program",
+            "register_builtins overwrote the real 21-byte snapshot account with a name-stub"
+        );
     }
 
     #[test]
