@@ -14,7 +14,7 @@ use solana_pubkey::Pubkey;
 use crate::{
     RangeReplay, ReplayBank, Replayer, WriteRecord,
     block::{self, Block},
-    build_feature_set, persist, register_builtins, snapshot,
+    build_feature_set, compat, persist, register_builtins, snapshot,
 };
 
 /// Backfill `blocks` (contiguous, in one epoch) for `program`, seeded from a
@@ -72,6 +72,10 @@ pub async fn backfill(
         let feature_set = build_feature_set(&bank, first.slot);
         let replayer = Replayer::new_with_feature_set(first.slot, epoch, feature_set);
         register_builtins(&mut bank, &replayer.processor);
+        // Re-supply native programs agave deleted after their core-BPF migration
+        // that this slot range predates (e.g. Stake). Gated per-program on the
+        // migration feature, so it's a no-op once the migration is active on chain.
+        compat::register_removed_builtins(&mut bank, &replayer.processor, replayer.feature_set());
         replayer.replay_range(&mut bank, blocks)
     } else {
         RangeReplay {

@@ -19,6 +19,11 @@ solana-rent = "3.1.0"
 solana-epoch-schedule = "3.2.0"
 solana-sysvar-id = "3.1.0"
 bincode = "1.3"
+# Native Stake program, vendored from solana-stake-program 3.0.14 (the last version
+# that shipped the native processor before it was repurposed to core BPF at 4.0.0).
+# Its 5 pinned =3.0.14 deps are repointed to =3.1.14 to build against our runtime.
+# Re-supplied for pre-migration replay via the compat module.
+solana-stake-program = { path = "../vendor/solana-stake-program" }
 solana-transaction = { version = "3.1.0", features = ["serde", "blake3", "bincode"] }
 solana-message = "3.1.0"
 solana-transaction-error = "3"

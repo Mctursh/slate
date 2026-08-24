@@ -9,6 +9,7 @@
 pub mod backfill;
 pub mod bankhash;
 pub mod block;
+pub mod compat;
 pub mod fixture;
 pub mod oracle;
 pub mod persist;
@@ -489,6 +490,12 @@ pub struct Replayer {
 }
 
 impl Replayer {
+    /// The runtime feature set this replayer was built against — the exact per-slot
+    /// set, used to gate compat shims (e.g. re-supplied removed builtins).
+    pub fn feature_set(&self) -> &FeatureSet {
+        &self.feature_set
+    }
+
     /// Build an execution-ready processor for `slot`/`epoch` with every feature
     /// enabled. Fine for the fixtures and any builtin-only path; a faithful replay
     /// of a real slot uses [`Replayer::new_with_feature_set`] with the exact set
