@@ -394,6 +394,43 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     set
 }
 
+/// The consensus bank-hash confirmations carried by a block's vote transactions.
+/// A TowerSync/VoteStateUpdate vote carries the bank hash of the newest slot it
+/// votes on, so votes in one block confirm the computed hashes of slots a handful
+/// back. Returns `(voted slot, that slot's bank hash)` for every decodable vote.
+/// Best-effort: non-vote txs and older instruction variants that carry no hash are
+/// skipped — a slot with no confirming vote is reported unverified, never wrong.
+pub fn vote_confirmations(block: &Block) -> Vec<(u64, Hash)> {
+    use solana_vote_interface::instruction::VoteInstruction;
+    let mut out = Vec::new();
+    for btx in &block.transactions {
+        let keys = btx.transaction.message.static_account_keys();
+        for ix in btx.transaction.message.instructions() {
+            if keys.get(ix.program_id_index as usize) != Some(&solana_sdk_ids::vote::id()) {
+                continue;
+            }
+            let Ok(vote) = bincode::deserialize::<VoteInstruction>(&ix.data) else {
+                continue;
+            };
+            // The hash is the bank hash of the last (newest) slot the vote covers.
+            let (lockouts, hash) = match &vote {
+                VoteInstruction::TowerSync(t) | VoteInstruction::TowerSyncSwitch(t, _) => {
+                    (&t.lockouts, t.hash)
+                }
+                VoteInstruction::UpdateVoteState(u)
+                | VoteInstruction::UpdateVoteStateSwitch(u, _)
+                | VoteInstruction::CompactUpdateVoteState(u)
+                | VoteInstruction::CompactUpdateVoteStateSwitch(u, _) => (&u.lockouts, u.hash),
+                _ => continue,
+            };
+            if let Some(slot) = lockouts.iter().map(|l| l.slot()).max() {
+                out.push((slot, hash));
+            }
+        }
+    }
+    out
+}
+
 /// The programData accounts for every key in `footprint`, derived as the
 /// upgradeable-loader PDA of that key. An upgradeable program's bytecode lives in
 /// a separate programData account (a PDA of the program id under the upgradeable

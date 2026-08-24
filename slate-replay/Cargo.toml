@@ -41,6 +41,10 @@ solana-slot-hashes = "3.1.0"
 solana-fee-structure = "3.0.0"
 solana-svm-feature-set = "3.1.14"
 solana-hash = "3.1.0"
+# Decode validator votes: a TowerSync/VoteStateUpdate carries the bank hash of the
+# slot it votes on, so votes in later blocks let the replay self-verify each slot
+# against consensus (block::vote_confirmations + the hash check in replay_range).
+solana-vote-interface = { version = "4", features = ["bincode"] }
 solana-sysvar = { version = "3.1.1", features = ["serde"] }
 # Bank-hash computation (lattice-hash regime). LtHash is agave's standalone
 # solana-lattice-hash crate — zero solana deps, consensus-frozen format, pinned to
@@ -60,7 +64,6 @@ slate-store = { path = "../slate-store" }
 solana-message = "3"
 solana-instruction = "3"
 solana-signature = "3"
-solana-vote-interface = { version = "4", features = ["bincode"] }
 solana-ed25519-program = "3"
 ed25519-dalek = "2"
 solana-nonce = { version = "3.1.0", features = ["serde"] }

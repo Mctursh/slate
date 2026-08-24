@@ -764,7 +764,42 @@ impl Replayer {
     /// reward machinery that isn't built yet, and the feature set is fixed at
     /// construction. `bank` must already be seeded with builtins registered.
     pub fn replay_range(&self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
+        // Self-verify against consensus as we go. A validator vote carries the bank
+        // hash of the slot it votes on, so votes in later blocks confirm earlier
+        // slots' computed hashes. `computed` holds our hashes awaiting a vote (with
+        // the block index, so a mismatch can stop coverage at the last good slot);
+        // `confirmed` holds votes awaiting their slot. Each slot reconciles once, so
+        // both stay bounded to the ~30-slot vote lag. A mismatch means our state
+        // diverged from what a supermajority of stake agreed on: halt.
+        let first_slot = blocks.first().map_or(0, |b| b.slot);
+        let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
+        let mut confirmed: HashMap<u64, Hash> = HashMap::new();
+        let mut verified = 0usize;
+
         for (completed, block) in blocks.iter().enumerate() {
+            // Harvest this block's votes; reconcile any slot we've already computed.
+            for (slot, vote_hash) in crate::block::vote_confirmations(block) {
+                if slot < first_slot {
+                    continue; // a vote for a slot before the range; never computed here
+                }
+                match computed.remove(&slot) {
+                    Some((got, idx)) if got != vote_hash => {
+                        return RangeReplay {
+                            blocks_completed: idx,
+                            halt: Some((slot, BlockReplay::halted(
+                                0,
+                                format!("bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"),
+                            ))),
+                        };
+                    }
+                    Some(_) => verified += 1,
+                    None => {
+                        confirmed.entry(slot).or_insert(vote_hash);
+                    }
+                }
+            }
+
+            // Replay the slot.
             let epoch = block.slot / 432_000;
             let processor = self.processor.new_from(block.slot, epoch);
             let block_replay = self.replay_block_with(&processor, bank, block, epoch);
@@ -774,7 +809,40 @@ impl Replayer {
                     halt: Some((block.slot, block_replay)),
                 };
             }
+
+            // Record the slot's computed hash; reconcile if its vote already arrived.
+            if let Some(got) = bank.parent_bank_hash() {
+                match confirmed.remove(&block.slot) {
+                    Some(vote_hash) if got != vote_hash => {
+                        return RangeReplay {
+                            blocks_completed: completed,
+                            halt: Some((block.slot, BlockReplay::halted(
+                                0,
+                                format!("bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"),
+                            ))),
+                        };
+                    }
+                    Some(_) => verified += 1,
+                    None => {
+                        computed.insert(block.slot, (got, completed));
+                    }
+                }
+            }
         }
+
+        // The tail (~30 slots) can't be confirmed here: their votes fall past the
+        // range end, so they're reported unverified, not wrong.
+        let mut unconfirmed: Vec<u64> = computed.keys().copied().collect();
+        unconfirmed.sort_unstable();
+        if unconfirmed.is_empty() {
+            eprintln!("hash-check: all {verified} replayed slots consensus-verified against votes");
+        } else {
+            eprintln!(
+                "hash-check: {verified} slots consensus-verified, {} unconfirmed (votes past range end): {unconfirmed:?}",
+                unconfirmed.len()
+            );
+        }
+
         RangeReplay {
             blocks_completed: blocks.len(),
             halt: None,
