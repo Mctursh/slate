@@ -298,9 +298,11 @@ mod tests {
         assert_eq!(*acct.owner(), solana_sdk_ids::system_program::id());
         assert_eq!(slot, SLOT);
 
-        // The recipient is present even at 0 lamports (the transfer funds it).
+        // A 0-lamport recipient reads as absent, the way the runtime treats a
+        // not-yet-funded address: the SVM synthesizes a default and the transfer funds
+        // it (the transfer tests cover that end to end). Zero lamports = dead on read.
         let recipient: Pubkey = RECIPIENT.parse().unwrap();
-        assert!(bank.get_account_shared_data(&recipient).is_some());
+        assert!(bank.get_account_shared_data(&recipient).is_none());
     }
 
     #[test]

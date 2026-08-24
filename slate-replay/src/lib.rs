@@ -494,7 +494,16 @@ impl InvokeContextCallback for ReplayBank {
 
 impl TransactionProcessingCallback for ReplayBank {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, u64)> {
-        self.accounts.get(pubkey).cloned()
+        // A zero-lamport account is dead: the runtime purges it, so a read returns the
+        // default (empty, system-owned). Keep it in the map so the lattice roll can
+        // still mix it out, but hand reads nothing — otherwise stale bytes on a drained
+        // account make a later System Allocate at that address fail "already in use"
+        // where the chain re-creates it fresh. Mirrors the snapshot loader's
+        // retain(lamports > 0), which drops dead accounts at seed time.
+        self.accounts
+            .get(pubkey)
+            .filter(|(account, _)| account.lamports() > 0)
+            .cloned()
     }
 }
 
