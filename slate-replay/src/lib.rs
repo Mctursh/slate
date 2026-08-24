@@ -356,6 +356,27 @@ impl ReplayBank {
         }
     }
 
+    /// The blockhashes currently valid for transaction age: the RecentBlockhashes
+    /// sysvar this bank carries (seeded from the snapshot, rolled at each freeze,
+    /// capped at 150 like the runtime's queue). A transaction whose recent_blockhash
+    /// is in here is a normal one; a transaction whose isn't is either durable-nonce
+    /// (its "blockhash" is really the stored nonce) or too old to land. Mirrors the
+    /// blockhash-queue lookup agave's age check does before falling back to nonces.
+    /// Empty when the sysvar wasn't seeded (test banks), which makes an AdvanceNonce-
+    /// first tx take the nonce path — the behavior callers had before this check.
+    pub fn recent_blockhashes(&self) -> std::collections::HashSet<Hash> {
+        #[allow(deprecated)]
+        self.get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
+            .and_then(|(account, _)| {
+                bincode::deserialize::<solana_sysvar::recent_blockhashes::RecentBlockhashes>(
+                    account.data(),
+                )
+                .ok()
+            })
+            .map(|recent| recent.iter().map(|entry| entry.blockhash).collect())
+            .unwrap_or_default()
+    }
+
     /// Populate the SlotHashes sysvar from recent `(slot, hash)` pairs (newest
     /// first, as the runtime keeps them). Vote transactions read it to check the
     /// slot they vote on is real.
@@ -603,14 +624,27 @@ impl Replayer {
                     FeeDetails::new(fee, 0),
                     true,
                 );
-                // A durable-nonce tx's first instruction is System
-                // AdvanceNonceAccount, and its "blockhash" is really the nonce held
-                // in a nonce account. get_durable_nonce returns that account; handing
-                // it to the SVM lets it advance the nonce and, on failure, still roll
-                // it back advanced, which a regular tx's fee-only rollback would not.
-                // The block is trusted, so we don't re-check the nonce value, just
-                // point the SVM at the account.
-                let nonce = tx.get_durable_nonce().copied();
+                // Decide durable-nonce vs normal the way agave's age check does:
+                // blockhash queue FIRST, nonce only as the fallback. A tx whose first
+                // instruction is System AdvanceNonceAccount looks like a durable nonce,
+                // but if its recent_blockhash is a real recent blockhash it's just a
+                // normal tx topping up its own nonce — agave validates it via the queue
+                // (nonce = None) and the advance runs as an ordinary instruction. Only
+                // when the blockhash isn't recent is it really the stored nonce; then we
+                // hand the SVM the nonce account so it validates and advances it (and, on
+                // failure, still rolls it back advanced, which a normal tx's fee-only
+                // rollback would not). The block is trusted, so we don't re-check the
+                // value, just point the SVM at the account.
+                let nonce = match tx.get_durable_nonce().copied() {
+                    Some(address)
+                        if !bank
+                            .recent_blockhashes()
+                            .contains(tx.message().recent_blockhash()) =>
+                    {
+                        Some(address)
+                    }
+                    _ => None,
+                };
                 Ok(CheckedTransactionDetails::new(nonce, budget))
             }
             Err(err) => Err(err),
