@@ -9,7 +9,11 @@
 pub mod backfill;
 pub mod bankhash;
 pub mod block;
+pub mod boundary;
 pub mod compat;
+pub mod source;
+pub mod store;
+use store::{AccountStore, MemStore};
 pub mod fixture;
 pub mod oracle;
 pub mod persist;
@@ -79,10 +83,10 @@ impl ForkGraph for SlateForkGraph {
 /// the snapshot footprint (Task 0.4), mutated as each slot's transactions commit,
 /// and the eventual home for sysvar/builtin/epoch-stake setup. Phase 0 holds
 /// accounts in a map; a real range uses a disk-backed store.
-#[derive(Default)]
 pub struct ReplayBank {
-    /// pubkey -> (account, slot it was last written)
-    accounts: HashMap<Pubkey, (AccountSharedData, u64)>,
+    /// The account universe: `pubkey -> (account, slot last written)`. In-memory by
+    /// default; a disk-backed store for ranges too big for RAM. See [`store`].
+    store: Box<dyn AccountStore>,
     /// Transaction-committed writes in commit order, for the persistence layer.
     /// Setup writes (seeds, builtins, sysvars) are deliberately not logged.
     writes: Vec<WriteRecord>,
@@ -98,6 +102,18 @@ pub struct ReplayBank {
     bankhash_roller: Option<BankHashRoller>,
 }
 
+impl Default for ReplayBank {
+    fn default() -> Self {
+        Self {
+            store: Box::new(MemStore::default()),
+            writes: Vec::new(),
+            write_version: 0,
+            slot_dirty: None,
+            bankhash_roller: None,
+        }
+    }
+}
+
 /// One transaction-committed account write: the account's state at the slot it
 /// was written, tagged with a monotonic write version. This is what the
 /// persistence layer turns into rows, owner-filtered to the indexed program.
@@ -110,14 +126,40 @@ pub struct WriteRecord {
 }
 
 impl ReplayBank {
+    /// A bank backed by an explicit account store (a `DiskStore` for a range too big
+    /// for RAM). `default()` uses the in-memory store.
+    pub fn with_store(store: Box<dyn AccountStore>) -> Self {
+        Self {
+            store,
+            writes: Vec::new(),
+            write_version: 0,
+            slot_dirty: None,
+            bankhash_roller: None,
+        }
+    }
+
+    /// Flush the account store's buffered writes to disk (a no-op for the in-memory
+    /// store). Called at the end of a run so the disk file is complete.
+    pub fn flush(&mut self) {
+        self.store.flush();
+    }
+
+    /// The raw account store behind the bank, for reading the reconstructed end-state
+    /// directly. Unlike [`ReplayBank::get_account_shared_data`] it returns the stored
+    /// value as-is (no zero-lamport filter) — the boundary diff does its own dead-account
+    /// handling when it compares this against the snapshot at the last replayed slot.
+    pub fn store(&self) -> &dyn AccountStore {
+        self.store.as_ref()
+    }
+
     pub fn insert(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
         // While recording a slot, remember the account's pre-slot value the first time
         // it's written this slot, so the lattice can mix it out before mixing the new in.
         if self.slot_dirty.as_ref().is_some_and(|d| !d.contains_key(&key)) {
-            let old = self.accounts.get(&key).map(|(a, _)| a.clone());
+            let old = self.store.get(&key).map(|(a, _)| a);
             self.slot_dirty.as_mut().unwrap().insert(key, old);
         }
-        self.accounts.insert(key, (account, slot));
+        self.store.put(key, account, slot);
     }
 
     /// Commit a transaction's write: log it (for persistence) and update the
@@ -140,6 +182,13 @@ impl ReplayBank {
         &self.writes
     }
 
+    /// Drain the write log, clearing it. The caller persists what it drains; draining
+    /// per chunk keeps the log from growing with the range length (it holds account
+    /// data, so over tens of thousands of slots it would otherwise blow up RAM).
+    pub fn take_writes(&mut self) -> Vec<WriteRecord> {
+        std::mem::take(&mut self.writes)
+    }
+
     /// Start recording which accounts a slot writes (with their pre-slot values), so
     /// the lattice hash can be rolled by the slot's changes. Call before configuring
     /// sysvars and replaying the slot's transactions.
@@ -157,7 +206,7 @@ impl ReplayBank {
             .take()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(key, old)| self.accounts.get(&key).map(|(new, _)| (key, old, new.clone())))
+            .filter_map(|(key, old)| self.store.get(&key).map(|(new, _)| (key, old, new)))
             .collect()
     }
 
@@ -219,7 +268,7 @@ impl ReplayBank {
         // input region by the size delta (8 bytes here, after BPF u128 alignment).
         // Programs that persist raw input-region pointers (Neon EVM's holder)
         // then store shifted pointers, corrupting their state and the bank hash.
-        if !self.accounts.contains_key(&program_id) {
+        if !self.store.contains(&program_id) {
             let account = AccountSharedData::from(Account {
                 lamports: 1,
                 data: name.as_bytes().to_vec(),
@@ -500,10 +549,9 @@ impl TransactionProcessingCallback for ReplayBank {
         // account make a later System Allocate at that address fail "already in use"
         // where the chain re-creates it fresh. Mirrors the snapshot loader's
         // retain(lamports > 0), which drops dead accounts at seed time.
-        self.accounts
+        self.store
             .get(pubkey)
             .filter(|(account, _)| account.lamports() > 0)
-            .cloned()
     }
 }
 
@@ -842,6 +890,10 @@ impl Replayer {
                 unconfirmed.len()
             );
         }
+
+        // Commit any buffered writes so the disk store's file is complete (no-op for
+        // the in-memory store).
+        bank.flush();
 
         RangeReplay {
             blocks_completed: blocks.len(),

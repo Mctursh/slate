@@ -3,7 +3,7 @@
 //! This is the one path that ties the pipeline together; feed it a snapshot, the
 //! range's blocks, the program to index, and a store.
 
-use std::io::Read;
+use std::{collections::HashSet, io::Read, sync::Arc};
 
 use anyhow::Result;
 use slate_store::ClickHouseClient;
@@ -14,20 +14,45 @@ use solana_pubkey::Pubkey;
 use crate::{
     RangeReplay, ReplayBank, Replayer, WriteRecord,
     block::{self, Block},
+    boundary,
     build_feature_set, compat, persist, register_builtins, snapshot,
+    source::BlockSource,
+    store::{AccountStore, DiskStore, MemStore},
 };
 
-/// Backfill `blocks` (contiguous, in one epoch) for `program`, seeded from a
-/// snapshot taken at slot `s_snap`:
+/// How to back the replay bank's account universe for a run.
+pub enum AccountStoreChoice {
+    /// Everything in RAM (a HashMap). Fine for small ranges and tests.
+    Memory,
+    /// redb on disk at `path`, with `cache_bytes` of page cache — the whole RAM budget.
+    /// For ranges whose footprint won't fit in memory.
+    Disk {
+        path: std::path::PathBuf,
+        cache_bytes: usize,
+    },
+}
+
+/// What a backfill run produced: how far the replay got, and — if a boundary snapshot was
+/// given — the byte-exact diff of the reconstructed end-state against it.
+pub struct BackfillReport {
+    pub replay: RangeReplay,
+    pub boundary: Option<boundary::DiffReport>,
+}
+
+/// Backfill the range `(s_snap, to]` for `program`, seeded from a snapshot taken at
+/// slot `s_snap`, pulling blocks from `source` a chunk at a time:
 ///
-/// 1. one snapshot pass loads the range's footprint (the wide seed, not owner-
-///    scoped, so every account a block touches is present) plus every account the
-///    program owns (the S_snap baseline);
+/// 1. **footprint pass** — stream the range once, accumulating every account the
+///    blocks reference (the wide seed, not owner-scoped); one snapshot pass then
+///    loads those plus every account the program owns (the S_snap baseline);
 /// 2. build the exact per-slot feature set from the seeded feature accounts;
-/// 3. replay every block, rolling the bank forward;
+/// 3. **replay pass** — stream the range again, replaying each chunk and rolling the
+///    bank forward;
 /// 4. persist the S_snap baseline, then the fully-completed blocks' program-owned
 ///    changes on top — the narrow store — and cover `[s_snap, last-completed-slot]`.
 ///
+/// Blocks are never all held at once — each pass fetches a chunk, uses it, and drops
+/// it — so the range length is bounded by the account store, not by RAM for blocks.
 /// The baseline is what makes an untouched account queryable: without it a covered
 /// as-of read of an account the range never touched would wrongly say "does not
 /// exist". A halted block is unreliable, so its partial writes are dropped and it
@@ -35,16 +60,35 @@ use crate::{
 pub async fn backfill(
     snapshot: impl Read,
     s_snap: u64,
-    blocks: &[Block],
+    source: Arc<dyn BlockSource>,
+    from: u64,
+    to: u64,
     program: &Pubkey,
     store: &ClickHouseClient,
     bootstrap: Option<(LtHash, Hash)>,
-) -> Result<RangeReplay> {
-    // Wide seed (footprint) ∪ baseline (program-owned), in a single snapshot scan.
-    let mut footprint = block::footprint(blocks);
-    // Also seed the programData (bytecode) accounts of every upgradeable program
-    // the range invokes: they're PDAs of the program ids, never declared keys, so
-    // the footprint alone misses them and the SVM can't load the programs.
+    account_store: AccountStoreChoice,
+    chunk_slots: usize,
+    verify_end: Option<Box<dyn Read>>,
+) -> Result<BackfillReport> {
+    let chunk_slots = chunk_slots.max(1);
+    // The confirmed slots to replay, `(from, to]`. Just u64s — bounded no matter how
+    // long the range — so we hold the whole list; the blocks themselves never all fit.
+    let slots = {
+        let src = Arc::clone(&source);
+        tokio::task::spawn_blocking(move || src.confirmed_slots(from, to)).await??
+    };
+
+    // Footprint pass: stream the range once, accumulating the accounts the blocks
+    // reference. Never more than a chunk of blocks resident at a time.
+    let mut footprint = HashSet::new();
+    for chunk in slots.chunks(chunk_slots) {
+        let blocks = fetch_chunk(&source, chunk).await?;
+        block::extend_footprint(&mut footprint, &blocks);
+    }
+    block::footprint_fixed(&mut footprint);
+    // Also seed the programData (bytecode) accounts of every upgradeable program the
+    // range invokes: they're PDAs of the program ids, never declared keys, so the
+    // footprint alone misses them and the SVM can't load the programs.
     let programdata = block::programdata_addresses(&footprint);
     footprint.extend(programdata);
     // Seed the SlotHashes sysvar from the snapshot too. Programs read it for on-chain
@@ -54,29 +98,91 @@ pub async fn backfill(
     // must see; without it an empty SlotHashes makes such a program panic reading a
     // nonexistent entry.
     footprint.insert(solana_sdk_ids::sysvar::slot_hashes::id());
-    let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
-    let baseline = persist::baseline_rows(&accounts, program, s_snap);
 
-    let mut bank = ReplayBank::default();
-    for (pubkey, (account, slot)) in &accounts {
-        bank.insert(*pubkey, account.clone(), *slot);
-    }
+    // Remember the store backing, so a boundary diff (if requested) loads the end
+    // snapshot into the same kind of store — disk for a big window, RAM otherwise.
+    let end_store_mode = match &account_store {
+        AccountStoreChoice::Memory => None,
+        AccountStoreChoice::Disk { path, cache_bytes } => {
+            Some((path.with_extension("end.redb"), *cache_bytes))
+        }
+    };
+
+    // Seed the bank from the snapshot into the chosen store: a RAM map, or redb on disk.
+    let (mut bank, baseline) = match account_store {
+        AccountStoreChoice::Memory => {
+            let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
+            let baseline = persist::baseline_rows(&accounts, program, s_snap);
+            let mut bank = ReplayBank::default();
+            for (pubkey, (account, slot)) in &accounts {
+                bank.insert(*pubkey, account.clone(), *slot);
+            }
+            (bank, baseline)
+        }
+        AccountStoreChoice::Disk { path, cache_bytes } => {
+            let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
+            let (written, owned) =
+                snapshot::stream_into_store(snapshot, &mut disk, Some(&footprint), Some(program))?;
+            eprintln!("seeded {written} accounts into disk store {}", path.display());
+            // The program-owned accounts collected during the seed ARE the S_snap
+            // baseline — same set the memory path derives from load_accounts.
+            let baseline = persist::baseline_rows(&owned, program, s_snap);
+            (ReplayBank::with_store(Box::new(disk)), baseline)
+        }
+    };
     // Start the bank-hash roll from the manifest's lattice + bank hash at s_snap, so
     // SlotHashes rolls forward with real bank hashes as the range replays.
     if let Some((lt_hash, bank_hash)) = bootstrap {
         bank.bootstrap_bankhash(lt_hash, bank_hash);
     }
 
-    let result = if let Some(first) = blocks.first() {
-        let epoch = first.slot / 432_000;
-        let feature_set = build_feature_set(&bank, first.slot);
-        let replayer = Replayer::new_with_feature_set(first.slot, epoch, feature_set);
+    // Baseline first, then replay pass: stream each chunk, roll the bank forward, and
+    // persist the chunk's program writes, clearing the log so it never grows with the
+    // range length.
+    store.insert_accounts(&baseline).await?;
+
+    // Track the last successfully-replayed slot as we go. With a getBlocks-less source the
+    // candidate `slots` include skipped slots, so covered_hi can't be recovered by indexing
+    // `slots` — it comes from the fetched blocks themselves.
+    let mut covered_hi = s_snap;
+    let result = if let Some(&first_slot) = slots.first() {
+        let epoch = first_slot / 432_000;
+        let feature_set = build_feature_set(&bank, first_slot);
+        let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
         register_builtins(&mut bank, &replayer.processor);
         // Re-supply native programs agave deleted after their core-BPF migration
         // that this slot range predates (e.g. Stake). Gated per-program on the
         // migration feature, so it's a no-op once the migration is active on chain.
         compat::register_removed_builtins(&mut bank, &replayer.processor, replayer.feature_set());
-        replayer.replay_range(&mut bank, blocks)
+
+        let mut completed = 0usize;
+        let mut halt = None;
+        for chunk in slots.chunks(chunk_slots) {
+            let blocks = fetch_chunk(&source, chunk).await?;
+            let chunk_replay = replayer.replay_range(&mut bank, &blocks);
+            let done = chunk_replay.blocks_completed;
+            if done > 0 {
+                covered_hi = blocks[done - 1].slot;
+            }
+            completed += done;
+            // Drain and persist this chunk's program writes, up to the last good slot.
+            let changes: Vec<WriteRecord> = bank
+                .take_writes()
+                .into_iter()
+                .filter(|w| w.slot <= covered_hi)
+                .collect();
+            store
+                .insert_accounts(&persist::program_account_rows(&changes, program))
+                .await?;
+            if let Some(h) = chunk_replay.halt {
+                halt = Some(h);
+                break;
+            }
+        }
+        RangeReplay {
+            blocks_completed: completed,
+            halt,
+        }
     } else {
         RangeReplay {
             blocks_completed: 0,
@@ -84,32 +190,47 @@ pub async fn backfill(
         }
     };
 
-    let covered_hi = if result.blocks_completed > 0 {
-        blocks[result.blocks_completed - 1].slot
-    } else {
-        s_snap
-    };
-    let changes: Vec<WriteRecord> = bank
-        .writes()
-        .iter()
-        .filter(|w| w.slot <= covered_hi)
-        .cloned()
-        .collect();
-
-    // Baseline first, then the changes layered on top, then one coverage segment.
-    store.insert_accounts(&baseline).await?;
-    store
-        .insert_accounts(&persist::program_account_rows(&changes, program))
-        .await?;
     store.record_coverage(s_snap, covered_hi).await?;
 
-    Ok(result)
+    // Boundary diff (verification only — logs, doesn't gate the run): prove the
+    // reconstructed end-state matches the real snapshot at the last replayed slot,
+    // byte-for-byte over the footprint. Every account a tx wrote is in the footprint, so
+    // this catches any write the replay got wrong that the oracle (lamports/status only)
+    // couldn't see.
+    let boundary = if let Some(end_snapshot) = verify_end {
+        bank.flush();
+        let mut end_store: Box<dyn AccountStore> = match &end_store_mode {
+            None => Box::new(MemStore::default()),
+            Some((path, cache_bytes)) => Box::new(DiskStore::create(path, *cache_bytes)?),
+        };
+        let (loaded, _) =
+            snapshot::stream_into_store(end_snapshot, &mut *end_store, Some(&footprint), None)?;
+        eprintln!("loaded {loaded} end-snapshot accounts for the boundary diff");
+        Some(boundary::boundary_diff(bank.store(), &footprint, &*end_store))
+    } else {
+        None
+    };
+
+    Ok(BackfillReport {
+        replay: result,
+        boundary,
+    })
+}
+
+/// Fetch one chunk's blocks off the async worker — the source's `fetch` is blocking
+/// I/O, so running it on the runtime's blocking pool keeps the persist of the previous
+/// chunk from stalling behind the network.
+async fn fetch_chunk(source: &Arc<dyn BlockSource>, slots: &[u64]) -> Result<Vec<Block>> {
+    let src = Arc::clone(source);
+    let slots = slots.to_vec();
+    tokio::task::spawn_blocking(move || src.fetch(&slots)).await?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block::{BlockTx, LoadedAddresses, TxMeta};
+    use crate::source::VecBlockSource;
     use solana_account::ReadableAccount;
     use solana_hash::Hash;
     use solana_instruction::{AccountMeta, Instruction};
@@ -188,10 +309,27 @@ mod tests {
         ];
 
         let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
-        let outcome = backfill(SNAPSHOT, s_snap, &blocks, &system, &store, None)
-            .await
-            .expect("backfill");
-        assert!(outcome.is_complete(), "backfill halted: {:?}", outcome.halt);
+        let source = Arc::new(VecBlockSource::new(blocks.to_vec()));
+        let outcome = backfill(
+            SNAPSHOT,
+            s_snap,
+            source,
+            s_snap,
+            s + 1,
+            &system,
+            &store,
+            None,
+            AccountStoreChoice::Memory,
+            2000,
+            None,
+        )
+        .await
+        .expect("backfill");
+        assert!(
+            outcome.replay.is_complete(),
+            "backfill halted: {:?}",
+            outcome.replay.halt
+        );
 
         // Per-slot history landed in the store: mid = a1 at slot s, then
         // a1 - a2 - fee at s+1; dst = a2 at s+1; the range reads covered.
@@ -240,5 +378,43 @@ mod tests {
 
         // Coverage spans the baseline slot through the last replayed slot.
         assert!(store.is_covered(s_snap, s + 1).await.unwrap());
+    }
+
+    // The boundary diff must be byte-exact when nothing replays: seed the fixture, replay
+    // an empty range, diff the seeded end-state against the SAME snapshot. Exercises the
+    // whole wiring — end-store load, footprint filter, store access, verdict — against a
+    // real snapshot with a known-exact answer, so a plumbing bug shows here, not 6h into
+    // the 50k run.
+    #[tokio::test]
+    #[ignore = "needs a local ClickHouse (slate_test db)"]
+    async fn boundary_diff_is_exact_when_nothing_replays() {
+        let system = solana_sdk_ids::system_program::id();
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
+        // Empty range (from == to == s_snap → no confirmed slots), verify against the seed.
+        let source = Arc::new(VecBlockSource::new(vec![]));
+        let outcome = backfill(
+            SNAPSHOT,
+            200,
+            source,
+            200,
+            200,
+            &system,
+            &store,
+            None,
+            AccountStoreChoice::Memory,
+            2000,
+            Some(Box::new(SNAPSHOT)),
+        )
+        .await
+        .expect("backfill");
+
+        let boundary = outcome.boundary.expect("boundary diff ran");
+        assert!(boundary.checked > 0, "should have checked the seeded footprint");
+        assert!(
+            boundary.is_exact(),
+            "no replay → end-state == seed == snapshot, expected byte-exact, got {} mismatch(es): {:?}",
+            boundary.mismatches.len(),
+            &boundary.mismatches[..boundary.mismatches.len().min(5)]
+        );
     }
 }

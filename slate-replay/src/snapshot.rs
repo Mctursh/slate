@@ -24,7 +24,7 @@ use solana_hash::Hash;
 use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
-use crate::ReplayBank;
+use crate::{store::AccountStore, ReplayBank};
 
 /// Fixed per-account header: `StoredMeta` (write_version u64, data_len u64,
 /// pubkey), then `AccountMeta` (lamports u64, rent_epoch u64, owner, executable +
@@ -159,6 +159,67 @@ pub fn load_accounts<R: Read>(
     // validator treats dead accounts on snapshot load.
     accounts.retain(|_, (account, _)| account.lamports() > 0);
     Ok(accounts)
+}
+
+/// Stream a snapshot's accounts straight into `store`, never holding them all in RAM —
+/// the disk-store path for ranges too big for [`load_accounts`]'s HashMap. Same footprint
+/// filter and highest-slot-wins dedup, but the dedup is done against the store itself
+/// (a `get` per account, so it's not fast; write-batching is the deferred optimization).
+///
+/// Zero-lamport records are kept as tombstones carrying their slot, so a later
+/// lower-slot record can't resurrect a closed account; the read path
+/// (`ReplayBank::get_account_shared_data`) filters them back out, exactly as
+/// `load_accounts`'s final `retain` drops them.
+///
+/// Returns `(writes performed, the keep_owned_by-owned live accounts at their highest
+/// slot)`. The second is the S_snap baseline, collected in this same pass so the disk
+/// path never needs a second scan to learn which accounts the program owns.
+pub fn stream_into_store<R: Read>(
+    reader: R,
+    store: &mut dyn AccountStore,
+    footprint: Option<&HashSet<Pubkey>>,
+    keep_owned_by: Option<&Pubkey>,
+) -> Result<(usize, HashMap<Pubkey, (AccountSharedData, u64)>)> {
+    let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut writes = 0usize;
+    let mut owned: HashMap<Pubkey, (AccountSharedData, u64)> = HashMap::new();
+
+    for entry in archive.entries().context("read tar entries")? {
+        let mut entry = entry.context("tar entry")?;
+        let path = entry.path().context("entry path")?.into_owned();
+        let Some(slot) = account_file_slot(&path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).context("read account file")?;
+        for (pubkey, account) in parse_append_vec(&bytes) {
+            let is_owned = keep_owned_by.is_some_and(|owner| account.owner() == owner);
+            let keep = is_owned || footprint.is_none_or(|f| f.contains(&pubkey));
+            if !keep {
+                continue;
+            }
+            // Highest-slot-wins, dedup'd against the store (which holds tombstones too,
+            // so their slot is still known and a stale lower-slot record loses).
+            match store.get(&pubkey) {
+                Some((_, prev)) if prev >= slot => {}
+                _ => {
+                    // Track program-owned live accounts as the baseline; drop any whose
+                    // newest version is closed (zero-lamport) or owned by someone else.
+                    if is_owned && account.lamports() > 0 {
+                        owned.insert(pubkey, (account.clone(), slot));
+                    } else {
+                        owned.remove(&pubkey);
+                    }
+                    store.put(pubkey, account, slot);
+                    writes += 1;
+                }
+            }
+        }
+    }
+    // Commit the final partial buffer so the whole seed is on disk.
+    store.flush();
+    Ok((writes, owned))
 }
 
 /// Convenience wrapper: load from a file path.
@@ -379,6 +440,50 @@ mod tests {
 
         // Nothing zero-lamport survived the filter.
         assert!(accounts.values().all(|(a, _)| a.lamports() > 0));
+    }
+
+    #[test]
+    fn stream_into_store_agrees_with_load_accounts() {
+        use crate::store::MemStore;
+
+        let map = load_accounts(SNAPSHOT, None, None).unwrap();
+        let mut store = MemStore::default();
+        stream_into_store(SNAPSHOT, &mut store, None, None).unwrap();
+
+        // Every live account load_accounts kept is byte-identical in the streamed store.
+        for (pk, (account, slot)) in &map {
+            let (got, got_slot) = store.get(pk).expect("live account present after stream");
+            assert_eq!(got_slot, *slot);
+            assert_eq!(got.lamports(), account.lamports());
+            assert_eq!(got.data(), account.data());
+            assert_eq!(got.owner(), account.owner());
+            assert_eq!(got.executable(), account.executable());
+        }
+        assert!(!map.is_empty());
+    }
+
+    #[test]
+    fn stream_into_store_collects_the_owned_baseline() {
+        use crate::store::MemStore;
+
+        // Sysvar accounts (Clock, Rent, ...) are owned by the sysvar id in the snapshot.
+        let owner = solana_sdk_ids::sysvar::id();
+        let empty = HashSet::new();
+        // load_accounts owner-scoped (empty footprint) is the reference baseline set.
+        let reference = load_accounts(SNAPSHOT, Some(&empty), Some(&owner)).unwrap();
+        assert!(!reference.is_empty());
+
+        let mut store = MemStore::default();
+        let (_writes, owned) = stream_into_store(SNAPSHOT, &mut store, None, Some(&owner)).unwrap();
+
+        // The baseline collected during the seed matches load_accounts' owner-scoped set.
+        assert_eq!(owned.len(), reference.len());
+        for (pk, (account, slot)) in &reference {
+            let (got, got_slot) = owned.get(pk).expect("owned baseline account present");
+            assert_eq!(got_slot, slot);
+            assert_eq!(got.lamports(), account.lamports());
+            assert_eq!(got.owner(), account.owner());
+        }
     }
 
     #[test]

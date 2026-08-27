@@ -22,6 +22,7 @@ use solana_transaction_error::AddressLoaderError;
 
 /// One block's worth of replay input: the transactions in execution order plus
 /// the block-level context the environment needs (blockhash, block time).
+#[derive(Clone)]
 pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
@@ -41,6 +42,7 @@ pub struct Block {
 }
 
 /// A transaction and the on-chain result we reconcile our replay against.
+#[derive(Clone)]
 pub struct BlockTx {
     pub transaction: VersionedTransaction,
     pub meta: TxMeta,
@@ -48,6 +50,7 @@ pub struct BlockTx {
 
 /// The getBlock meta fields the oracle checks a replay against. Inner instructions
 /// and logs are omitted until something consumes them.
+#[derive(Clone)]
 pub struct TxMeta {
     /// The on-chain error, rendered; `None` means the transaction succeeded.
     pub err: Option<String>,
@@ -72,13 +75,14 @@ impl TxMeta {
 /// One token account's post amount from getBlock's `postTokenBalances`.
 /// `account_index` indexes the transaction's account list (the same order as
 /// `post_balances`); `amount` is the raw token amount (not UI-scaled).
+#[derive(Clone)]
 pub struct TokenBalance {
     pub account_index: u8,
     pub mint: Pubkey,
     pub amount: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LoadedAddresses {
     pub writable: Vec<Pubkey>,
     pub readonly: Vec<Pubkey>,
@@ -227,10 +231,15 @@ fn parse_loaded_addresses(v: &serde_json::Value) -> Result<LoadedAddresses> {
     })
 }
 
-/// Fetch one block over getBlock and parse it. Blocking I/O on purpose: backfill
-/// is a batch job, so a straight fetch -> replay loop is simplest and needs no
-/// async runtime. `rpc_url` must point at an archive RPC that still has `slot`.
-pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
+/// Fetch one block over getBlock and parse it, reusing `client` so its connection pool
+/// is shared across a chunk's fetches (no TCP+TLS handshake per block). Blocking I/O on
+/// purpose: backfill is a batch job. `rpc_url` must point at an archive RPC (or a local
+/// yellowstone-faithful) that still has `slot`.
+pub fn fetch_block_with(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    slot: u64,
+) -> Result<Block> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -242,15 +251,17 @@ pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
             "maxSupportedTransactionVersion": 0,
         }],
     });
-    let resp: serde_json::Value = reqwest::blocking::Client::new()
-        .post(rpc_url)
-        .json(&request)
-        .send()?
-        .json()?;
+    let resp: serde_json::Value = client.post(rpc_url).json(&request).send()?.json()?;
     let result = resp
         .get("result")
         .with_context(|| format!("getBlock returned no result: {resp}"))?;
     Block::from_getblock(slot, result)
+}
+
+/// Fetch one block with a one-off client. For preflight/dry-run single calls; the backfill
+/// path fetches through [`crate::source::RpcBlockSource`], which pools + parallelizes.
+pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
+    fetch_block_with(&reqwest::blocking::Client::new(), rpc_url, slot)
 }
 
 /// Ask the RPC which slots in `[start, end]` actually produced a block (getBlocks).
@@ -269,15 +280,55 @@ pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<
         .json(&request)
         .send()?
         .json()?;
-    let result = resp
-        .get("result")
-        .with_context(|| format!("getBlocks returned no result: {resp}"))?;
-    result
-        .as_array()
-        .with_context(|| format!("getBlocks result was not an array: {result}"))?
-        .iter()
-        .map(|v| v.as_u64().context("getBlocks returned a non-integer slot"))
-        .collect()
+    match resp.get("result") {
+        // yellowstone-faithful (Old Faithful) serves getBlock but not getBlocks, and
+        // returns a null result. Fall back to the whole candidate range; the fetch path
+        // skips slots that produced no block (see `fetch_block_opt`).
+        None | Some(serde_json::Value::Null) => Ok((start..=end).collect()),
+        Some(result) => result
+            .as_array()
+            .with_context(|| format!("getBlocks result was not an array: {result}"))?
+            .iter()
+            .map(|v| v.as_u64().context("getBlocks returned a non-integer slot"))
+            .collect(),
+    }
+}
+
+/// Like [`fetch_block_with`] but returns `None` for a slot that produced no block (a
+/// skipped slot: null result, or a "not available"/"skipped" RPC error) instead of
+/// erroring — so a caller enumerating a full range (no getBlocks) can drop the ~5% of
+/// empty slots. A genuine transport/parse failure still returns `Err`.
+pub fn fetch_block_opt(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    slot: u64,
+) -> Result<Option<Block>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBlock",
+        "params": [slot, {
+            "encoding": "base64",
+            "transactionDetails": "full",
+            "rewards": true,
+            "maxSupportedTransactionVersion": 0,
+        }],
+    });
+    let resp: serde_json::Value = client.post(rpc_url).json(&request).send()?.json()?;
+    if let Some(err) = resp.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        if msg.contains("skip") || msg.contains("not available") || msg.contains("Block not") {
+            return Ok(None);
+        }
+        anyhow::bail!("getBlock error for slot {slot}: {err}");
+    }
+    match resp.get("result") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(result) => Ok(Some(Block::from_getblock(slot, result)?)),
+    }
 }
 
 /// The chain's current slot (getSlot). Doubles as an RPC reachability probe and
@@ -360,8 +411,10 @@ pub fn sanitize(
 /// SlotHashes/StakeHistory content is a separate snapshot-seeded step), and an
 /// upgradeable program's programdata account, which is resolved when the program
 /// is loaded, not here.
-pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
-    let mut set = HashSet::new();
+/// Add the accounts `blocks` reference — every tx's static keys and lookup-loaded
+/// addresses, plus each slot's fee-credited leader — to `set`. Called once per chunk
+/// while streaming, so the footprint accumulates without ever holding every block.
+pub fn extend_footprint(set: &mut HashSet<Pubkey>, blocks: &[Block]) {
     for block in blocks {
         for tx in &block.transactions {
             set.extend(tx.transaction.message.static_account_keys().iter().copied());
@@ -374,6 +427,12 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
             set.insert(leader);
         }
     }
+}
+
+/// Add the block-independent part of the seed to `set`: every feature account (so the
+/// per-slot feature set can be built) and the sysvars replay reads but no block names.
+/// Added once, after the block keys.
+pub fn footprint_fixed(set: &mut HashSet<Pubkey>) {
     set.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
     // Seed every sysvar we need from the snapshot rather than synthesize it. The
     // bank-hash roll needs each per-slot sysvar write to be bit-exact, so replay
@@ -391,6 +450,15 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     set.insert(solana_sdk_ids::sysvar::stake_history::id());
     set.insert(solana_sdk_ids::sysvar::epoch_rewards::id());
     set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
+}
+
+/// The full seed footprint for `blocks` in one shot: block keys ∪ the fixed set. Kept
+/// for tests and non-streaming callers; the streaming backfill calls the two halves
+/// directly so it never holds every block at once.
+pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
+    let mut set = HashSet::new();
+    extend_footprint(&mut set, blocks);
+    footprint_fixed(&mut set);
     set
 }
 

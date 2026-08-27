@@ -30,6 +30,9 @@ solana-transaction-error = "3"
 base64 = "0.22"
 zstd = "0.13"
 tar = "0.4"
+# Disk-backed account store for ranges too big for RAM. Pure Rust (no C++ toolchain);
+# swappable for RocksDB later behind the AccountStore trait if it hits a scale wall.
+redb = "2"
 serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 agave-reserved-account-keys = { version = "3.1.12", features = ["agave-unstable-api"] }
@@ -59,6 +62,9 @@ solana-builtins = { version = "3", features = ["agave-unstable-api"] }
 agave-precompiles = { version = "3.1.12", features = ["agave-unstable-api"] }
 solana-precompile-error = "3"
 slate-store = { path = "../slate-store" }
+# spawn_blocking: the block source's fetch is blocking reqwest, run off the async worker
+# so it can't panic inside (or stall) the runtime that persists to ClickHouse.
+tokio = { workspace = true }
 
 [dev-dependencies]
 solana-message = "3"
@@ -67,4 +73,3 @@ solana-signature = "3"
 solana-ed25519-program = "3"
 ed25519-dalek = "2"
 solana-nonce = { version = "3.1.0", features = ["serde"] }
-tokio = { workspace = true }

@@ -9,15 +9,16 @@
 //! sanitizes the range and reports what it looks like, so a target range can be
 //! validated before committing to a large snapshot download.
 
-use std::{fs::File, io::Read, str::FromStr};
+use std::{fs::File, io::Read, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
 use slate_common::config::Config;
 use slate_replay::{
-    backfill::backfill,
+    backfill::{backfill, AccountStoreChoice},
     block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
     snapshot::{read_manifest_hashes, read_manifest_lt_hash},
+    source::{BlockSource, RpcBlockSource},
 };
 use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
@@ -49,6 +50,28 @@ struct Args {
     /// report what it looks like. A preflight to run before downloading a snapshot.
     #[arg(long)]
     dry_run: bool,
+    /// Account store: `memory` (RAM, small ranges) or `disk` (redb, large ranges).
+    #[arg(long, default_value = "memory")]
+    store: String,
+    /// Disk store's redb page-cache size in bytes — its whole RAM budget. Default 8 GiB.
+    #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+    cache_size: usize,
+    /// Path for the disk store's redb file.
+    #[arg(long, default_value = "slate-accounts.redb")]
+    store_path: String,
+    /// Replay this many slots per chunk before flushing writes to ClickHouse and
+    /// clearing the log. Bounds write-log RAM over long ranges.
+    #[arg(long, default_value_t = 2000)]
+    chunk_slots: usize,
+    /// After replaying, diff the reconstructed end-state against this snapshot (the real
+    /// snapshot at --to) byte-for-byte over the footprint — the data-fidelity proof the
+    /// per-tx oracle can't give. Optional; verification only, logs and never gates the run.
+    #[arg(long)]
+    verify_boundary: Option<String>,
+    /// How many blocks to fetch concurrently. 1 (serial) suits a rate-limited RPC like
+    /// Helius; raise it (16-32) for an unmetered local yellowstone-faithful.
+    #[arg(long, default_value_t = 1)]
+    fetch_concurrency: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -95,8 +118,6 @@ fn main() -> anyhow::Result<()> {
     check_clickhouse(&cfg.clickhouse.url)?;
     println!("preflight ok: RPC, program, snapshot, config, and ClickHouse all check out");
 
-    let blocks = fetch_range(&args)?;
-
     // Bootstrap the bank-hash roll from the snapshot manifest — the lattice hash and
     // bank hash at s_snap — so SlotHashes rolls forward with real bank hashes and the
     // programs that read it (and votes) reconcile past the first block.
@@ -116,6 +137,15 @@ fn main() -> anyhow::Result<()> {
     let snapshot =
         File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?;
 
+    let account_store = match args.store.as_str() {
+        "memory" => AccountStoreChoice::Memory,
+        "disk" => AccountStoreChoice::Disk {
+            path: args.store_path.clone().into(),
+            cache_bytes: args.cache_size,
+        },
+        other => anyhow::bail!("--store must be `memory` or `disk`, got `{other}`"),
+    };
+
     // Seed, replay, and persist. This part is async because the store writes are.
     tokio::runtime::Runtime::new()?.block_on(async {
         let store = ClickHouseClient::with_config(
@@ -124,11 +154,36 @@ fn main() -> anyhow::Result<()> {
             &cfg.clickhouse.user,
             &cfg.clickhouse.password,
         );
-        let result = backfill(snapshot, args.from, &blocks, &program, &store, bootstrap).await?;
-        match &result.halt {
+        // Stream blocks from the RPC-backed source (a local yellowstone-faithful in
+        // production, or any getBlock provider). The trait is the seam — Jetstreamer or
+        // direct CAR reads drop in here without touching backfill.
+        let source: Arc<dyn BlockSource> =
+            Arc::new(RpcBlockSource::new(&args.rpc).with_concurrency(args.fetch_concurrency));
+        // Optional byte-exact end-state check against the snapshot at --to.
+        let verify_end: Option<Box<dyn Read>> = match &args.verify_boundary {
+            Some(path) => Some(Box::new(
+                File::open(path).with_context(|| format!("opening boundary snapshot {path}"))?,
+            )),
+            None => None,
+        };
+        let result = backfill(
+            snapshot,
+            args.from,
+            source,
+            args.from,
+            args.to,
+            &program,
+            &store,
+            bootstrap,
+            account_store,
+            args.chunk_slots,
+            verify_end,
+        )
+        .await?;
+        match &result.replay.halt {
             None => println!(
                 "done: {} blocks replayed and persisted; coverage ({}, {}]",
-                result.blocks_completed, args.from, args.to
+                result.replay.blocks_completed, args.from, args.to
             ),
             Some((slot, block_replay)) => {
                 let detail = block_replay
@@ -139,9 +194,24 @@ fn main() -> anyhow::Result<()> {
                 println!(
                     "halted at slot {slot} after {} completed blocks, on {detail}; \
                      coverage recorded up to the last good slot",
-                    result.blocks_completed
+                    result.replay.blocks_completed
                 );
             }
+        }
+        // Boundary verdict: the byte-exact fidelity proof. Loud pass, and a hard failure
+        // (non-zero exit) on any mismatch so a silent data divergence can't slip through.
+        if let Some(diff) = &result.boundary {
+            println!("{}", diff.summary());
+            for m in diff.mismatches.iter().take(20) {
+                println!("  mismatch {} {:?}", m.pubkey, m.kind);
+            }
+            if !diff.is_exact() {
+                anyhow::bail!(
+                    "boundary diff: {} mismatch(es) — reconstructed end-state is NOT byte-exact vs the snapshot at --to",
+                    diff.mismatches.len()
+                );
+            }
+            println!("boundary diff: end-state is byte-exact against the snapshot at --to");
         }
         anyhow::Ok(())
     })
