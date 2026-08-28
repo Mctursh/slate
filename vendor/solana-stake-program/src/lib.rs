@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::too_many_arguments)]
 #[deprecated(
     since = "1.8.0",
     note = "Please use `solana_sdk_ids::sysvar::stake::id` instead"

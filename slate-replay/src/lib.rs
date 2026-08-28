@@ -285,11 +285,11 @@ impl ReplayBank {
     // Apply the runtime's freeze-time sysvar writes the lattice must include (SlotHistory + RecentBlockhashes); no-op for sysvars the snapshot didn't supply (tests).
     pub fn freeze_slot(&mut self, slot: u64, blockhash: Hash, fee_reward: Option<(Pubkey, u64)>) {
         // Leader fee credit: the runtime pays the leader 50% of fees at freeze; getBlock's "Fee" reward is the exact amount.
-        if let Some((leader, lamports)) = fee_reward {
-            if let Some((mut account, _)) = self.get_account_shared_data(&leader) {
-                account.set_lamports(account.lamports() + lamports);
-                self.insert(leader, account, slot);
-            }
+        if let Some((leader, lamports)) = fee_reward
+            && let Some((mut account, _)) = self.get_account_shared_data(&leader)
+        {
+            account.set_lamports(account.lamports() + lamports);
+            self.insert(leader, account, slot);
         }
         if let Some(mut history) = self
             .get_account_shared_data(&solana_sdk_ids::sysvar::slot_history::id())
@@ -633,22 +633,15 @@ impl Replayer {
             if !self
                 .feature_set
                 .is_active(&agave_feature_set::remove_accounts_executable_flag_checks::id())
+                && let Ok(ProcessedTransaction::Executed(executed)) = &mut result
+                && executed.was_successful()
+                && let Some(idx) =
+                    executable_modification(bank, &tx, &executed.loaded_transaction.accounts)
             {
-                if let Ok(ProcessedTransaction::Executed(executed)) = &mut result {
-                    if executed.was_successful() {
-                        if let Some(idx) = executable_modification(
-                            bank,
-                            &tx,
-                            &executed.loaded_transaction.accounts,
-                        ) {
-                            executed.execution_details.status =
-                                Err(TransactionError::InstructionError(
-                                    idx as u8,
-                                    InstructionError::ExecutableLamportChange,
-                                ));
-                        }
-                    }
-                }
+                executed.execution_details.status = Err(TransactionError::InstructionError(
+                    idx as u8,
+                    InstructionError::ExecutableLamportChange,
+                ));
             }
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {

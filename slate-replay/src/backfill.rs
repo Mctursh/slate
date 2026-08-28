@@ -27,6 +27,7 @@ pub struct BackfillReport {
     pub boundary: Option<boundary::DiffReport>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn backfill(
     snapshot: impl Read,
     s_snap: u64,

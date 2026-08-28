@@ -118,6 +118,7 @@ pub fn load_accounts<R: Read>(
 
 // Disk-store path for ranges too big for load_accounts's HashMap; same filter + highest-slot-wins, but dedup is against the store (a get per account).
 // Zero-lamport records are kept as tombstones carrying their slot so a later lower-slot record can't resurrect a closed account; the read path filters them back out.
+#[allow(clippy::type_complexity)]
 pub fn stream_into_store<R: Read>(
     reader: R,
     store: &mut dyn AccountStore,
