@@ -108,8 +108,8 @@ mod tests {
         assert_eq!(lt.0[1], 0x3d16);
         assert_eq!(lt.0[2], 0x86b3);
         let expected: [u8; 32] = [
-            79, 156, 26, 184, 156, 205, 94, 208, 182, 235, 33, 147, 111, 153, 229, 152, 207,
-            133, 75, 109, 182, 198, 119, 61, 11, 81, 41, 70, 24, 87, 100, 85,
+            79, 156, 26, 184, 156, 205, 94, 208, 182, 235, 33, 147, 111, 153, 229, 152, 207, 133,
+            75, 109, 182, 198, 119, 61, 11, 81, 41, 70, 24, 87, 100, 85,
         ];
         assert_eq!(lt.checksum().0, expected);
     }
@@ -166,7 +166,11 @@ mod tests {
         let blockhash = Hash::new_from_array([9; 32]);
 
         let mut roller = BankHashRoller::new(LtHash::identity(), Hash::default());
-        let bh = roller.roll_slot(&[(k1, None, a1.clone()), (k2, None, a2.clone())], 5, &blockhash);
+        let bh = roller.roll_slot(
+            &[(k1, None, a1.clone()), (k2, None, a2.clone())],
+            5,
+            &blockhash,
+        );
 
         let mut lt = LtHash::identity();
         lt.mix_in(&lt_hash_account(&k1, &a1));
@@ -218,14 +222,21 @@ mod tests {
 
         // The remaining two inputs are this slot's on-chain values (getBlock 349047024): sig count + blockhash.
         let signature_count = 1890u64;
-        let blockhash: Hash = "BaUZWzsjp8aicbMfFQ9Z7xsqT5TbHHHSbzZ6Kd6R1QfP".parse().unwrap();
+        let blockhash: Hash = "BaUZWzsjp8aicbMfFQ9Z7xsqT5TbHHHSbzZ6Kd6R1QfP"
+            .parse()
+            .unwrap();
 
         let computed = bank_hash(&mh.parent_hash, signature_count, &blockhash, &lt);
         assert_eq!(
             computed, mh.bank_hash,
             "recomputed bank hash must equal the manifest's own bank hash"
         );
-        let expected: Hash = "Cv87aY5YPjpDpWfEzbikfxyhthNmfYSJ1rZdbJfQ8gm6".parse().unwrap();
-        assert_eq!(mh.bank_hash, expected, "and it's the real mainnet bank hash");
+        let expected: Hash = "Cv87aY5YPjpDpWfEzbikfxyhthNmfYSJ1rZdbJfQ8gm6"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            mh.bank_hash, expected,
+            "and it's the real mainnet bank hash"
+        );
     }
 }

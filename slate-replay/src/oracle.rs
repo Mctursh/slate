@@ -192,7 +192,13 @@ mod tests {
 
         let tx = fixture::cpi::sanitized_transaction();
         let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
-        let result = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, solana_hash::Hash::default());
+        let result = replayer.execute(
+            &bank,
+            &tx,
+            fixture::cpi::FEE,
+            epoch,
+            solana_hash::Hash::default(),
+        );
         (account_keys, result)
     }
 
@@ -277,7 +283,13 @@ mod tests {
         let sanitized = sanitize(&tx, &LoadedAddresses::default()).unwrap();
         let account_keys: Vec<Pubkey> =
             sanitized.message().account_keys().iter().copied().collect();
-        let result = replayer.execute(&bank, &sanitized, 5_000, epoch, solana_hash::Hash::default());
+        let result = replayer.execute(
+            &bank,
+            &sanitized,
+            5_000,
+            epoch,
+            solana_hash::Hash::default(),
+        );
         (account_keys, result)
     }
 
@@ -423,7 +435,13 @@ mod tests {
         let sanitized = sanitize(&tx, &LoadedAddresses::default()).unwrap();
         let account_keys: Vec<Pubkey> =
             sanitized.message().account_keys().iter().copied().collect();
-        let result = replayer.execute(&bank, &sanitized, 5_000, epoch, solana_hash::Hash::default());
+        let result = replayer.execute(
+            &bank,
+            &sanitized,
+            5_000,
+            epoch,
+            solana_hash::Hash::default(),
+        );
         (account_keys, result)
     }
 

@@ -24,12 +24,13 @@ use solana_compute_budget_instruction::instructions_processor::process_compute_b
 use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
+use solana_instruction_error::InstructionError;
+use solana_lattice_hash::lt_hash::LtHash;
 use solana_precompile_error::PrecompileError;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
     loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
 };
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use solana_slot_hashes::SlotHashes;
@@ -45,10 +46,9 @@ use solana_svm::{
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use solana_svm_feature_set::SVMFeatureSet;
 use solana_svm_transaction::svm_message::SVMMessage;
-use solana_instruction_error::InstructionError;
-use solana_transaction_error::TransactionError;
 use solana_sysvar_id::SysvarId;
 use solana_transaction::sanitized::SanitizedTransaction;
+use solana_transaction_error::TransactionError;
 
 use crate::{
     bankhash::BankHashRoller,
@@ -125,7 +125,11 @@ impl ReplayBank {
 
     pub fn insert(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
         // On first write this slot, capture the pre-slot value so the lattice can mix it out before mixing the new in.
-        if self.slot_dirty.as_ref().is_some_and(|d| !d.contains_key(&key)) {
+        if self
+            .slot_dirty
+            .as_ref()
+            .is_some_and(|d| !d.contains_key(&key))
+        {
             let old = self.store.get(&key).map(|(a, _)| a);
             self.slot_dirty.as_mut().unwrap().insert(key, old);
         }
@@ -290,7 +294,8 @@ impl ReplayBank {
         if let Some(mut history) = self
             .get_account_shared_data(&solana_sdk_ids::sysvar::slot_history::id())
             .and_then(|(account, _)| {
-                bincode::deserialize::<solana_sysvar::slot_history::SlotHistory>(account.data()).ok()
+                bincode::deserialize::<solana_sysvar::slot_history::SlotHistory>(account.data())
+                    .ok()
             })
         {
             history.add(slot);
@@ -631,9 +636,11 @@ impl Replayer {
             {
                 if let Ok(ProcessedTransaction::Executed(executed)) = &mut result {
                     if executed.was_successful() {
-                        if let Some(idx) =
-                            executable_modification(bank, &tx, &executed.loaded_transaction.accounts)
-                        {
+                        if let Some(idx) = executable_modification(
+                            bank,
+                            &tx,
+                            &executed.loaded_transaction.accounts,
+                        ) {
                             executed.execution_details.status =
                                 Err(TransactionError::InstructionError(
                                     idx as u8,
@@ -659,7 +666,8 @@ impl Replayer {
                 .iter()
                 .map(|tx| tx.transaction.signatures.len() as u64)
                 .sum();
-            if let Some(bank_hash) = bank.finalize_slot_bankhash(signature_count, &block.blockhash) {
+            if let Some(bank_hash) = bank.finalize_slot_bankhash(signature_count, &block.blockhash)
+            {
                 eprintln!("slot {} computed bank_hash {bank_hash}", block.slot);
             }
         }
@@ -685,10 +693,15 @@ impl Replayer {
                     Some((got, idx)) if got != vote_hash => {
                         return RangeReplay {
                             blocks_completed: idx,
-                            halt: Some((slot, BlockReplay::halted(
-                                0,
-                                format!("bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"),
-                            ))),
+                            halt: Some((
+                                slot,
+                                BlockReplay::halted(
+                                    0,
+                                    format!(
+                                        "bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"
+                                    ),
+                                ),
+                            )),
                         };
                     }
                     Some(_) => verified += 1,
@@ -714,10 +727,15 @@ impl Replayer {
                     Some(vote_hash) if got != vote_hash => {
                         return RangeReplay {
                             blocks_completed: completed,
-                            halt: Some((block.slot, BlockReplay::halted(
-                                0,
-                                format!("bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"),
-                            ))),
+                            halt: Some((
+                                block.slot,
+                                BlockReplay::halted(
+                                    0,
+                                    format!(
+                                        "bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"
+                                    ),
+                                ),
+                            )),
                         };
                     }
                     Some(_) => verified += 1,
@@ -1342,7 +1360,10 @@ mod tests {
         data.extend_from_slice(&500_000u64.to_le_bytes());
         let ix = Instruction {
             program_id: system,
-            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(program, false)],
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(program, false),
+            ],
             data,
         };
         let message = Message::new_with_blockhash(&[ix], Some(&payer), &Hash::default());
@@ -1550,7 +1571,8 @@ mod tests {
         // A nonce account holding a durable nonce derived from some old blockhash.
         let stored = DurableNonce::from_blockhash(&Hash::new_from_array([9u8; 32]));
         let nonce_data =
-            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee))).unwrap();
+            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee)))
+                .unwrap();
 
         let mut bank = ReplayBank::default();
         bank.insert(
@@ -1637,7 +1659,11 @@ mod tests {
             "the nonce advances from the block's blockhash, not the tx's nonce value"
         );
         let (payer_acct, _) = bank.get_account_shared_data(&payer).unwrap();
-        assert_eq!(payer_acct.lamports(), start - fee, "fee payer charged the fee");
+        assert_eq!(
+            payer_acct.lamports(),
+            start - fee,
+            "fee payer charged the fee"
+        );
     }
 
     #[test]
@@ -1665,7 +1691,8 @@ mod tests {
 
         let stored = DurableNonce::from_blockhash(&Hash::new_from_array([9u8; 32]));
         let nonce_data =
-            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee))).unwrap();
+            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee)))
+                .unwrap();
 
         let mut bank = ReplayBank::default();
         bank.insert(
@@ -1746,7 +1773,11 @@ mod tests {
             "a normal failed tx must roll the nonce back, not advance it"
         );
         let (payer_acct, _) = bank.get_account_shared_data(&payer).unwrap();
-        assert_eq!(payer_acct.lamports(), start - fee, "fee payer charged the fee");
+        assert_eq!(
+            payer_acct.lamports(),
+            start - fee,
+            "fee payer charged the fee"
+        );
     }
 
     #[test]

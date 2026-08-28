@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -9,7 +9,7 @@ use std::{
 use anyhow::Result;
 use reqwest::blocking::Client;
 
-use crate::block::{fetch_block_opt, fetch_confirmed_slots, Block};
+use crate::block::{Block, fetch_block_opt, fetch_confirmed_slots};
 
 // Big retry budget: one unrecovered miss aborts a whole pass, and Old Faithful flakes transiently (CDN range-fetch), so it has to outlast a transient window, not just a blip.
 const MAX_RETRIES: usize = 40;
@@ -98,19 +98,25 @@ impl BlockSource for RpcBlockSource {
         let workers = self.concurrency.min(slots.len());
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= slots.len() {
-                        break;
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= slots.len() {
+                            break;
+                        }
+                        let fetched = self.fetch_one(slots[i]);
+                        *results[i].lock().expect("results mutex") = Some(fetched);
                     }
-                    let fetched = self.fetch_one(slots[i]);
-                    *results[i].lock().expect("results mutex") = Some(fetched);
                 });
             }
         });
         let mut out = Vec::with_capacity(slots.len());
         for m in results {
-            match m.into_inner().expect("results mutex").expect("worker set result") {
+            match m
+                .into_inner()
+                .expect("results mutex")
+                .expect("worker set result")
+            {
                 Ok(Some(block)) => out.push(block),
                 Ok(None) => {} // skipped slot
                 Err(e) => return Err(e),

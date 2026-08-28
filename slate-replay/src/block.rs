@@ -94,7 +94,11 @@ impl Block {
         // Leader fee reward (rewardType "Fee"), credited at freeze; mid-epoch the block's only reward.
         let fee_reward = result["rewards"]
             .as_array()
-            .and_then(|rewards| rewards.iter().find(|r| r["rewardType"].as_str() == Some("Fee")))
+            .and_then(|rewards| {
+                rewards
+                    .iter()
+                    .find(|r| r["rewardType"].as_str() == Some("Fee"))
+            })
             .and_then(|r| {
                 let pubkey = r["pubkey"].as_str()?.parse::<Pubkey>().ok()?;
                 let lamports = u64::try_from(r["lamports"].as_i64()?).ok()?;
@@ -521,8 +525,12 @@ mod tests {
     #[test]
     fn programdata_addresses_derive_the_upgradeable_pda() {
         // Raydium v4 and its real programData account, confirmed on-chain.
-        let raydium: Pubkey = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".parse().unwrap();
-        let expected: Pubkey = "A7ZG7ByDi8DpzT9Ab7CiXhvgYTJQmaDPJkMDoPitaCQV".parse().unwrap();
+        let raydium: Pubkey = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+            .parse()
+            .unwrap();
+        let expected: Pubkey = "A7ZG7ByDi8DpzT9Ab7CiXhvgYTJQmaDPJkMDoPitaCQV"
+            .parse()
+            .unwrap();
         let pd = programdata_addresses(&HashSet::from([raydium]));
         assert!(
             pd.contains(&expected),
@@ -590,8 +598,8 @@ mod tests {
                 account_keys: vec![authority, nonce, recent_blockhashes, system],
                 recent_blockhash: Hash::default(),
                 instructions: vec![CompiledInstruction {
-                    program_id_index: 3,      // system program
-                    accounts: vec![1, 2, 0],  // nonce, recent_blockhashes, authority
+                    program_id_index: 3,     // system program
+                    accounts: vec![1, 2, 0], // nonce, recent_blockhashes, authority
                     data,
                 }],
             }),

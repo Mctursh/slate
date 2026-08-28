@@ -94,11 +94,17 @@ pub fn boundary_diff(
             }
         }
     }
-    DiffReport { checked, mismatches }
+    DiffReport {
+        checked,
+        mismatches,
+    }
 }
 
 // First differing field, or None if byte-identical across the consensus fields.
-fn compare_accounts(engine: &AccountSharedData, snapshot: &AccountSharedData) -> Option<MismatchKind> {
+fn compare_accounts(
+    engine: &AccountSharedData,
+    snapshot: &AccountSharedData,
+) -> Option<MismatchKind> {
     if engine.lamports() != snapshot.lamports() {
         return Some(MismatchKind::Lamports {
             engine: engine.lamports(),
@@ -167,7 +173,7 @@ mod tests {
         ]);
         let snapshot = store(&[
             (k1, acct(100, [1; 32], &[1, 2, 3]), 9), // same value, later slot
-            // k2 absent from the snapshot (dead) → matches the engine's zero-lamport
+                                                     // k2 absent from the snapshot (dead) → matches the engine's zero-lamport
         ]);
         let keys = HashSet::from([k1, k2]);
 
@@ -207,9 +213,9 @@ mod tests {
             (gone, acct(100, [1; 32], &[]), 5), // live in engine, dead in snapshot
         ]);
         let snapshot = store(&[
-            (lam, acct(200, [1; 32], &[]), 5),        // lamports differ
-            (own, acct(100, [2; 32], &[]), 5),        // owner differs
-            // gone absent → presence mismatch
+            (lam, acct(200, [1; 32], &[]), 5), // lamports differ
+            (own, acct(100, [2; 32], &[]), 5), // owner differs
+                                               // gone absent → presence mismatch
         ]);
         let keys = HashSet::from([lam, own, gone]);
 

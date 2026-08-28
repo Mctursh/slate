@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::Parser;
 use slate_common::config::Config;
 use slate_replay::{
-    backfill::{backfill, AccountStoreChoice},
+    backfill::{AccountStoreChoice, backfill},
     block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
     snapshot::{read_manifest_hashes, read_manifest_lt_hash},
     source::{BlockSource, RpcBlockSource},
@@ -13,9 +13,7 @@ use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
 
 #[derive(Parser)]
-#[command(
-    about = "Reconstruct a program's historical account state by replaying a slot range"
-)]
+#[command(about = "Reconstruct a program's historical account state by replaying a slot range")]
 struct Args {
     /// Path to the full snapshot the range starts from (omit with --dry-run).
     #[arg(required_unless_present = "dry_run")]

@@ -11,7 +11,7 @@ use solana_hash::Hash;
 use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
-use crate::{store::AccountStore, ReplayBank};
+use crate::{ReplayBank, store::AccountStore};
 
 // Per-account header: StoredMeta (write_version, data_len, pubkey) + AccountMeta (lamports, rent_epoch, owner, executable+pad) + obsolete 32B hash. Layout byte-identical agave 1.18, 3.1, which brackets the 2.x that wrote the epoch-808 snapshot.
 const STORE_META_OVERHEAD: usize = 136;
@@ -242,7 +242,9 @@ fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<Ma
             parent_hash: Hash::new_from_array(front[o - 32..o].try_into().unwrap()),
         };
         if result.replace(hashes).is_some() {
-            anyhow::bail!("ambiguous bank fields in manifest (two candidates landed on slot {slot})");
+            anyhow::bail!(
+                "ambiguous bank fields in manifest (two candidates landed on slot {slot})"
+            );
         }
     }
     result.context("bank fields not found in manifest front (snapshot format drift?)")
@@ -250,7 +252,10 @@ fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<Ma
 
 // Walk the SerializableVersionedBank scalars from parent_slot to slot; landing on the right slot confirms `o` is parent_slot, not a coincidental byte match.
 fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
-    let read_u64 = |p: usize| b.get(p..p + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+    let read_u64 = |p: usize| {
+        b.get(p..p + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    };
     let mut p = o + 8; // past parent_slot
     let hard_forks = read_u64(p)?; // Vec<(Slot, usize)> length
     if hard_forks > 1024 {
@@ -401,8 +406,16 @@ mod tests {
         let mh = read_manifest_hashes(SNAPSHOT, 200).expect("read manifest hashes");
         assert_eq!(mh.slot, 200);
         assert_eq!(mh.parent_slot, 199);
-        assert_ne!(mh.bank_hash, Hash::default(), "bank hash should be populated");
-        assert_ne!(mh.parent_hash, Hash::default(), "parent hash should be populated");
+        assert_ne!(
+            mh.bank_hash,
+            Hash::default(),
+            "bank hash should be populated"
+        );
+        assert_ne!(
+            mh.parent_hash,
+            Hash::default(),
+            "parent hash should be populated"
+        );
     }
 
     #[test]
@@ -422,7 +435,10 @@ mod tests {
         assert!(len > 0, "SlotHashes should carry entries");
         let newest_slot = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let newest_hash = Hash::new_from_array(data[16..48].try_into().unwrap());
-        assert_eq!(newest_slot, mh.parent_slot, "newest SlotHashes slot = parent slot");
+        assert_eq!(
+            newest_slot, mh.parent_slot,
+            "newest SlotHashes slot = parent slot"
+        );
         assert_eq!(
             newest_hash, mh.parent_hash,
             "newest SlotHashes bank hash must equal the manifest parent_hash"
@@ -436,7 +452,9 @@ mod tests {
                     snapshot-349047024-Cv8fHRuDLaRVhB8YTXGMxbMpZBC1BDGpN5MN99GFGqUv.tar.zst";
         let f = File::open(path).expect("open the mainnet snapshot");
         let mh = read_manifest_hashes(f, 349047024).expect("read manifest hashes");
-        let expected: Hash = "Cv87aY5YPjpDpWfEzbikfxyhthNmfYSJ1rZdbJfQ8gm6".parse().unwrap();
+        let expected: Hash = "Cv87aY5YPjpDpWfEzbikfxyhthNmfYSJ1rZdbJfQ8gm6"
+            .parse()
+            .unwrap();
         assert_eq!(mh.bank_hash, expected, "mainnet bank_hash(s_snap)");
         assert_eq!(mh.parent_slot, 349047023);
     }

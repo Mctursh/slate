@@ -9,8 +9,7 @@ use solana_pubkey::Pubkey;
 use crate::{
     RangeReplay, ReplayBank, Replayer, WriteRecord,
     block::{self, Block},
-    boundary,
-    build_feature_set, compat, persist, register_builtins, snapshot,
+    boundary, build_feature_set, compat, persist, register_builtins, snapshot,
     source::BlockSource,
     store::{AccountStore, DiskStore, MemStore},
 };
@@ -84,7 +83,10 @@ pub async fn backfill(
             let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
             let (written, owned) =
                 snapshot::stream_into_store(snapshot, &mut disk, Some(&footprint), Some(program))?;
-            eprintln!("seeded {written} accounts into disk store {}", path.display());
+            eprintln!(
+                "seeded {written} accounts into disk store {}",
+                path.display()
+            );
             // The seed's program-owned accounts ARE the S_snap baseline (same set the memory path derives).
             let baseline = persist::baseline_rows(&owned, program, s_snap);
             (ReplayBank::with_store(Box::new(disk)), baseline)
@@ -155,7 +157,11 @@ pub async fn backfill(
         let (loaded, _) =
             snapshot::stream_into_store(end_snapshot, &mut *end_store, Some(&footprint), None)?;
         eprintln!("loaded {loaded} end-snapshot accounts for the boundary diff");
-        Some(boundary::boundary_diff(bank.store(), &footprint, &*end_store))
+        Some(boundary::boundary_diff(
+            bank.store(),
+            &footprint,
+            &*end_store,
+        ))
     } else {
         None
     };
@@ -349,7 +355,10 @@ mod tests {
         .expect("backfill");
 
         let boundary = outcome.boundary.expect("boundary diff ran");
-        assert!(boundary.checked > 0, "should have checked the seeded footprint");
+        assert!(
+            boundary.checked > 0,
+            "should have checked the seeded footprint"
+        );
         assert!(
             boundary.is_exact(),
             "no replay → end-state == seed == snapshot, expected byte-exact, got {} mismatch(es): {:?}",

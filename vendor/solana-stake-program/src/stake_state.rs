@@ -24,7 +24,9 @@ use {
         tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
     },
     solana_svm_log_collector::ic_msg,
-    solana_transaction_context::{BorrowedInstructionAccount as BorrowedAccount, IndexOfAccount, InstructionContext},
+    solana_transaction_context::{
+        BorrowedInstructionAccount as BorrowedAccount, IndexOfAccount, InstructionContext,
+    },
     solana_vote_interface::state::{VoteStateV3, VoteStateVersions},
     std::{collections::HashSet, convert::TryFrom},
 };
