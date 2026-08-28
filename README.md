@@ -167,7 +167,7 @@ bind = "127.0.0.1:8899"
 
 ## Validation
 
-Slate ships a differential harness that checks its historical answers against a source it never saw. It reads a program's full account set from a reference RPC at that RPC's current finalized slot, waits until Slate has streamed past that slot, then diffs Slate's as-of answer against it. A match means Slate's reconstruction of a now-past slot agrees with an independent RPC, account for account.
+Backfill self-verifies against the consensus hash in each block's votes (see [Backfill](#backfill)), so it needs no reference RPC. The live path is checked separately, by a differential harness: it reads a program's accounts from a reference RPC at that RPC's current slot, waits for Slate to stream past it, then diffs Slate's as-of answer. A match means Slate's reconstruction of a now-past slot agrees with an RPC it never saw, account for account.
 
 ```sh
 # use an RPC that is NOT the one seeding Slate's baseline
