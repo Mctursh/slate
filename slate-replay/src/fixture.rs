@@ -1,10 +1,3 @@
-//! Phase 0 test fixture: one real mainnet SOL transfer, used as both the input
-//! to the SVM and the reconciliation oracle for the walking skeleton.
-//!
-//! tx `2B5TKSri…goDJc` at slot 437,390,844 (epoch 1012): a bare, single-
-//! instruction System transfer. No snapshot needed — the two wallet accounts
-//! are fully described by their pre-balances (system-owned, no data).
-
 use std::collections::HashSet;
 
 use base64::Engine;
@@ -13,17 +6,14 @@ use solana_transaction::{Transaction, sanitized::SanitizedTransaction};
 
 use crate::ReplayBank;
 
-/// Slot the transaction executed in.
 pub const SLOT: u64 = 437_390_844;
-/// Block time for SLOT — becomes `Clock.unix_timestamp` when we build sysvars.
+// Block time for SLOT; becomes Clock.unix_timestamp in sysvars.
 pub const BLOCK_TIME: i64 = 1_785_937_873;
 
-/// The serialized (legacy) `VersionedTransaction`, base64 as `getBlock` returns
-/// it. Deserialized in a later step (0.6.1).
+// Serialized legacy tx, base64 as getBlock returns it.
 pub const TX_BASE64: &str = "ATq082EQa8wH8RtRiKiNnbTtnmKeltzlaGqCRtdk21Hg1hNU2kHxp+78foBpncMbQI5YC+glQYNv/SX15A0HpQ0BAAEDw4B6xeDlAaFibjEgbRMiMXS00HF5RzZfwTxZfKDTSdvZ36530GxvAWJRjG5qeKEIGQAV7QfgiUiVaKdl8H87NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwiB0jNDlB6T4/1tzggIwNX7E0msTiBHqXHegtJdI4kMBAgIAAQwCAAAASIaYLwAAAAA=";
 
-// Account keys, in the transaction's order (the meta balance arrays are indexed
-// the same way).
+// Account keys in tx order (the meta balance arrays are indexed the same way).
 pub const SENDER: &str = "EAA8V9ZkF7gA5pfavotinL9jRPFUKNTgdF4AS6rLaJpS";
 pub const RECIPIENT: &str = "FfVJ8zpFFo12TerGXAm8yhDPxjyAZcprTrww6AV2TmH8";
 
@@ -35,7 +25,6 @@ pub const RECIPIENT_POST: u64 = 798_525_000;
 pub const FEE: u64 = 5_000;
 pub const COMPUTE_UNITS: u64 = 150;
 
-/// A plain system-owned wallet: lamports only, no data, not executable.
 fn system_wallet(lamports: u64) -> AccountSharedData {
     AccountSharedData::from(Account {
         lamports,
@@ -46,9 +35,7 @@ fn system_wallet(lamports: u64) -> AccountSharedData {
     })
 }
 
-/// Seed a fresh `ReplayBank` with the fixture's pre-state: the two wallets at
-/// their pre-balances. The System program is deliberately NOT seeded here — it's
-/// a builtin, provided by `register_builtins` in Task 0.5.
+// System program deliberately NOT seeded, it's a builtin from register_builtins.
 pub fn seed_bank() -> ReplayBank {
     let mut bank = ReplayBank::default();
     bank.insert(SENDER.parse().unwrap(), system_wallet(SENDER_PRE), SLOT);
@@ -60,10 +47,7 @@ pub fn seed_bank() -> ReplayBank {
     bank
 }
 
-/// Decode the base64 transaction and sanitize it into the form the SVM accepts.
-/// Legacy tx (no address tables), so an empty reserved-key set is fine — that's
-/// exactly what Solana's own test helper uses. v0 txs will need the fuller
-/// `try_new` path with ALT resolution later.
+// Legacy tx (no ALTs), so an empty reserved-key set is fine; v0 needs the try_new + ALT path.
 pub fn sanitized_transaction() -> SanitizedTransaction {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(TX_BASE64)
@@ -73,10 +57,7 @@ pub fn sanitized_transaction() -> SanitizedTransaction {
         .expect("transaction sanitizes")
 }
 
-/// Second fixture: a legacy `transfer + memo` tx. The memo invokes the SPL Memo
-/// BPF program, which forces the real program-loading + VM path. It reads no
-/// account data, so all accounts are still reconstructable from pre-balances
-/// (no snapshot). sig `2emmK4…PD6T`, slot 437,572,006.
+// Memo fixture: transfer + SPL Memo, forces the real program-load + VM path; no snapshot (no data reads).
 pub mod memo {
     use std::collections::HashSet;
 
@@ -102,15 +83,11 @@ pub mod memo {
     pub const COMPUTE_UNITS: u64 = 11_295;
     pub const MEMO_PROGRAM_LAMPORTS: u64 = 523_015_135;
 
-    /// The SPL Memo program's ELF, embedded so tests stay offline. It's a
-    /// BPFLoader2 (non-upgradeable, immutable) program, so the current bytecode
-    /// is exactly what ran at the historical slot.
+    // SPL Memo ELF, embedded for offline tests; BPFLoader2 (immutable), so current bytecode == historical.
     pub fn program_bytecode() -> &'static [u8] {
         include_bytes!("memo_program.so")
     }
 
-    /// Seed the two wallets (from pre-balances) and the Memo program account,
-    /// which is BPFLoader2-owned, executable, and holds the ELF bytecode.
     pub fn seed_bank() -> ReplayBank {
         let mut bank = ReplayBank::default();
         bank.insert(
@@ -144,11 +121,7 @@ pub mod memo {
     }
 }
 
-/// Third fixture: a legacy tx where an upgradeable BPF program CPIs
-/// `System::transfer`. All non-program accounts are wallets (verified: two are
-/// system-owned + empty, one was a fresh 0-lamport account being funded), so
-/// still no snapshot. This exercises the CPI path + the *upgradeable* loader
-/// (program stub + separate programdata) + ComputeBudget. sig `2SWPHXgR…r3N3g`.
+// CPI fixture: upgradeable BPF program CPIs System::transfer; exercises CPI + upgradeable loader (stub + programdata) + ComputeBudget. No snapshot.
 pub mod cpi {
     use std::collections::HashSet;
 
@@ -178,7 +151,7 @@ pub mod cpi {
     pub const COMPUTE_UNITS: u64 = 11_343;
     const PROGRAM_LAMPORTS: u64 = 1_141_442;
     const PROGRAMDATA_LAMPORTS: u64 = 3_487_607_280;
-    /// 36-byte upgradeable stub: enum Program { programdata_address }.
+    // 36-byte upgradeable stub: enum Program { programdata_address }.
     const PROGRAM_STUB_B64: &str = "AgAAACUdi2x9aB+XxzPVIajvRrPtyueG9y5LFEC/+Pm35IhR";
 
     pub fn sanitized_transaction() -> SanitizedTransaction {
@@ -197,8 +170,7 @@ pub mod cpi {
         bincode::deserialize(&bytes).expect("versioned transaction")
     }
 
-    /// The real getBlock meta for this tx, in canonical account order:
-    /// [payer, wallet1, wallet2, System, ComputeBudget, FdDd].
+    // Real getBlock meta, order [payer, wallet1, wallet2, System, ComputeBudget, FdDd].
     pub fn meta() -> crate::block::TxMeta {
         crate::block::TxMeta {
             err: None,
@@ -218,7 +190,6 @@ pub mod cpi {
         }
     }
 
-    /// This fixture as a one-transaction block, for exercising the replay loop.
     pub fn block() -> crate::block::Block {
         crate::block::Block {
             slot: SLOT,
@@ -252,9 +223,7 @@ pub mod cpi {
             SLOT,
         );
 
-        // Upgradeable program: the 36-byte stub points at the programdata account,
-        // which holds the ELF and is loaded via that pointer even though it's not
-        // in the transaction's account list.
+        // Upgradeable stub points at the programdata account, loaded via that pointer though not in the tx account list.
         let stub = base64::engine::general_purpose::STANDARD
             .decode(PROGRAM_STUB_B64)
             .unwrap();
@@ -298,9 +267,7 @@ mod tests {
         assert_eq!(*acct.owner(), solana_sdk_ids::system_program::id());
         assert_eq!(slot, SLOT);
 
-        // A 0-lamport recipient reads as absent, the way the runtime treats a
-        // not-yet-funded address: the SVM synthesizes a default and the transfer funds
-        // it (the transfer tests cover that end to end). Zero lamports = dead on read.
+        // 0-lamport recipient reads as absent (zero lamports = dead); the SVM synthesizes a default when funded.
         let recipient: Pubkey = RECIPIENT.parse().unwrap();
         assert!(bank.get_account_shared_data(&recipient).is_none());
     }

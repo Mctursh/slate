@@ -1,15 +1,6 @@
-//! Historical-runtime compatibility for replay.
-//!
-//! A recent agave runtime plus the per-slot feature set already reproduces almost
-//! all historical behavior: agave gates its consensus changes, so handing it the
-//! feature set that was live at slot N reproduces slot N. The one thing it can't
-//! reproduce is code agave *deleted* — when a core-BPF migration finishes, agave
-//! removes the native program (no real validator replays pre-migration slots).
-//! Slate does. This module re-supplies exactly that deleted code, gated on the
-//! same feature that deleted it, so one binary spans every epoch from 807 to now.
-//!
-//! To handle another deleted program: add its native implementation in a sibling
-//! module and add one row to [`REMOVED_BUILTINS`]. The logic below never changes.
+// Re-supply native programs agave migrated to core BPF then deleted, so one 3.1.x
+// binary replays pre-migration slots too. Gated per program on the migration feature
+// that removed it. Add another via a sibling module plus a REMOVED_BUILTINS row.
 
 mod stake;
 
@@ -22,15 +13,12 @@ use solana_svm::transaction_processor::TransactionBatchProcessor;
 
 use crate::{ReplayBank, SlateForkGraph};
 
-/// A native program agave migrated to core BPF and then deleted. It's native for
-/// slots before `removed_by` activates; agave's on-chain BPF program takes over
-/// after. Registering it as a builtin (not a seeded BPF account) is what gives it
-/// the fixed native compute cost the pre-migration runtime charged.
+// Native before removed_by activates, agave's on-chain BPF program after. Registered
+// as a builtin (not a seeded BPF account) for the fixed native compute cost.
 struct RemovedBuiltin {
     id: Pubkey,
     name: &'static str,
     entrypoint: BuiltinFunctionWithContext,
-    /// The core-BPF migration feature that deleted the native program.
     removed_by: Pubkey,
 }
 
@@ -41,10 +29,8 @@ const REMOVED_BUILTINS: &[RemovedBuiltin] = &[RemovedBuiltin {
     removed_by: agave_feature_set::migrate_stake_program_to_core_bpf::id(),
 }];
 
-/// Register the deleted builtins this slot still needs, given its feature set.
-/// Call once during setup, after the current builtins are registered. A no-op for
-/// any program whose migration is already active (agave's BPF account covers it),
-/// which is what keeps one binary correct across every migration boundary.
+// No-op for any program whose migration is already active (agave's BPF account covers
+// it), which keeps one binary correct across every migration boundary.
 pub fn register_removed_builtins(
     bank: &mut ReplayBank,
     processor: &TransactionBatchProcessor<SlateForkGraph>,

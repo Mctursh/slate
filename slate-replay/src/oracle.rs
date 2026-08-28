@@ -1,14 +1,3 @@
-//! Reconciliation oracle: does a replayed transaction match what the chain
-//! actually did? Compares the replay result against the getBlock meta on what it
-//! reports: the success/failure status, the fee, every account's post-balance
-//! (lamports), and every touched token account's post amount.
-//!
-//! Scope: status, fee, lamports, and token amounts. getBlock does not carry
-//! arbitrary post-account DATA, so a divergence that changes a non-token account's
-//! data but not its lamports (a PDA field) is NOT caught here; that's the
-//! differential harness's job at serve time. The rule here is conservative:
-//! anything we cannot positively confirm becomes an issue, never a silent pass.
-
 use std::collections::HashMap;
 
 use solana_account::{AccountSharedData, ReadableAccount};
@@ -19,8 +8,7 @@ use solana_svm::transaction_processing_result::{
 
 use crate::block::TxMeta;
 
-/// The verdict for one transaction. `issues` is empty iff the replay reproduced
-/// the chain's result. The loop halts the slot on any non-empty verdict.
+// Verdict for one tx; issues empty iff replay matched the chain. Any non-empty verdict halts the slot.
 pub struct Reconciliation {
     pub issues: Vec<String>,
 }
@@ -31,10 +19,8 @@ impl Reconciliation {
     }
 }
 
-/// Reconcile one replayed transaction against its on-chain meta. `account_keys`
-/// is the transaction's full account list in canonical order (static keys plus
-/// any lookup-table addresses), which is the order `pre_balances`/`post_balances`
-/// are indexed by.
+// Data-blind by design: checks status, fee, lamports, and token amounts against the chain, not arbitrary account data (that's the boundary diff's job).
+// account_keys is the canonical order (static + lookup-table) that pre/post_balances are indexed by.
 pub fn reconcile(
     account_keys: &[Pubkey],
     meta: &TxMeta,
@@ -46,8 +32,7 @@ pub fn reconcile(
         Ok(ProcessedTransaction::Executed(executed)) => {
             let replay_ok = executed.was_successful();
             if replay_ok != meta.succeeded() {
-                // When our replay failed but the chain succeeded, the execution
-                // error is the whole diagnosis, so include it.
+                // Include the execution error only when our replay failed (it's the diagnosis).
                 let detail = if replay_ok {
                     String::new()
                 } else {
@@ -74,10 +59,7 @@ pub fn reconcile(
                 issues.push(format!("fee: replay {replay_fee}, chain {}", meta.fee));
             }
 
-            // Successful: the executed accounts are the committed post-state.
-            // Failed: everything rolls back except the fee payer (and any nonce),
-            // exactly like fees-only — the executed accounts here still hold the
-            // pre-rollback state — so reconcile the rollback accounts instead.
+            // On failure everything rolls back except fee payer/nonce, so reconcile rollback_accounts, not the executed (pre-rollback) ones.
             let replay_post: HashMap<&Pubkey, u64> = if replay_ok {
                 executed
                     .loaded_transaction
@@ -94,19 +76,12 @@ pub fn reconcile(
                     .collect()
             };
             check_balances(account_keys, meta, &replay_post, &mut issues);
-            // Token amounts, successful txs only: a failed tx's token accounts roll
-            // back, so its post token balances just equal its pre balances.
+            // Token amounts on successful txs only; a failed tx's token accounts roll back to pre.
             if replay_ok {
                 check_token_balances(&executed.loaded_transaction.accounts, meta, &mut issues);
             }
         }
-        // Replay only charged fees: the transaction failed to load. This matches
-        // the chain only when the chain also failed (its meta carries an error) —
-        // otherwise we failed where the chain succeeded. When both failed, only the
-        // fee payer (plus any advanced nonce) moved, so its rollback balance must
-        // match and every other account must be unchanged, which is exactly what
-        // `check_balances` asserts. The fee is checked implicitly: the fee payer's
-        // post balance is its pre balance minus the fee.
+        // Fees-only = tx failed to load; matches the chain only if it also failed. check_balances covers the fee (payer post = pre - fee).
         Ok(ProcessedTransaction::FeesOnly(fees_only)) => {
             if meta.succeeded() {
                 issues.push(format!(
@@ -158,9 +133,7 @@ fn check_balances(
                 ));
             }
             None => {
-                // The replay result didn't return this account. That's fine only
-                // if the chain didn't change its balance either (a read-only or
-                // program account); otherwise it's a real omission.
+                // Replay omitted this account; fine only if the chain didn't change its balance either.
                 let chain_pre = meta.pre_balances.get(i).copied().unwrap_or(chain_post);
                 if chain_pre != chain_post {
                     issues.push(format!(
@@ -172,11 +145,7 @@ fn check_balances(
     }
 }
 
-/// Check the replay's token accounts against the chain's `postTokenBalances`. Each
-/// entry names an account (by index into the tx's account list) that held a token
-/// amount; the amount lives at offset 64 of an SPL Token / Token-2022 account's
-/// data, which share that base layout. A mismatch, or a replay account too short
-/// to hold an amount, is a divergence.
+// Token amount lives at offset 64 of SPL Token / Token-2022 data (shared base layout).
 fn check_token_balances(
     replay_accounts: &[(Pubkey, AccountSharedData)],
     meta: &TxMeta,
@@ -212,7 +181,6 @@ mod tests {
     use super::*;
     use crate::{Replayer, block::LoadedAddresses, fixture, register_builtins};
 
-    /// Replay the CPI fixture and return its result plus canonical account keys.
     fn replay_cpi() -> (Vec<Pubkey>, TransactionProcessingResult) {
         let s = fixture::cpi::SLOT;
         let epoch = s / 432_000;
@@ -228,8 +196,7 @@ mod tests {
         (account_keys, result)
     }
 
-    /// Real getBlock meta for the CPI fixture tx (slot 437680849), in canonical
-    /// account order: [payer, wallet1, wallet2, System, ComputeBudget, FdDd].
+    // Real getBlock meta for the CPI tx (slot 437680849), order [payer, wallet1, wallet2, System, ComputeBudget, FdDd].
     fn cpi_meta() -> TxMeta {
         TxMeta {
             err: None,
@@ -267,9 +234,7 @@ mod tests {
         );
     }
 
-    /// Replay a tx that invokes an unregistered program: the fee payer is charged
-    /// but the tx can't execute, producing a fees-only result. Payer starts at
-    /// 10_000_000; account order is [payer, program].
+    // Tx invoking an unregistered program → fees-only. Payer starts at 10_000_000; order [payer, program].
     fn replay_fees_only() -> (Vec<Pubkey>, TransactionProcessingResult) {
         use crate::{ReplayBank, block::sanitize};
         use solana_account::{Account, AccountSharedData};
@@ -324,8 +289,7 @@ mod tests {
             "expected a fees-only result, got {result:?}"
         );
 
-        // The chain also failed (err set): fee charged to the payer, program
-        // unchanged. This must reconcile now instead of false-halting.
+        // Chain also failed: fee charged, program unchanged, must reconcile, not false-halt.
         let meta = TxMeta {
             err: Some("InstructionError".into()),
             fee: 5_000,
@@ -346,7 +310,7 @@ mod tests {
     #[test]
     fn fees_only_flags_a_chain_success() {
         let (account_keys, result) = replay_fees_only();
-        // The chain SUCCEEDED — our fees-only is a genuine divergence.
+        // The chain SUCCEEDED, our fees-only is a genuine divergence.
         let meta = TxMeta {
             err: None,
             fee: 5_000,
@@ -414,8 +378,7 @@ mod tests {
         );
     }
 
-    /// Replay a transfer larger than the payer holds: it executes then fails on
-    /// insufficient funds. Payer starts at 10_000_000; order [payer, dst, system].
+    // Transfer larger than the payer holds: executes then fails on insufficient funds. Order [payer, dst, system].
     fn replay_failed_transfer() -> (Vec<Pubkey>, TransactionProcessingResult) {
         use crate::{ReplayBank, block::sanitize};
         use solana_account::{Account, AccountSharedData};

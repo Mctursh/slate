@@ -1,16 +1,3 @@
-//! Snapshot loader: read a full-snapshot `.tar.zst` and pull out the accounts to
-//! seed the replay bank.
-//!
-//! Manifest-free by design. We walk the `accounts/<slot>.<id>` AppendVec files
-//! directly and keep the highest-slot value per pubkey. The 136-byte per-account
-//! record layout (StoredMeta + AccountMeta + obsolete hash) is stable across agave
-//! versions: verified byte-identical from 1.18 through 3.1, which brackets the 2.x
-//! that wrote the epoch-808 snapshot. The archiver writes each storage at its
-//! `current_len` (agave-snapshots `archive.rs` sets the tar entry to the storage
-//! reader's length, not the on-disk capacity), so a snapshot file has no trailing
-//! slack to bound. The manifest bincode (bank fields) is what drifts, so we never
-//! parse it; the snapshot's slot comes from the archive filename.
-
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -26,10 +13,7 @@ use solana_pubkey::Pubkey;
 
 use crate::{store::AccountStore, ReplayBank};
 
-/// Fixed per-account header: `StoredMeta` (write_version u64, data_len u64,
-/// pubkey), then `AccountMeta` (lamports u64, rent_epoch u64, owner, executable +
-/// pad), then the now-obsolete 32-byte account hash. Matches agave
-/// `STORE_META_OVERHEAD`.
+// Per-account header: StoredMeta (write_version, data_len, pubkey) + AccountMeta (lamports, rent_epoch, owner, executable+pad) + obsolete 32B hash. Layout byte-identical agave 1.18, 3.1, which brackets the 2.x that wrote the epoch-808 snapshot.
 const STORE_META_OVERHEAD: usize = 136;
 const OFF_DATA_LEN: usize = 8;
 const OFF_PUBKEY: usize = 16;
@@ -37,8 +21,7 @@ const OFF_LAMPORTS: usize = 48;
 const OFF_RENT_EPOCH: usize = 56;
 const OFF_OWNER: usize = 64;
 const OFF_EXECUTABLE: usize = 96;
-/// Sanity cap so a corrupt or slack record can't make us allocate wildly.
-/// Solana's max account data is 10 MiB.
+// Sanity cap so a corrupt record can't make us allocate wildly; Solana's max account data is 10 MiB.
 const MAX_ACCOUNT_DATA: usize = 10 * 1024 * 1024;
 
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
@@ -49,18 +32,11 @@ fn read_pubkey(bytes: &[u8], at: usize) -> Pubkey {
     Pubkey::new_from_array(bytes[at..at + 32].try_into().unwrap())
 }
 
-/// Walk one AppendVec's bytes into (pubkey, account) pairs. Stops at the end or at
-/// the first record that doesn't fit within `bytes`. The archiver trims each
-/// storage to `current_len`, so a real snapshot file ends exactly on a record
-/// boundary with no slack; the doesn't-fit and 10-MiB checks are a defensive guard
-/// for a truncated or corrupt download, not the normal stop condition.
+// The archiver trims each storage to current_len, so a real file ends on a record boundary; the doesn't-fit and 10-MiB checks guard a truncated/corrupt download, not the normal stop.
 fn parse_append_vec(bytes: &[u8]) -> Vec<(Pubkey, AccountSharedData)> {
     let mut accounts = Vec::new();
     let mut offset = 0usize;
-    // Checked arithmetic throughout: `bytes` is an untrusted downloaded snapshot,
-    // so a corrupt record must never overflow (which would panic in debug or wrap
-    // in release) — it just ends the walk. Every `offset + OFF_*` read below is
-    // safely within `header_end`, so only the record-boundary math needs guarding.
+    // Checked arithmetic: `bytes` is an untrusted download, so a corrupt record ends the walk instead of overflowing.
     while let Some(header_end) = offset.checked_add(STORE_META_OVERHEAD) {
         if header_end > bytes.len() {
             break;
@@ -93,8 +69,6 @@ fn parse_append_vec(bytes: &[u8]) -> Vec<(Pubkey, AccountSharedData)> {
     accounts
 }
 
-/// The slot an `accounts/<slot>.<id>` file belongs to, or `None` if `path` isn't
-/// one of those.
 fn account_file_slot(path: &Path) -> Option<u64> {
     if path.parent()?.file_name()? != "accounts" {
         return None;
@@ -102,21 +76,8 @@ fn account_file_slot(path: &Path) -> Option<u64> {
     path.file_name()?.to_str()?.split('.').next()?.parse().ok()
 }
 
-/// Load live accounts from a snapshot archive, keyed by pubkey with the slot it
-/// was last written. Highest-slot value wins; a zero-lamport account at its
-/// highest slot has been deleted and is dropped.
-///
-/// Two independent keep-filters, unioned in one pass:
-/// - `footprint` — load only these pubkeys (for the mainnet snapshot's millions of
-///   accounts, the range's read-set). It is the union of EVERY tx's account keys,
-///   NOT owner/program-filtered: our program's txs read accounts other txs write,
-///   so owner-scoping the seed would yield stale reads.
-/// - `keep_owned_by` — ALSO keep every account this program owns, regardless of
-///   footprint. That is the S_snap baseline the persist layer needs (the narrow
-///   store), captured in the same scan. Owner-filtering here is only ever for what
-///   we persist, never a narrowing of the seed.
-///
-/// An account is kept if it is in the footprint OR owned by `keep_owned_by`.
+// Highest-slot-wins; a zero-lamport account at its top slot is deleted on-chain, so dropped.
+// footprint is the seed read-set, NOT owner-filtered (owner-scoping yields stale reads); keep_owned_by also keeps every program-owned account as the persist baseline. Kept if in footprint OR owned by keep_owned_by.
 pub fn load_accounts<R: Read>(
     reader: R,
     footprint: Option<&HashSet<Pubkey>>,
@@ -135,8 +96,7 @@ pub fn load_accounts<R: Read>(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).context("read account file")?;
         for (pubkey, account) in parse_append_vec(&bytes) {
-            // Keep during parse (bounds memory) anything in the footprint (seed) or
-            // owned by the baseline program (persist).
+            // Filter during parse to bound memory: keep footprint (seed) or program-owned (persist).
             let keep = footprint.is_none_or(|f| f.contains(&pubkey))
                 || keep_owned_by.is_some_and(|owner| account.owner() == owner);
             if !keep {
@@ -151,29 +111,13 @@ pub fn load_accounts<R: Read>(
         }
     }
 
-    // Drop dead accounts. A zero-lamport account is purged on-chain, so a read of
-    // it returns the default (system-owned, empty), NOT the stale owner/data the
-    // AppendVec record may still carry — seeding that record would diverge from the
-    // chain. Highest-slot-wins ran first, so this also correctly deletes an account
-    // that was funded at an earlier slot and closed at a later one. Matches how a
-    // validator treats dead accounts on snapshot load.
+    // Drop dead (zero-lamport) accounts: on-chain they're purged and read as the default, so seeding the stale AppendVec record would diverge from the chain.
     accounts.retain(|_, (account, _)| account.lamports() > 0);
     Ok(accounts)
 }
 
-/// Stream a snapshot's accounts straight into `store`, never holding them all in RAM —
-/// the disk-store path for ranges too big for [`load_accounts`]'s HashMap. Same footprint
-/// filter and highest-slot-wins dedup, but the dedup is done against the store itself
-/// (a `get` per account, so it's not fast; write-batching is the deferred optimization).
-///
-/// Zero-lamport records are kept as tombstones carrying their slot, so a later
-/// lower-slot record can't resurrect a closed account; the read path
-/// (`ReplayBank::get_account_shared_data`) filters them back out, exactly as
-/// `load_accounts`'s final `retain` drops them.
-///
-/// Returns `(writes performed, the keep_owned_by-owned live accounts at their highest
-/// slot)`. The second is the S_snap baseline, collected in this same pass so the disk
-/// path never needs a second scan to learn which accounts the program owns.
+// Disk-store path for ranges too big for load_accounts's HashMap; same filter + highest-slot-wins, but dedup is against the store (a get per account).
+// Zero-lamport records are kept as tombstones carrying their slot so a later lower-slot record can't resurrect a closed account; the read path filters them back out.
 pub fn stream_into_store<R: Read>(
     reader: R,
     store: &mut dyn AccountStore,
@@ -199,13 +143,10 @@ pub fn stream_into_store<R: Read>(
             if !keep {
                 continue;
             }
-            // Highest-slot-wins, dedup'd against the store (which holds tombstones too,
-            // so their slot is still known and a stale lower-slot record loses).
             match store.get(&pubkey) {
                 Some((_, prev)) if prev >= slot => {}
                 _ => {
-                    // Track program-owned live accounts as the baseline; drop any whose
-                    // newest version is closed (zero-lamport) or owned by someone else.
+                    // Track program-owned live accounts as the baseline; drop any now closed or reowned.
                     if is_owned && account.lamports() > 0 {
                         owned.insert(pubkey, (account.clone(), slot));
                     } else {
@@ -222,7 +163,6 @@ pub fn stream_into_store<R: Read>(
     Ok((writes, owned))
 }
 
-/// Convenience wrapper: load from a file path.
 pub fn load_accounts_from_file(
     path: &Path,
     footprint: Option<&HashSet<Pubkey>>,
@@ -234,10 +174,7 @@ pub fn load_accounts_from_file(
     )
 }
 
-/// Seed a [`ReplayBank`] from a snapshot. `footprint`, when given, is the set of
-/// pubkeys to load — the union of the range's transaction account keys from the
-/// pre-scan, NOT an owner filter (see [`load_accounts`]). `None` loads everything,
-/// which is fine for a small snapshot.
+// footprint is the pre-scan read-set (NOT an owner filter); None loads everything, fine for a small snapshot.
 pub fn seed_bank_from_snapshot<R: Read>(
     reader: R,
     footprint: Option<&HashSet<Pubkey>>,
@@ -249,32 +186,18 @@ pub fn seed_bank_from_snapshot<R: Read>(
     Ok(bank)
 }
 
-/// The bank-hash anchors read from a snapshot's manifest bank fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestHashes {
-    /// The snapshot slot.
     pub slot: u64,
-    /// `bank_hash(slot)` — the state-commitment hash, the keystone verification
-    /// target for a computed bank hash.
+    // bank_hash(slot): the keystone verification target for a computed bank hash.
     pub bank_hash: Hash,
-    /// `slot - 1`.
     pub parent_slot: u64,
-    /// `bank_hash(slot - 1)`. Equals the newest SlotHashes entry the snapshot
-    /// carries, an independent cross-check that the parse found the right fields.
+    // bank_hash(slot-1); equals the snapshot's newest SlotHashes entry, an independent cross-check the parse found the right fields.
     pub parent_hash: Hash,
 }
 
-/// Read the bank hash and parent bank hash from a full snapshot's manifest
-/// (`snapshots/<slot>/<slot>`, the first non-account entry). The bank fields hold
-/// `hash`(=bank hash), `parent_hash`, `parent_slot` as three consecutive fields,
-/// but they sit behind the variable-length `blockhash_queue` and `ancestors`, which
-/// are painful to parse. So instead of parsing from the start, we locate the
-/// `parent_slot` value (= `snapshot_slot - 1`) and forward-parse the fixed scalar
-/// layout that follows it, requiring it to land exactly on the `slot` field
-/// (= `snapshot_slot`). A coincidental byte match won't have a self-consistent
-/// layout that lands on `slot`, so it's rejected; `bank_hash`/`parent_hash` are the
-/// two 32-byte fields immediately before `parent_slot`. Only the manifest front is
-/// read — the ~1 GiB stakes/epoch-stakes tail is never pulled into memory.
+// The manifest bincode drifts across versions, so we never decode it; the bank fields also sit behind variable-length blockhash_queue/ancestors. Instead we anchor on parent_slot (= slot-1) and forward-parse the fixed scalar layout, requiring it to land on slot (a coincidental byte match won't).
+// bank_hash/parent_hash are the two 32B fields just before parent_slot; only the manifest front is read, never the ~1 GiB stakes tail.
 pub fn read_manifest_hashes<R: Read>(reader: R, snapshot_slot: u64) -> Result<ManifestHashes> {
     let parent_slot = snapshot_slot
         .checked_sub(1)
@@ -294,8 +217,7 @@ pub fn read_manifest_hashes<R: Read>(reader: R, snapshot_slot: u64) -> Result<Ma
         if !is_manifest {
             continue;
         }
-        // The bank hash is a few KB in (past blockhash_queue/ancestors); 8 MiB is far
-        // more than enough and keeps the huge stakes tail out of memory.
+        // The bank hash is a few KB in; 8 MiB is far more than enough and keeps the huge stakes tail out of memory.
         let mut front = Vec::new();
         (&mut entry)
             .take(8 * 1024 * 1024)
@@ -306,8 +228,6 @@ pub fn read_manifest_hashes<R: Read>(reader: R, snapshot_slot: u64) -> Result<Ma
     anyhow::bail!("manifest {manifest_path} not found in snapshot")
 }
 
-/// Locate the bank fields in the manifest `front` by anchoring on `parent_slot` and
-/// requiring the scalar layout after it to land on `slot`. See [`read_manifest_hashes`].
 fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<ManifestHashes> {
     let ps_le = parent_slot.to_le_bytes();
     let mut result: Option<ManifestHashes> = None;
@@ -328,10 +248,7 @@ fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<Ma
     result.context("bank fields not found in manifest front (snapshot format drift?)")
 }
 
-/// Parse the `SerializableVersionedBank` scalar fields between `parent_slot` (at
-/// `o`) and `slot`, returning the `slot` value, or `None` if the walk leaves the
-/// buffer or hits an implausible field. Landing on the right `slot` is what confirms
-/// `o` really is the `parent_slot` field and not a coincidental byte match.
+// Walk the SerializableVersionedBank scalars from parent_slot to slot; landing on the right slot confirms `o` is parent_slot, not a coincidental byte match.
 fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
     let read_u64 = |p: usize| b.get(p..p + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()));
     let mut p = o + 8; // past parent_slot
@@ -347,22 +264,16 @@ fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
         1 => p += 1 + 8, // Some(u64)
         _ => return None,
     }
-    // ticks_per_slot(8) + ns_per_slot(u128=16) + genesis_creation_time(8)
-    // + slots_per_year(8) + accounts_data_len(8)
+    // ticks_per_slot(8) + ns_per_slot(u128=16) + genesis_creation_time(8) + slots_per_year(8) + accounts_data_len(8)
     p = p.checked_add(8 + 16 + 8 + 8 + 8)?;
     read_u64(p) // slot
 }
 
-/// The trailer size of the manifest's `accounts_lt_hash` field when present: a 1-byte
-/// `Option` tag (`0x01`) followed by 1024 little-endian u16 lanes (2048 bytes).
+// accounts_lt_hash trailer when present: 1-byte Option tag (0x01) + 1024 LE u16 lanes (2048B).
 const LT_HASH_TRAILER: usize = 1 + 2048;
 
-/// Read the accounts lattice hash from a snapshot manifest. In v2.2.x it's the LAST
-/// field of the manifest — `Option<[u16; 1024]>` — so when present it's the final
-/// 2049 bytes: an `0x01` tag then the 2048 lattice bytes, then EOF. Returns `None` if
-/// it was serialized as `None` (the `accounts_lt_hash` feature wasn't active for that
-/// snapshot's slot). Streams the whole manifest to reach its tail but keeps only the
-/// last bytes in memory, never the ~1 GiB body.
+// In v2.2.x accounts_lt_hash is the manifest's LAST field, so it's the final 2049 bytes (0x01 tag + 2048 lattice bytes); None if serialized None (feature inactive at that slot).
+// Streams to the tail keeping only the last bytes, never the ~1 GiB body.
 pub fn read_manifest_lt_hash<R: Read>(reader: R, snapshot_slot: u64) -> Result<Option<LtHash>> {
     let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
     let mut archive = tar::Archive::new(decoder);
@@ -378,7 +289,7 @@ pub fn read_manifest_lt_hash<R: Read>(reader: R, snapshot_slot: u64) -> Result<O
         if !is_manifest {
             continue;
         }
-        // Roll a window of the last LT_HASH_TRAILER bytes across the streamed manifest.
+        // Roll a window of the last LT_HASH_TRAILER bytes across the streamed manifest to reach its tail.
         let mut tail = Vec::with_capacity(LT_HASH_TRAILER + 64 * 1024);
         let mut buf = [0u8; 64 * 1024];
         loop {
@@ -396,8 +307,7 @@ pub fn read_manifest_lt_hash<R: Read>(reader: R, snapshot_slot: u64) -> Result<O
     anyhow::bail!("manifest {manifest_path} not found in snapshot")
 }
 
-/// Decode the manifest's `Option<accounts_lt_hash>` trailer: `0x01` + 2048 LE bytes ⇒
-/// `Some(LtHash)`, `0x00` (or too-short) ⇒ `None`.
+// Trailer decode: 0x01 + 2048 LE bytes ⇒ Some(LtHash); 0x00 or too-short ⇒ None.
 fn parse_lt_hash_trailer(tail: &[u8]) -> Option<LtHash> {
     if tail.len() < LT_HASH_TRAILER || tail[tail.len() - LT_HASH_TRAILER] != 1 {
         return None;
@@ -414,8 +324,7 @@ fn parse_lt_hash_trailer(tail: &[u8]) -> Option<LtHash> {
 mod tests {
     use super::*;
 
-    // A real solana-test-validator full snapshot (slot 200), embedded so the test
-    // stays offline. Genesis builtins + sysvars + the validator's own accounts.
+    // A real solana-test-validator full snapshot (slot 200), embedded so the test stays offline.
     const SNAPSHOT: &[u8] = include_bytes!("test_snapshot.tar.zst");
 
     #[test]
@@ -498,8 +407,7 @@ mod tests {
 
     #[test]
     fn manifest_parent_hash_matches_the_snapshot_slothashes() {
-        // Two independent reads must agree: the manifest's parent_hash field and the
-        // newest entry of the SlotHashes sysvar account (both are bank_hash(slot-1)).
+        // Two independent reads must agree: the manifest's parent_hash and the newest SlotHashes entry (both are bank_hash(slot-1)).
         let mh = read_manifest_hashes(SNAPSHOT, 200).expect("read manifest hashes");
         let accounts = load_accounts(SNAPSHOT, None, None).unwrap();
         let slot_hashes_id: Pubkey = "SysvarS1otHashes111111111111111111111111111"
@@ -508,8 +416,7 @@ mod tests {
         let (sh, _) = accounts
             .get(&slot_hashes_id)
             .expect("SlotHashes sysvar present in the snapshot");
-        // SlotHashes data = bincode Vec<(Slot, Hash)>, newest first: u64 len, then
-        // entries of (u64 slot, 32-byte hash).
+        // SlotHashes data = bincode Vec<(Slot, Hash)> newest-first: u64 len, then (u64 slot, 32B hash) entries.
         let data = sh.data();
         let len = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert!(len > 0, "SlotHashes should carry entries");

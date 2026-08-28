@@ -1,8 +1,3 @@
-//! Block source: turn a getBlock response into the transactions + per-tx meta
-//! the replay loop needs. Parsing lives here (pure, unit-tested against an
-//! embedded fixture); the thin reqwest wrapper that fetches a slot lives with
-//! the loop, since network I/O is the orchestrator's job, not the engine's.
-
 use std::collections::HashSet;
 
 use agave_reserved_account_keys::ReservedAccountKeys;
@@ -20,61 +15,42 @@ use solana_transaction::{
 };
 use solana_transaction_error::AddressLoaderError;
 
-/// One block's worth of replay input: the transactions in execution order plus
-/// the block-level context the environment needs (blockhash, block time).
 #[derive(Clone)]
 pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
     pub blockhash: Hash,
-    /// The parent block's blockhash (getBlock `previousBlockhash`) — the blockhash
-    /// the bank is on while it processes this slot. This is what a durable nonce
-    /// advances from, so it, not any individual tx's recent_blockhash, is the
-    /// environment blockhash for the block's transactions.
+    // The bank runs this slot on the parent's blockhash, what a durable nonce advances from, so it's the env blockhash, not any tx's recent_blockhash.
     pub previous_blockhash: Hash,
     pub block_time: i64,
     pub transactions: Vec<BlockTx>,
-    /// The slot's leader fee reward from getBlock `rewards` (the "Fee" entry): the
-    /// leader's identity pubkey and the lamports credited to it at freeze. The runtime
-    /// pays the leader 50% of the slot's fees (burning the rest), an account write that
-    /// the bank-hash lattice must include. `None` if the block carried no fee reward.
+    // Leader fee reward (getBlock "Fee"): a freeze-time account write the bank-hash lattice must include. None if the block carried none.
     pub fee_reward: Option<(Pubkey, u64)>,
 }
 
-/// A transaction and the on-chain result we reconcile our replay against.
 #[derive(Clone)]
 pub struct BlockTx {
     pub transaction: VersionedTransaction,
     pub meta: TxMeta,
 }
 
-/// The getBlock meta fields the oracle checks a replay against. Inner instructions
-/// and logs are omitted until something consumes them.
 #[derive(Clone)]
 pub struct TxMeta {
-    /// The on-chain error, rendered; `None` means the transaction succeeded.
     pub err: Option<String>,
     pub fee: u64,
     pub compute_units_consumed: u64,
     pub pre_balances: Vec<u64>,
     pub post_balances: Vec<u64>,
-    /// Addresses pulled in from lookup tables (empty for legacy transactions).
     pub loaded_addresses: LoadedAddresses,
-    /// Post-transaction SPL token amounts, one per touched token account (empty
-    /// when the tx touches no token accounts). The oracle checks these too.
     pub post_token_balances: Vec<TokenBalance>,
 }
 
 impl TxMeta {
-    /// Whether the transaction succeeded on chain.
     pub fn succeeded(&self) -> bool {
         self.err.is_none()
     }
 }
 
-/// One token account's post amount from getBlock's `postTokenBalances`.
-/// `account_index` indexes the transaction's account list (the same order as
-/// `post_balances`); `amount` is the raw token amount (not UI-scaled).
 #[derive(Clone)]
 pub struct TokenBalance {
     pub account_index: u8,
@@ -89,8 +65,6 @@ pub struct LoadedAddresses {
 }
 
 impl Block {
-    /// Parse the `result` object of a getBlock response (encoding `base64`,
-    /// `transactionDetails: full`, `maxSupportedTransactionVersion: 0`).
     pub fn from_getblock(slot: u64, result: &serde_json::Value) -> Result<Block> {
         let parent_slot = result["parentSlot"]
             .as_u64()
@@ -117,8 +91,7 @@ impl Block {
             transactions.push(parse_tx(t).with_context(|| format!("transaction[{i}]"))?);
         }
 
-        // The leader fee reward (rewardType "Fee"): the leader's pubkey and the lamports
-        // credited to it at freeze. Mid-epoch this is the block's only reward.
+        // Leader fee reward (rewardType "Fee"), credited at freeze; mid-epoch the block's only reward.
         let fee_reward = result["rewards"]
             .as_array()
             .and_then(|rewards| rewards.iter().find(|r| r["rewardType"].as_str() == Some("Fee")))
@@ -231,10 +204,7 @@ fn parse_loaded_addresses(v: &serde_json::Value) -> Result<LoadedAddresses> {
     })
 }
 
-/// Fetch one block over getBlock and parse it, reusing `client` so its connection pool
-/// is shared across a chunk's fetches (no TCP+TLS handshake per block). Blocking I/O on
-/// purpose: backfill is a batch job. `rpc_url` must point at an archive RPC (or a local
-/// yellowstone-faithful) that still has `slot`.
+// Reuses `client` so a chunk's fetches share one connection pool (no handshake per block); blocking on purpose, backfill is a batch job.
 pub fn fetch_block_with(
     client: &reqwest::blocking::Client,
     rpc_url: &str,
@@ -258,16 +228,12 @@ pub fn fetch_block_with(
     Block::from_getblock(slot, result)
 }
 
-/// Fetch one block with a one-off client. For preflight/dry-run single calls; the backfill
-/// path fetches through [`crate::source::RpcBlockSource`], which pools + parallelizes.
+// One-off client for preflight/dry-run single calls; the backfill path goes through RpcBlockSource (pooled + parallel).
 pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
     fetch_block_with(&reqwest::blocking::Client::new(), rpc_url, slot)
 }
 
-/// Ask the RPC which slots in `[start, end]` actually produced a block (getBlocks).
-/// The ~5% of skipped slots never produced one, so getBlock would error on them;
-/// getBlocks returns only the real ones. getBlocks caps the span at 500k slots, so
-/// a larger backfill would have to page, which the caller doesn't do yet.
+// getBlocks lists only the slots that produced a block (the ~5% skipped would error on getBlock); caps at 500k slots, caller doesn't page yet.
 pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<u64>> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -281,9 +247,7 @@ pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<
         .send()?
         .json()?;
     match resp.get("result") {
-        // yellowstone-faithful (Old Faithful) serves getBlock but not getBlocks, and
-        // returns a null result. Fall back to the whole candidate range; the fetch path
-        // skips slots that produced no block (see `fetch_block_opt`).
+        // Old Faithful serves getBlock but not getBlocks (null result); fall back to the full range, the fetch path skips empties.
         None | Some(serde_json::Value::Null) => Ok((start..=end).collect()),
         Some(result) => result
             .as_array()
@@ -294,10 +258,7 @@ pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<
     }
 }
 
-/// Like [`fetch_block_with`] but returns `None` for a slot that produced no block (a
-/// skipped slot: null result, or a "not available"/"skipped" RPC error) instead of
-/// erroring — so a caller enumerating a full range (no getBlocks) can drop the ~5% of
-/// empty slots. A genuine transport/parse failure still returns `Err`.
+// None for a skipped slot (null result or a "skip"/"not available" error) so a full-range caller can drop empties; a real transport/parse failure still Errs.
 pub fn fetch_block_opt(
     client: &reqwest::blocking::Client,
     rpc_url: &str,
@@ -331,8 +292,7 @@ pub fn fetch_block_opt(
     }
 }
 
-/// The chain's current slot (getSlot). Doubles as an RPC reachability probe and
-/// lets a caller reject a target range that runs past the chain head.
+// Current slot (getSlot); also serves as an RPC reachability probe.
 pub fn current_slot(rpc_url: &str) -> Result<u64> {
     let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getSlot" });
     let resp: serde_json::Value = reqwest::blocking::Client::new()
@@ -345,14 +305,7 @@ pub fn current_slot(rpc_url: &str) -> Result<u64> {
         .with_context(|| format!("getSlot returned no slot: {resp}"))
 }
 
-/// An [`AddressLoader`] that hands back the lookup-table addresses getBlock
-/// already resolved for a v0 transaction, instead of re-deriving them from the
-/// on-chain address-table accounts. Those addresses are part of the committed
-/// block, so we trust them at the same level as the transaction itself — which
-/// also means the lookup-table accounts don't need to be seeded, or their exact
-/// state as of this slot reconstructed. A block source that returns an
-/// inconsistent set is caught downstream: the resolved account count won't match
-/// the meta's balance arrays and the oracle halts the replay.
+// Hands back the ALT addresses getBlock already resolved, so ALT accounts needn't be seeded; an inconsistent set is caught downstream by the oracle.
 #[derive(Clone)]
 struct ResolvedAddresses {
     writable: Vec<Pubkey>,
@@ -371,13 +324,7 @@ impl AddressLoader for ResolvedAddresses {
     }
 }
 
-/// Turn a block transaction into the [`SanitizedTransaction`] the replayer takes.
-/// Handles both legacy and v0 (address-lookup-table) messages. For a v0 tx the
-/// lookup tables are resolved from `loaded` — the addresses getBlock already
-/// resolved for this transaction (see [`ResolvedAddresses`]) — so no lookup-table
-/// account state is needed. The message hash is computed and simple-vote status is
-/// detected from the message. The reserved-key set is the fully-activated one,
-/// correct for our post-epoch-808 floor where every reserved key is already live.
+// Reserved-key set is the fully-activated one, correct for our post-epoch-808 floor where every reserved key is already live.
 pub fn sanitize(
     tx: &VersionedTransaction,
     loaded: &LoadedAddresses,
@@ -397,23 +344,7 @@ pub fn sanitize(
     .context("transaction failed to sanitize")
 }
 
-/// The set of accounts a range of blocks touches — the seed set to pull from the
-/// snapshot. It's the union of every transaction's static account keys and the
-/// addresses it loaded from lookup tables, plus every feature account so the
-/// per-slot feature set can be computed.
-///
-/// Deliberately NOT owner-filtered: our program's transactions read accounts other
-/// transactions write, so scoping the seed to one program yields stale reads. The
-/// footprint bounds memory by skipping dormant untouched accounts, never by
-/// narrowing the read-set.
-///
-/// Two things it does not add: sysvars (Clock/Rent/EpochSchedule are synthesized;
-/// SlotHashes/StakeHistory content is a separate snapshot-seeded step), and an
-/// upgradeable program's programdata account, which is resolved when the program
-/// is loaded, not here.
-/// Add the accounts `blocks` reference — every tx's static keys and lookup-loaded
-/// addresses, plus each slot's fee-credited leader — to `set`. Called once per chunk
-/// while streaming, so the footprint accumulates without ever holding every block.
+// Not owner-filtered on purpose: our txs read accounts other txs write, so owner-scoping the seed yields stale reads. Called per chunk while streaming, so the footprint accumulates without holding every block.
 pub fn extend_footprint(set: &mut HashSet<Pubkey>, blocks: &[Block]) {
     for block in blocks {
         for tx in &block.transactions {
@@ -421,27 +352,17 @@ pub fn extend_footprint(set: &mut HashSet<Pubkey>, blocks: &[Block]) {
             set.extend(tx.meta.loaded_addresses.writable.iter().copied());
             set.extend(tx.meta.loaded_addresses.readonly.iter().copied());
         }
-        // The leader credited this slot's fees — freeze writes it, so the lattice needs
-        // its pre-slot value seeded.
+        // Freeze writes the fee-credited leader, so the lattice needs its pre-slot value seeded.
         if let Some((leader, _)) = block.fee_reward {
             set.insert(leader);
         }
     }
 }
 
-/// Add the block-independent part of the seed to `set`: every feature account (so the
-/// per-slot feature set can be built) and the sysvars replay reads but no block names.
-/// Added once, after the block keys.
+// Block-independent seed: every feature account (to build the per-slot feature set) plus the sysvars replay reads but no block names.
 pub fn footprint_fixed(set: &mut HashSet<Pubkey>) {
     set.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
-    // Seed every sysvar we need from the snapshot rather than synthesize it. The
-    // bank-hash roll needs each per-slot sysvar write to be bit-exact, so replay
-    // starts from the real value at s_snap and applies the runtime's minimal delta:
-    // Clock keeps its epoch fields and just advances slot/timestamp; SlotHistory and
-    // RecentBlockhashes roll one entry forward; Rent/EpochSchedule don't change. The
-    // historical ones (StakeHistory's stake curve, EpochRewards, LastRestartSlot)
-    // likewise can't be synthesized. SlotHashes is added in backfill (it also seeds
-    // the programData PDAs there).
+    // Seed sysvars from the snapshot rather than synthesize them: the bank-hash roll needs each per-slot value bit-exact. SlotHashes is seeded in backfill.
     set.insert(solana_sdk_ids::sysvar::clock::id());
     set.insert(solana_sdk_ids::sysvar::slot_history::id());
     set.insert(solana_sdk_ids::sysvar::recent_blockhashes::id());
@@ -452,9 +373,7 @@ pub fn footprint_fixed(set: &mut HashSet<Pubkey>) {
     set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
 }
 
-/// The full seed footprint for `blocks` in one shot: block keys ∪ the fixed set. Kept
-/// for tests and non-streaming callers; the streaming backfill calls the two halves
-/// directly so it never holds every block at once.
+// Full seed footprint in one shot (block keys ∪ the fixed set); for tests and non-streaming callers.
 pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     let mut set = HashSet::new();
     extend_footprint(&mut set, blocks);
@@ -462,12 +381,7 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     set
 }
 
-/// The consensus bank-hash confirmations carried by a block's vote transactions.
-/// A TowerSync/VoteStateUpdate vote carries the bank hash of the newest slot it
-/// votes on, so votes in one block confirm the computed hashes of slots a handful
-/// back. Returns `(voted slot, that slot's bank hash)` for every decodable vote.
-/// Best-effort: non-vote txs and older instruction variants that carry no hash are
-/// skipped — a slot with no confirming vote is reported unverified, never wrong.
+// Bank-hash confirmations from a block's votes; best-effort, a slot with no confirming vote is reported unverified, never wrong.
 pub fn vote_confirmations(block: &Block) -> Vec<(u64, Hash)> {
     use solana_vote_interface::instruction::VoteInstruction;
     let mut out = Vec::new();
@@ -499,17 +413,7 @@ pub fn vote_confirmations(block: &Block) -> Vec<(u64, Hash)> {
     out
 }
 
-/// The programData accounts for every key in `footprint`, derived as the
-/// upgradeable-loader PDA of that key. An upgradeable program's bytecode lives in
-/// a separate programData account (a PDA of the program id under the upgradeable
-/// loader) that is NEVER a declared account key, so the footprint misses it and
-/// the SVM can't load the program without it. We can't tell which keys are
-/// programs before the scan, so we derive the PDA for ALL of them and let the
-/// snapshot decide: a real program's programData is present and gets seeded; a
-/// non-program key derives to an address the snapshot doesn't hold, which is
-/// harmlessly skipped. The derivation is deterministic, so no RPC or second pass
-/// is needed. Any program a tx invokes (top-level or via CPI) is a declared key,
-/// so this covers CPI targets too.
+// An upgradeable program's programData (a PDA under the loader) is never a declared key, so the footprint misses it; derive it for every key and let the snapshot keep the real ones.
 pub fn programdata_addresses(footprint: &HashSet<Pubkey>) -> HashSet<Pubkey> {
     let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
     footprint
@@ -562,8 +466,7 @@ mod tests {
             .static_account_keys()
             .to_vec();
 
-        // Re-wrap tx0 with synthetic loaded addresses to exercise that path (the
-        // fixture is all legacy, so its real loaded set is empty).
+        // Re-wrap tx0 with synthetic loaded addresses to exercise that path (the fixture is all legacy).
         let w = Pubkey::new_unique();
         let r = Pubkey::new_unique();
         let synthetic = Block {
@@ -600,8 +503,7 @@ mod tests {
             fp.contains(agave_feature_set::FEATURE_NAMES.keys().next().unwrap()),
             "feature accounts missing"
         );
-        // Non-synthesized cache sysvars must be seeded from the snapshot, so the
-        // footprint has to name them regardless of what the transactions touch.
+        // Non-synthesized sysvars must be seeded from the snapshot, so the footprint names them regardless of what txs touch.
         assert!(
             fp.contains(&solana_sdk_ids::sysvar::stake_history::id()),
             "StakeHistory sysvar missing from footprint"
@@ -676,10 +578,7 @@ mod tests {
         let recent_blockhashes = solana_sdk_ids::sysvar::recent_blockhashes::id();
         let system = solana_sdk_ids::system_program::id();
 
-        // A legacy durable-nonce tx: authority is the writable signer, the nonce
-        // account is a writable non-signer (the last two unsigned keys are readonly),
-        // and the first instruction is System AdvanceNonceAccount. `build` lets the
-        // negative case reuse the exact same shape with a different discriminant.
+        // Hand-built legacy durable-nonce tx (authority signer, nonce writable non-signer, first ix AdvanceNonceAccount); `build` reuses the shape for the negative case.
         let build = |data: Vec<u8>| VersionedTransaction {
             signatures: vec![solana_signature::Signature::default()],
             message: VersionedMessage::Legacy(Message {
@@ -728,9 +627,7 @@ mod tests {
         let w_loaded = Pubkey::new_unique();
         let r_loaded = Pubkey::new_unique();
 
-        // A v0 message: two static keys (writable-signer payer, readonly program),
-        // one lookup pulling in one writable + one readonly account, and an
-        // instruction that touches both loaded accounts.
+        // A v0 message: two static keys (writable-signer payer, readonly program) + one lookup (one writable, one readonly).
         let message = VersionedMessage::V0(V0Message {
             header: MessageHeader {
                 num_required_signatures: 1,
@@ -740,7 +637,7 @@ mod tests {
             account_keys: vec![payer, program],
             recent_blockhash: Hash::default(),
             instructions: vec![CompiledInstruction {
-                program_id_index: 1,  // `program` — a program must be a static key
+                program_id_index: 1,  // `program`, a program must be a static key
                 accounts: vec![2, 3], // the two loaded accounts
                 data: vec![],
             }],
@@ -764,8 +661,7 @@ mod tests {
         // Resolved order is static keys, then loaded writable, then loaded readonly.
         let keys: Vec<Pubkey> = sanitized.message().account_keys().iter().copied().collect();
         assert_eq!(keys, vec![payer, program, w_loaded, r_loaded]);
-        // Writability survives resolution: payer and the loaded-writable account are
-        // writable; the readonly program and loaded-readonly account are not.
+        // Writability survives resolution: payer and loaded-writable are writable; program and loaded-readonly are not.
         assert!(sanitized.message().is_writable(0), "payer writable");
         assert!(!sanitized.message().is_writable(1), "program readonly");
         assert!(sanitized.message().is_writable(2), "loaded writable");
@@ -774,15 +670,7 @@ mod tests {
 
     #[test]
     fn sanitizes_a_real_mainnet_v0_tx() {
-        // Real mainnet v0 tx `3mFFw1gy…A9tHw` at slot 438,686,267: a payer,
-        // ComputeBudget, and the Archer program (all static), plus one writable and
-        // one readonly account pulled from an address lookup table. The tx bytes are
-        // straight from getTransaction; `loaded` is its `meta.loadedAddresses`; the
-        // expected resolved order and writability are the chain's own (getTransaction
-        // jsonParsed). This proves our ALT resolution reproduces exactly what the
-        // runtime resolved, on real data. No execution: a real v0 tx touches volatile
-        // program state we can't seed without a snapshot, so this exercises the new
-        // resolution path, which is what v0 support actually added.
+        // Real mainnet v0 tx at slot 438,686,267: tx bytes + `loaded` from getTransaction, expected order/writability are the chain's own, proves ALT resolution matches the runtime on real data. No execution (a real v0 tx touches volatile state we can't seed).
         const TX_B64: &str = "AYownfptVgnmlmBec4O8Ea7P0GwxZrSNzSMUoNkMq36JMSUX0vVDR753DYLNn0nZVQvgaU86SmimmV8/Hy0ipQmAAQACA+PR7JOJ9x+VNoggrlsrmG6pSPHWYFr79eziSqc10kxqAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAACSbwJV/6sw7SgPMIg8jcryjPkcMvll106orrFSiIQJ2Mmubt//DUKNJZxeh89/JU7lfBVVZURpqHZcGq6kK9npBAEABQJMHQAAAQAJAwAAAAAAAAAAAQAFBIAaBgACAwADBJgEB/2sHQoAAAAAWhUAAAAAAAAKCgAAAAAAncMCAAAAAAAAAAAAAAAAAGwlBAAAAAAA+/////////9sJQQAAAAAAPf/////////bCUEAAAAAADz/////////2wlBAAAAAAA7v////////+dwwIAAAAAAOr/////////bCUEAAAAAADl/////////2wlBAAAAAAA4f////////9sJQQAAAAAAN3/////////ncMCAAAAAADY/////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAL4CAAAAAAAAAQAAAAAAAAAdBAAAAAAAAAYAAAAAAAAAHQQAAAAAAAAKAAAAAAAAAB0EAAAAAAAADgAAAAAAAAC+AgAAAAAAABMAAAAAAAAAvgIAAAAAAAAXAAAAAAAAAB0EAAAAAAAAGwAAAAAAAAAdBAAAAAAAACAAAAAAAAAAHQQAAAAAAAAkAAAAAAAAAL4CAAAAAAAAKQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABb8+IV+seoVHrDD63JNlJEUTeQ0yR7qrG1EQue3HUY30BIAEp";
 
         let bytes = base64::engine::general_purpose::STANDARD
@@ -822,8 +710,7 @@ mod tests {
             "resolved account order must match the chain"
         );
 
-        // Writability, straight from the chain: payer and the loaded-writable account
-        // are writable; the two programs and the loaded-readonly account are not.
+        // Writability straight from the chain: payer and loaded-writable are writable; the two programs and loaded-readonly are not.
         for (i, want) in [true, false, false, true, false].iter().enumerate() {
             assert_eq!(sanitized.message().is_writable(i), *want, "writable[{i}]");
         }
@@ -843,8 +730,7 @@ mod tests {
     #[ignore = "hits a mainnet archive RPC; run with SLATE_RPC set"]
     fn fetch_confirmed_slots_live() {
         let url = std::env::var("SLATE_RPC").expect("set SLATE_RPC to an archive RPC url");
-        // The fixture slot is a real confirmed block, so getBlocks over a tight
-        // range around it must list it.
+        // The fixture slot is a real confirmed block, so getBlocks over a tight range must list it.
         let slots = fetch_confirmed_slots(&url, 437_680_848, 437_680_849).unwrap();
         assert!(
             slots.contains(&437_680_849),

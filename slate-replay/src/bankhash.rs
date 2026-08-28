@@ -1,13 +1,4 @@
-//! Bank-hash computation for the lattice-hash regime (epoch 804+: `accounts_lt_hash`
-//! active; epoch 807+: `accounts_delta_hash` removed). This lets replay roll the
-//! SlotHashes sysvar forward with real bank hashes, so programs that read SlotHashes
-//! for on-chain randomness (and vote txs) reconcile past the first block.
-//!
-//! `LtHash` comes from agave's standalone `solana-lattice-hash` crate — the exact
-//! consensus code, so the lattice math is bit-exact. The per-account element and the
-//! bank-hash combine are reproduced here from agave `accounts_db::hash_account_helper`
-//! and `bank::hash_internal_state` (v2.2.20). See the memory reference
-//! `slate-bankhash-computation-spec` for the full derivation and feature activations.
+// Bank-hash computation for the lattice-hash regime (accounts_lt_hash active epoch 804+, accounts_delta_hash removed epoch 807+); mirrors agave v2.2.20.
 
 use sha2::{Digest, Sha256};
 use solana_account::{AccountSharedData, ReadableAccount};
@@ -15,15 +6,10 @@ use solana_hash::Hash;
 use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
-/// One slot's account changes: `(pubkey, pre-slot value, post-slot value)`. A `None`
-/// pre-slot value means the slot created the account.
+// One slot's changes: (pubkey, pre-value, post-value); None pre-value = created this slot.
 pub type SlotChange = (Pubkey, Option<AccountSharedData>, AccountSharedData);
 
-/// One account's lattice element, matching agave `lt_hash_account` /
-/// `hash_account_helper` with `RentEpochInAccountHash::Excluded`: blake3 in XOF mode
-/// over `lamports(LE) || data || executable || owner || pubkey` — note NO rent_epoch —
-/// read into the 1024 u16 lanes. A zero-lamport (dead) account contributes the
-/// identity (it's not part of the live state the lattice commits to).
+// Lattice element, mirrors agave hash_account_helper (RentEpochInAccountHash::Excluded): blake3 XOF over lamports(LE)||data||executable||owner||pubkey, NO rent_epoch. Dead account = identity.
 pub fn lt_hash_account(pubkey: &Pubkey, account: &impl ReadableAccount) -> LtHash {
     if account.lamports() == 0 {
         return LtHash::identity();
@@ -37,9 +23,7 @@ pub fn lt_hash_account(pubkey: &Pubkey, account: &impl ReadableAccount) -> LtHas
     LtHash::with(&hasher)
 }
 
-/// The 2048 bytes of a lattice hash as fed to the bank hash: the 1024 lanes as
-/// little-endian u16. Agave uses `bytemuck::must_cast_slice`, which is the same bytes
-/// on little-endian targets (every validator).
+// 1024 lanes as LE u16 (2048 bytes); matches agave bytemuck::must_cast_slice on LE targets.
 fn lt_hash_bytes(lt: &LtHash) -> [u8; 2048] {
     let mut bytes = [0u8; 2048];
     for (lane, chunk) in lt.0.iter().zip(bytes.chunks_exact_mut(2)) {
@@ -48,12 +32,7 @@ fn lt_hash_bytes(lt: &LtHash) -> [u8; 2048] {
     bytes
 }
 
-/// Compute a slot's bank hash in the lattice-hash regime (`accounts_lt_hash` active,
-/// `accounts_delta_hash` removed): two nested SHA-256s,
-/// `SHA256(SHA256(parent || sig_count_LE || blockhash) || lt_hash[2048])`. Matches
-/// agave `Bank::hash_internal_state` for this feature set — the accounts-delta term
-/// is gone (SIMD-0223) and the epoch-accounts-hash is never mixed once the lattice
-/// hash is active (SIMD-0215).
+// Lattice-regime bank hash: SHA256(SHA256(parent||sig_count_LE||blockhash)||lt_hash[2048]). No accounts-delta (SIMD-0223), no epoch-accounts-hash (SIMD-0215).
 pub fn bank_hash(
     parent_bank_hash: &Hash,
     signature_count: u64,
@@ -72,32 +51,22 @@ pub fn bank_hash(
     Hash::new_from_array(full.into())
 }
 
-/// Rolls the accounts lattice hash forward slot by slot and computes each slot's bank
-/// hash. Bootstrapped from the snapshot's lattice + bank hash at s_snap; each slot it
-/// mixes the slot's changed accounts (out at their old value, in at their new) and
-/// combines with the slot's signature count and blockhash. The resulting bank hash is
-/// both the parent for the next slot and the value to prepend into SlotHashes so the
-/// next block sees it.
+// Rolls the lattice forward per slot (mix out old, in new) and computes each bank hash, parent for the next slot and the SlotHashes entry.
 pub struct BankHashRoller {
     lt_hash: LtHash,
     bank_hash: Hash,
 }
 
 impl BankHashRoller {
-    /// Bootstrap from the snapshot manifest's `accounts_lt_hash` and `bank_hash` at
-    /// s_snap.
     pub fn new(lt_hash: LtHash, bank_hash: Hash) -> Self {
         Self { lt_hash, bank_hash }
     }
 
-    /// The current bank hash: `bank_hash(s_snap)` before any roll, then `bank_hash(N)`
-    /// after rolling slot N. This is what gets prepended into SlotHashes for slot N+1.
+    // Current bank hash; prepended into SlotHashes for the next slot.
     pub fn bank_hash(&self) -> Hash {
         self.bank_hash
     }
 
-    /// Roll the lattice over one slot's changed accounts, then compute and store that
-    /// slot's bank hash (also returned).
     pub fn roll_slot(
         &mut self,
         changes: &[SlotChange],
@@ -119,9 +88,7 @@ impl BankHashRoller {
 mod tests {
     use super::*;
 
-    /// agave `lt_hash.rs::test_checksum_display`: the identity lattice hash's checksum
-    /// (blake3 of 2048 zero bytes) has a fixed base58 form. Proves the crate + blake3
-    /// are wired correctly.
+    // agave lt_hash.rs::test_checksum_display: identity checksum has a fixed base58 form.
     #[test]
     fn identity_checksum_matches_agave() {
         assert_eq!(
@@ -130,9 +97,7 @@ mod tests {
         );
     }
 
-    /// agave `lt_hash.rs::test_hello_world`: `LtHash::with(blake3("hello"))`. Checks the
-    /// XOF byte-order (leading LE u16 lanes) and the checksum against agave's own
-    /// vector, so our lane interpretation matches consensus.
+    // agave lt_hash.rs::test_hello_world: checks XOF byte-order (LE u16 lanes) against agave's vector.
     #[test]
     fn with_matches_agave_hello_vector() {
         let mut h = blake3::Hasher::new();
@@ -149,7 +114,7 @@ mod tests {
         assert_eq!(lt.checksum().0, expected);
     }
 
-    /// The bank-hash combine is exactly two nested SHA-256s over the four inputs.
+    // The bank-hash combine is two nested SHA-256s over the four inputs.
     #[test]
     fn bank_hash_is_two_nested_sha256() {
         let parent = Hash::new_from_array([1u8; 32]);
@@ -169,8 +134,7 @@ mod tests {
         assert_eq!(got, Hash::new_from_array(expected.into()));
     }
 
-    /// Mixing an element in then out returns to where we started — the homomorphism
-    /// that lets us roll the lattice forward by the slot's changed accounts.
+    // Mix in then out returns to start, the homomorphism the roll-forward relies on.
     #[test]
     fn mix_in_then_out_is_identity() {
         let mut acc = LtHash::identity();
@@ -193,8 +157,7 @@ mod tests {
         })
     }
 
-    /// Rolling a slot that creates two accounts equals mixing those two elements into
-    /// the lattice directly — the roller's mix-in path and the combine line up.
+    // Rolling a slot that creates two accounts equals mixing both elements directly.
     #[test]
     fn roller_creates_accounts_like_a_direct_sum() {
         let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
@@ -212,9 +175,7 @@ mod tests {
         assert_eq!(roller.bank_hash(), bh);
     }
 
-    /// Updating an existing account rolls it out at its old value and in at its new, so
-    /// the lattice ends holding only the new value — the homomorphism the whole
-    /// roll-forward depends on.
+    // Updating rolls out old + in new, so the lattice ends holding only the new value.
     #[test]
     fn roller_updates_an_account_by_mixing_out_then_in() {
         let k = Pubkey::new_unique();
@@ -237,10 +198,7 @@ mod tests {
         );
     }
 
-    /// THE KEYSTONE: recompute the real mainnet bank hash for the snapshot slot from
-    /// the manifest's lattice hash + parent hash and the slot's on-chain signature
-    /// count and blockhash, and assert it equals the bank hash the manifest itself
-    /// records. Proves the whole computation is bit-exact against real consensus data.
+    // KEYSTONE: recompute the real mainnet bank hash from manifest lattice+parent + on-chain sig count/blockhash; proves bit-exact.
     #[test]
     #[ignore = "needs the local mainnet snapshot at /Users/mctursh/slate-data"]
     fn keystone_reproduces_the_mainnet_bank_hash() {
@@ -258,8 +216,7 @@ mod tests {
             .unwrap()
             .expect("accounts_lt_hash is serialized in the manifest at epoch 807");
 
-        // The remaining two inputs are this slot's on-chain values (getBlock 349047024):
-        // total signature count across the block, and the slot's blockhash.
+        // The remaining two inputs are this slot's on-chain values (getBlock 349047024): sig count + blockhash.
         let signature_count = 1890u64;
         let blockhash: Hash = "BaUZWzsjp8aicbMfFQ9Z7xsqT5TbHHHSbzZ6Kd6R1QfP".parse().unwrap();
 

@@ -1,36 +1,19 @@
-//! The account store behind the replay bank: the full account universe, keyed by
-//! pubkey. An in-memory map for tests and small ranges; a disk-backed store (next)
-//! for inter-snapshot windows that don't fit in RAM. The bank talks to it only
-//! through the [`AccountStore`] trait, so the backing can swap without touching the
-//! replay path.
-
 use std::{collections::HashMap, path::Path};
 
 use redb::{Database, Durability, TableDefinition};
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 
-/// The replay bank's account universe: `pubkey -> (account, slot it was last written)`.
-/// Point get/put/contains is the whole surface the bank needs — the lattice roll and
-/// zero-lamport handling live in the bank, so the store stays a dumb key-value map.
-///
-/// `Send + Sync` so the bank (used as the SVM's account callback) keeps the same auto
-/// traits it had when the field was a plain `HashMap`.
+// pubkey -> (account, last-written slot). Send + Sync so the bank stays usable as the SVM's account callback.
 pub trait AccountStore: Send + Sync {
-    /// The stored value for `key`, or `None` if absent.
     fn get(&self, key: &Pubkey) -> Option<(AccountSharedData, u64)>;
-    /// Store `account` for `key`, tagged with the `slot` it was written at.
     fn put(&mut self, key: Pubkey, account: AccountSharedData, slot: u64);
-    /// Whether `key` is present.
     fn contains(&self, key: &Pubkey) -> bool;
-    /// Make buffered writes durable. A no-op for stores that write through; the disk
-    /// store commits its RAM write-buffer in one transaction. Called per slot and at
-    /// the end of a seed/run.
+    // Commit buffered writes; no-op for write-through stores.
     fn flush(&mut self);
 }
 
-/// The whole universe in a `HashMap`. What the bank has always used; kept for tests
-/// and ranges small enough to hold in RAM.
+// In-RAM HashMap; for tests and ranges small enough to fit.
 #[derive(Default)]
 pub struct MemStore {
     accounts: HashMap<Pubkey, (AccountSharedData, u64)>,
@@ -54,20 +37,10 @@ impl AccountStore for MemStore {
 
 const ACCOUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accounts");
 
-/// Flush the write-buffer to disk once it holds this many bytes of account data, so a
-/// long seed or replay never grows the buffer without bound.
+// Flush the write-buffer once it holds this many bytes, so it never grows unbounded.
 const FLUSH_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
-/// A disk-backed [`AccountStore`] over redb (pure-Rust embedded KV). Holds the whole
-/// account universe on disk, so a large range's footprint never has to fit in RAM. The
-/// store is scratch — rebuilt from the snapshot each run — so writes use
-/// `Durability::None` (no fsync); a crash just means re-importing.
-///
-/// Writes are BUFFERED in RAM and committed in batches — one redb transaction per flush,
-/// not per put. Per-put commits copy-on-write B-tree pages that pile up and bloat the
-/// file catastrophically (a 300-slot range ballooned to 152 GiB). The buffer auto-flushes
-/// at [`FLUSH_THRESHOLD_BYTES`] so it stays bounded, and reads check the buffer before
-/// disk, so a just-written account is visible before its flush.
+// redb-backed scratch store (rebuilt each run) so Durability::None; writes buffered + flushed in batches because per-put commits bloat the file to 152 GiB.
 pub struct DiskStore {
     db: Database,
     buffer: HashMap<Pubkey, (AccountSharedData, u64)>,
@@ -75,11 +48,7 @@ pub struct DiskStore {
 }
 
 impl DiskStore {
-    /// Create (or overwrite) the store at `path`, giving redb `cache_bytes` of RAM for
-    /// its page cache. This is the store's memory budget: the account universe lives on
-    /// disk, and only these hot pages (plus the bounded write-buffer) sit in RAM — so
-    /// `cache_bytes` is what bounds our footprint, no matter how many accounts the
-    /// snapshot holds. Set it to whatever slice of RAM you can spare (say 8 GiB).
+    // cache_bytes is redb's page-cache = the store's RAM budget (universe lives on disk).
     pub fn create(path: impl AsRef<Path>, cache_bytes: usize) -> anyhow::Result<Self> {
         let db = Database::builder()
             .set_cache_size(cache_bytes)
@@ -143,8 +112,7 @@ impl AccountStore for DiskStore {
     }
 }
 
-/// `slot(8) | lamports(8) | rent_epoch(8) | executable(1) | owner(32) | data(rest)`.
-/// A fixed 57-byte head then the account data — compact and stable, no serde.
+// slot(8) | lamports(8) | rent_epoch(8) | executable(1) | owner(32) | data(rest): 57-byte head + data.
 fn encode(account: &AccountSharedData, slot: u64) -> Vec<u8> {
     let data = account.data();
     let mut buf = Vec::with_capacity(57 + data.len());

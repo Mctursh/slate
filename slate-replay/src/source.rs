@@ -1,8 +1,3 @@
-//! Block source: the adapter that feeds the replay its blocks. One trait so the backend
-//! swaps without touching the replay loop — yellowstone-faithful (Old Faithful) or plain
-//! JSON-RPC today (both getBlock), Jetstreamer or direct CAR reads later. The replay
-//! pulls one chunk of slots at a time, so blocks never all sit in RAM.
-
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -16,27 +11,18 @@ use reqwest::blocking::Client;
 
 use crate::block::{fetch_block_opt, fetch_confirmed_slots, Block};
 
-/// How many times to retry a transient fetch failure (429/timeout/dropped connection, or
-/// Old Faithful failing to range-fetch a block from the remote CAR) before giving up.
-/// A footprint or replay pass over a 50k-slot range fetches tens of thousands of blocks;
-/// a single unrecovered miss aborts the whole pass, so the budget has to outlast a
-/// transient CDN window (seconds to a couple of minutes), not just a blip. With the
-/// backoff below this is ~12 min of retrying per block — long, but a pass is worth hours.
+// Big retry budget: one unrecovered miss aborts a whole pass, and Old Faithful flakes transiently (CDN range-fetch), so it has to outlast a transient window, not just a blip.
 const MAX_RETRIES: usize = 40;
 
-/// Where the replay gets its blocks. `Send + Sync` so a shared source can be handed to a
-/// blocking fetch task while the async loop persists the previous chunk.
+// Send + Sync so a shared source can be handed to a blocking fetch task while the async loop persists the previous chunk.
 pub trait BlockSource: Send + Sync {
-    /// The confirmed slots in `(from, to]` — the ones that actually have a block.
+    // Confirmed slots in (from, to], the ones that actually produced a block.
     fn confirmed_slots(&self, from: u64, to: u64) -> Result<Vec<u64>>;
-    /// Fetch the blocks for `slots` (one chunk). Blocking is fine — the caller drives
-    /// chunks, so only a chunk's worth is ever resident.
+    // Blocking is fine, the caller drives chunks, so only one chunk is ever resident.
     fn fetch(&self, slots: &[u64]) -> Result<Vec<Block>>;
 }
 
-/// `getBlock` over JSON-RPC. Backs both a local `yellowstone-faithful` (Old Faithful,
-/// unmetered, the production path) and a remote provider (Helius/QuickNode, handy for
-/// recent slots or quick tests) — same protocol, only the URL differs.
+// getBlock over JSON-RPC; backs both a local yellowstone-faithful (production) and a remote provider (Helius/QuickNode), only the URL differs.
 pub struct RpcBlockSource {
     rpc_url: String,
     client: Client,
@@ -57,17 +43,13 @@ impl RpcBlockSource {
         }
     }
 
-    /// How many blocks to fetch at once. Leave at 1 (serial) for a rate-limited provider
-    /// like Helius; raise it for an unmetered local source (yellowstone-faithful), where
-    /// parallel range-fetches are what make a 50k-slot window tractable.
+    // Leave at 1 (serial) for a rate-limited provider like Helius; raise it for an unmetered local source where parallel fetches make a big window tractable.
     pub fn with_concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
     }
 
-    /// Fetch one block, retrying transient failures with a short linear backoff. Returns
-    /// `None` for a skipped slot (no block) so the caller can drop it. The pooled client
-    /// is shared, so a retry reuses the connection.
+    // Retries transient failures with backoff; None for a skipped slot so the caller drops it.
     fn fetch_one(&self, slot: u64) -> Result<Option<Block>> {
         let mut attempt = 0usize;
         loop {
@@ -80,10 +62,8 @@ impl RpcBlockSource {
                             "fetching block {slot} failed after {MAX_RETRIES} retries"
                         )));
                     }
-                    // Exponential backoff capped at 20s: 0.5s, 1, 2, 4, 8, 16, then 20s.
-                    // Old Faithful's transient range-fetch failures clear on their own in
-                    // seconds to a couple of minutes; longer, spaced-out retries ride them
-                    // out instead of hammering a saturated CDN connection.
+                    // Exponential backoff capped at 20s: 0.5, 1, 2, 4, 8, 16, then 20s.
+                    // Old Faithful's transient range-fetch failures clear in seconds-to-minutes; spaced-out retries ride them out instead of hammering a saturated CDN.
                     let backoff_ms = (500u64 << (attempt as u32 - 1).min(6)).min(20_000);
                     std::thread::sleep(Duration::from_millis(backoff_ms));
                 }
@@ -111,10 +91,7 @@ impl BlockSource for RpcBlockSource {
             }
             return Ok(out);
         }
-        // Bounded-concurrency parallel fetch, order-preserving: workers pull slot indices
-        // off a shared counter and write each result into its own cell. Skipped slots
-        // (None) are dropped when collecting, so the returned Vec is the confirmed blocks
-        // in slot order.
+        // Bounded-concurrency, order-preserving: workers pull indices off a shared counter into per-index cells; skipped slots (None) drop out when collecting, leaving confirmed blocks in slot order.
         let results: Vec<Mutex<Option<Result<Option<Block>>>>> =
             (0..slots.len()).map(|_| Mutex::new(None)).collect();
         let next = AtomicUsize::new(0);
@@ -143,8 +120,7 @@ impl BlockSource for RpcBlockSource {
     }
 }
 
-/// A [`BlockSource`] over blocks already in memory. For tests, and for callers that have
-/// a small range pre-built — the replay path treats it exactly like a remote source.
+// In-memory BlockSource for tests and small pre-built ranges; the replay path treats it like a remote source.
 pub struct VecBlockSource {
     blocks: Vec<Block>,
 }
@@ -168,8 +144,7 @@ impl BlockSource for VecBlockSource {
     }
 
     fn fetch(&self, slots: &[u64]) -> Result<Vec<Block>> {
-        // Return them in `slots` order (the chunk order the caller expects), not the
-        // source's internal order.
+        // Return in `slots` order (the chunk order the caller expects), not the source's internal order.
         Ok(slots
             .iter()
             .filter_map(|s| self.blocks.iter().find(|b| b.slot == *s).cloned())

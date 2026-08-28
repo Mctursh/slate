@@ -1,11 +1,3 @@
-//! slate-replay: historical Solana account-state reconstruction via SVM
-//! transaction replay.
-//!
-//! Phase 0 — walking skeleton: prove we can construct the SVM processor and the
-//! account-loading callback against solana-svm 3.1.x. Execution (building the
-//! per-slot environment, sanitizing a real tx, and reconciling against getBlock)
-//! comes in Tasks 0.4–0.7.
-
 pub mod backfill;
 pub mod bankhash;
 pub mod block;
@@ -64,14 +56,11 @@ use crate::{
     oracle::reconcile,
 };
 
-/// Replay walks a single linear chain of slots, so there are no forks to reason
-/// about — the program cache only ever needs "unknown".
 pub struct SlateForkGraph;
 
 impl ForkGraph for SlateForkGraph {
     fn relationship(&self, a: u64, b: u64) -> BlockRelation {
-        // Replay is a single linear chain: an earlier slot is always an ancestor
-        // of a later one. The program cache needs this to see deployed programs.
+        // Single linear replay chain: earlier slot = ancestor, so the program cache sees deployed programs.
         match a.cmp(&b) {
             std::cmp::Ordering::Less => BlockRelation::Ancestor,
             std::cmp::Ordering::Equal => BlockRelation::Equal,
@@ -80,27 +69,16 @@ impl ForkGraph for SlateForkGraph {
     }
 }
 
-/// Slate's stand-in for the validator's `Bank`: the account source the SVM
-/// reads and writes during replay (it implements the SVM callback). Seeded from
-/// the snapshot footprint (Task 0.4), mutated as each slot's transactions commit,
-/// and the eventual home for sysvar/builtin/epoch-stake setup. Phase 0 holds
-/// accounts in a map; a real range uses a disk-backed store.
+// Slate's stand-in for the validator's Bank: the account source the SVM reads and writes during replay.
 pub struct ReplayBank {
-    /// The account universe: `pubkey -> (account, slot last written)`. In-memory by
-    /// default; a disk-backed store for ranges too big for RAM. See [`store`].
     store: Box<dyn AccountStore>,
-    /// Transaction-committed writes in commit order, for the persistence layer.
-    /// Setup writes (seeds, builtins, sysvars) are deliberately not logged.
+    // Tx-committed writes in commit order; setup writes (seeds/builtins/sysvars) deliberately not logged.
     writes: Vec<WriteRecord>,
-    /// Monotonic counter so same-slot writes to one account order correctly.
+    // Monotonic counter so same-slot writes to one account order correctly.
     write_version: u64,
-    /// While recording a slot (`Some`), the pre-slot value of each account the slot
-    /// writes (`None` = it didn't exist), captured on the first write. This drives the
-    /// lattice-hash roll: mix each changed account out at its old value, in at its new.
+    // Per-slot pre-write account values (None = didn't exist); drives the lattice-hash roll.
     slot_dirty: Option<HashMap<Pubkey, Option<AccountSharedData>>>,
-    /// The bank-hash roll, when active (`Some` for a real backfill, bootstrapped from
-    /// the snapshot manifest). Holds the running lattice + bank hash and advances one
-    /// slot at a time. `None` for tests that don't need forward bank hashes.
+    // Running lattice + bank hash; None for tests that don't need forward bank hashes.
     bankhash_roller: Option<BankHashRoller>,
 }
 
@@ -116,9 +94,6 @@ impl Default for ReplayBank {
     }
 }
 
-/// One transaction-committed account write: the account's state at the slot it
-/// was written, tagged with a monotonic write version. This is what the
-/// persistence layer turns into rows, owner-filtered to the indexed program.
 #[derive(Clone)]
 pub struct WriteRecord {
     pub slot: u64,
@@ -128,8 +103,6 @@ pub struct WriteRecord {
 }
 
 impl ReplayBank {
-    /// A bank backed by an explicit account store (a `DiskStore` for a range too big
-    /// for RAM). `default()` uses the in-memory store.
     pub fn with_store(store: Box<dyn AccountStore>) -> Self {
         Self {
             store,
@@ -140,23 +113,18 @@ impl ReplayBank {
         }
     }
 
-    /// Flush the account store's buffered writes to disk (a no-op for the in-memory
-    /// store). Called at the end of a run so the disk file is complete.
+    // Flush buffered writes to disk (no-op for the in-memory store).
     pub fn flush(&mut self) {
         self.store.flush();
     }
 
-    /// The raw account store behind the bank, for reading the reconstructed end-state
-    /// directly. Unlike [`ReplayBank::get_account_shared_data`] it returns the stored
-    /// value as-is (no zero-lamport filter) — the boundary diff does its own dead-account
-    /// handling when it compares this against the snapshot at the last replayed slot.
+    // Raw store access with no zero-lamport filter (unlike get_account_shared_data); the boundary diff handles dead accounts itself.
     pub fn store(&self) -> &dyn AccountStore {
         self.store.as_ref()
     }
 
     pub fn insert(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
-        // While recording a slot, remember the account's pre-slot value the first time
-        // it's written this slot, so the lattice can mix it out before mixing the new in.
+        // On first write this slot, capture the pre-slot value so the lattice can mix it out before mixing the new in.
         if self.slot_dirty.as_ref().is_some_and(|d| !d.contains_key(&key)) {
             let old = self.store.get(&key).map(|(a, _)| a);
             self.slot_dirty.as_mut().unwrap().insert(key, old);
@@ -164,9 +132,7 @@ impl ReplayBank {
         self.store.put(key, account, slot);
     }
 
-    /// Commit a transaction's write: log it (for persistence) and update the
-    /// account map. Distinct from [`ReplayBank::insert`], which is for setup
-    /// (seeds, builtins, sysvars) that isn't a chain write and mustn't be persisted.
+    // Log the write (for persistence) then apply it; unlike insert, which is for un-persisted setup.
     fn commit_write(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
         self.write_version += 1;
         self.writes.push(WriteRecord {
@@ -178,29 +144,21 @@ impl ReplayBank {
         self.insert(key, account, slot);
     }
 
-    /// The transaction-committed writes captured so far, in commit order. The
-    /// persistence layer owner-filters these to the program being indexed.
     pub fn writes(&self) -> &[WriteRecord] {
         &self.writes
     }
 
-    /// Drain the write log, clearing it. The caller persists what it drains; draining
-    /// per chunk keeps the log from growing with the range length (it holds account
-    /// data, so over tens of thousands of slots it would otherwise blow up RAM).
+    // Drain the write log; per-chunk draining keeps it from growing with range length (it holds account data).
     pub fn take_writes(&mut self) -> Vec<WriteRecord> {
         std::mem::take(&mut self.writes)
     }
 
-    /// Start recording which accounts a slot writes (with their pre-slot values), so
-    /// the lattice hash can be rolled by the slot's changes. Call before configuring
-    /// sysvars and replaying the slot's transactions.
+    // Start recording the accounts a slot writes (with pre-slot values) for the lattice-hash roll.
     pub fn begin_slot(&mut self) {
         self.slot_dirty = Some(HashMap::new());
     }
 
-    /// Take every account written since [`ReplayBank::begin_slot`], as `(pubkey,
-    /// pre-slot value, post-slot value)`; a `None` pre-slot value means the slot
-    /// created the account. Stops recording.
+    // (pubkey, pre-slot value, post-slot value) for accounts written since begin_slot; None pre = slot created it. Stops recording.
     pub fn take_slot_changes(
         &mut self,
     ) -> Vec<(Pubkey, Option<AccountSharedData>, AccountSharedData)> {
@@ -212,20 +170,17 @@ impl ReplayBank {
             .collect()
     }
 
-    /// Start the bank-hash roll from the snapshot manifest's lattice hash and bank hash
-    /// at s_snap. Once set, each replayed slot advances the roll.
+    // Start the bank-hash roll from the snapshot manifest's lattice + bank hash at s_snap.
     pub fn bootstrap_bankhash(&mut self, lt_hash: LtHash, bank_hash: Hash) {
         self.bankhash_roller = Some(BankHashRoller::new(lt_hash, bank_hash));
     }
 
-    /// The last finalized slot's bank hash — what gets prepended into SlotHashes for
-    /// the next slot — or `None` if the roll isn't active.
+    // Last finalized slot's bank hash, prepended into SlotHashes for the next slot; None if the roll isn't active.
     pub fn parent_bank_hash(&self) -> Option<Hash> {
         self.bankhash_roller.as_ref().map(|r| r.bank_hash())
     }
 
-    /// Roll the lattice over this slot's changed accounts and compute the slot's bank
-    /// hash, advancing the roll. `None` (and no-op) if the roll isn't active.
+    // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
     pub fn finalize_slot_bankhash(
         &mut self,
         signature_count: u64,
@@ -237,9 +192,7 @@ impl ReplayBank {
             .map(|r| r.roll_slot(&changes, signature_count, blockhash))
     }
 
-    /// Prepend `(slot, bank_hash)` to the SlotHashes sysvar, exactly as the runtime's
-    /// `update_slot_hashes` does at the start of a slot. `SlotHashes::add` keeps the
-    /// entries newest-first and truncates to the 512-entry maximum.
+    // Prepend (slot, bank_hash) to SlotHashes like the runtime's update_slot_hashes (newest-first, truncated to 512).
     pub fn roll_slot_hashes(&mut self, slot: u64, bank_hash: Hash) {
         let mut slot_hashes = self
             .get_account_shared_data(&SlotHashes::id())
@@ -249,10 +202,7 @@ impl ReplayBank {
         self.set_sysvar_account(SlotHashes::id(), bincode::serialize(&slot_hashes).unwrap());
     }
 
-    /// Register a builtin (native) program: put its loader-owned account in the
-    /// bank and hand its entrypoint to the processor's program cache. Builtins
-    /// (System, the BPF loaders, ...) aren't loaded like normal accounts; the
-    /// processor runs them natively, so they must be registered up front.
+    // Register a builtin: put its loader-owned account in the bank and hand its entrypoint to the processor's program cache.
     pub fn add_builtin(
         &mut self,
         processor: &TransactionBatchProcessor<SlateForkGraph>,
@@ -260,16 +210,7 @@ impl ReplayBank {
         name: &str,
         entry: ProgramCacheEntry,
     ) {
-        // Only synthesize a stub account when the real on-chain one isn't already
-        // present (loaded from the snapshot). The real builtin account's data is
-        // its runtime name — e.g. system program is "solana_system_program" (21
-        // bytes) — which differs from the `solana_builtins` short name
-        // ("system_program", 14 bytes). Overwriting the loaded account with a
-        // name-stub changes its serialized length, and since builtins are passed
-        // as instruction accounts, that shifts every following account in the VM
-        // input region by the size delta (8 bytes here, after BPF u128 alignment).
-        // Programs that persist raw input-region pointers (Neon EVM's holder)
-        // then store shifted pointers, corrupting their state and the bank hash.
+        // Only stub when the real on-chain account is absent: its data is the runtime name (21 bytes for system) vs solana_builtins' short name (14), and overwriting shifts every following VM input-region account by +8 (BPF u128 align), corrupting programs that persist raw pointers (Neon) and the bank hash.
         if !self.store.contains(&program_id) {
             let account = AccountSharedData::from(Account {
                 lamports: 1,
@@ -283,17 +224,10 @@ impl ReplayBank {
         processor.add_builtin(program_id, entry);
     }
 
-    /// Build the sysvars this replay needs and insert them as accounts; the
-    /// processor pulls them into its cache via `fill_missing_sysvar_cache_entries`.
-    /// Skeleton set: Clock (real slot + block time), Rent, EpochSchedule. Harder
-    /// txs will add SlotHashes / StakeHistory.
+    // Build the sysvars this replay needs and insert them as accounts; the processor pulls them in via fill_missing_sysvar_cache_entries.
     pub fn configure_sysvars(&mut self, slot: u64, unix_timestamp: i64) {
         let epoch = slot / 432_000; // mainnet: no warmup
-        // Clock: derive from the snapshot's real Clock — the epoch fields
-        // (epoch, epoch_start_timestamp, leader_schedule_epoch) are constant within an
-        // epoch, so only slot and unix_timestamp advance. Reproducing them exactly is
-        // what the bank-hash roll needs. Fall back to a synthesized Clock when none is
-        // loaded (fixtures/tests that don't seed one).
+        // Derive Clock from the snapshot's real Clock (epoch fields are constant within an epoch; only slot + timestamp advance); synthesize one only for tests.
         let clock = match self
             .get_account_shared_data(&Clock::id())
             .and_then(|(account, _)| bincode::deserialize::<Clock>(account.data()).ok())
@@ -312,9 +246,7 @@ impl ReplayBank {
             },
         };
         self.set_sysvar_account(Clock::id(), bincode::serialize(&clock).unwrap());
-        // Rent / EpochSchedule are constant and seeded from the snapshot; only
-        // synthesize them when absent (tests). Overwriting a loaded value would be a
-        // spurious change in the lattice.
+        // Rent/EpochSchedule are seeded from the snapshot; only synthesize when absent (tests), else it's a spurious lattice change.
         if self.get_account_shared_data(&Rent::id()).is_none() {
             self.set_sysvar_account(Rent::id(), bincode::serialize(&Rent::default()).unwrap());
         }
@@ -324,15 +256,11 @@ impl ReplayBank {
                 bincode::serialize(&EpochSchedule::without_warmup()).unwrap(),
             );
         }
-        // SlotHashes is seeded from the snapshot (real bank hashes) and prepended per
-        // slot by roll_slot_hashes; only default it to empty when absent.
+        // SlotHashes is seeded from the snapshot and prepended per slot by roll_slot_hashes; only default to empty when absent.
         if self.get_account_shared_data(&SlotHashes::id()).is_none() {
             self.set_slot_hashes(&[]);
         }
-        // RecentBlockhashes is seeded from the snapshot and rolled at freeze
-        // (freeze_slot). When absent (tests) fill a 150-entry placeholder: it's
-        // deprecated, but AdvanceNonceAccount errors if it's empty, and its full size
-        // fixes the rent-exempt lamports the oracle checks.
+        // Seeded from the snapshot, rolled at freeze; absent (tests) fill 150 placeholders, AdvanceNonceAccount errors if empty, and full size fixes the rent-exempt lamports the oracle checks.
         #[allow(deprecated)]
         if self
             .get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
@@ -350,13 +278,9 @@ impl ReplayBank {
         }
     }
 
-    /// Apply the account writes the runtime does at slot freeze that the bank-hash
-    /// lattice must include: extend SlotHistory with this slot, and prepend this
-    /// slot's blockhash to RecentBlockhashes. Both roll forward from the snapshot's
-    /// real value. No-op for the sysvars the snapshot didn't supply (tests).
+    // Apply the runtime's freeze-time sysvar writes the lattice must include (SlotHistory + RecentBlockhashes); no-op for sysvars the snapshot didn't supply (tests).
     pub fn freeze_slot(&mut self, slot: u64, blockhash: Hash, fee_reward: Option<(Pubkey, u64)>) {
-        // Leader fee credit: the runtime pays the slot's leader 50% of its fees at
-        // freeze (burning the rest). getBlock's "Fee" reward gives the exact amount.
+        // Leader fee credit: the runtime pays the leader 50% of fees at freeze; getBlock's "Fee" reward is the exact amount.
         if let Some((leader, lamports)) = fee_reward {
             if let Some((mut account, _)) = self.get_account_shared_data(&leader) {
                 account.set_lamports(account.lamports() + lamports);
@@ -385,8 +309,7 @@ impl ReplayBank {
                 .ok()
             })
         {
-            // Newest first, this slot's blockhash prepended, capped at 150 like the
-            // runtime. Mainnet's fee is fixed, so every entry carries 5000.
+            // Newest-first, this slot's blockhash prepended, capped at 150 like the runtime; mainnet fee is fixed 5000.
             let entries: Vec<(Hash, u64)> = std::iter::once((blockhash, 5_000u64))
                 .chain(
                     current
@@ -407,14 +330,7 @@ impl ReplayBank {
         }
     }
 
-    /// The blockhashes currently valid for transaction age: the RecentBlockhashes
-    /// sysvar this bank carries (seeded from the snapshot, rolled at each freeze,
-    /// capped at 150 like the runtime's queue). A transaction whose recent_blockhash
-    /// is in here is a normal one; a transaction whose isn't is either durable-nonce
-    /// (its "blockhash" is really the stored nonce) or too old to land. Mirrors the
-    /// blockhash-queue lookup agave's age check does before falling back to nonces.
-    /// Empty when the sysvar wasn't seeded (test banks), which makes an AdvanceNonce-
-    /// first tx take the nonce path — the behavior callers had before this check.
+    // Valid-age blockhashes (RecentBlockhashes sysvar, capped 150); a tx whose recent_blockhash isn't here is durable-nonce or too old. Empty for test banks.
     pub fn recent_blockhashes(&self) -> std::collections::HashSet<Hash> {
         #[allow(deprecated)]
         self.get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
@@ -428,13 +344,7 @@ impl ReplayBank {
             .unwrap_or_default()
     }
 
-    /// The blockhash an initialized System nonce account currently stores, or `None`
-    /// if `address` isn't one. A durable-nonce transaction's recent_blockhash equals
-    /// this exactly — that's what makes it durable — so comparing against it tells a
-    /// real durable-nonce tx from a normal tx that merely advances its own nonce as an
-    /// ordinary instruction. Exact, unlike the [`Self::recent_blockhashes`] window
-    /// whose 150 entries stop one short of agave's age-150 validity (a normal tx built
-    /// on the oldest-still-valid blockhash looked "not recent" and got mis-routed).
+    // The blockhash an initialized nonce account stores (None if not one). A durable-nonce tx's recent_blockhash equals this exactly, exact, unlike the RecentBlockhashes window that stops one short of agave's age-150 validity and mis-routed normal txs.
     pub fn stored_durable_nonce(&self, address: &Pubkey) -> Option<Hash> {
         let (account, _) = self.get_account_shared_data(address)?;
         if *account.owner() != solana_sdk_ids::system_program::id() {
@@ -449,9 +359,7 @@ impl ReplayBank {
         }
     }
 
-    /// Populate the SlotHashes sysvar from recent `(slot, hash)` pairs (newest
-    /// first, as the runtime keeps them). Vote transactions read it to check the
-    /// slot they vote on is real.
+    // Populate SlotHashes from (slot, hash) pairs (newest-first); vote txs read it to check the voted slot is real.
     pub fn set_slot_hashes(&mut self, entries: &[(u64, Hash)]) {
         self.set_sysvar_account(
             SlotHashes::id(),
@@ -460,11 +368,7 @@ impl ReplayBank {
     }
 
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
-        // On-chain sysvar accounts are rent-exempt for their exact size, so use the
-        // rent-exempt minimum for `data`, not a placeholder. A tx that passes a
-        // sysvar as an account (e.g. a durable-nonce tx passing RecentBlockhashes)
-        // has its balance checked against the chain by the oracle; a wrong balance
-        // would falsely halt the replay.
+        // Sysvar accounts are rent-exempt for their exact size; a wrong balance would fail the oracle's balance check and halt the replay.
         let lamports = Rent::default().minimum_balance(data.len());
         let account = AccountSharedData::from(Account {
             lamports,
@@ -477,19 +381,7 @@ impl ReplayBank {
     }
 }
 
-/// Register the native builtin programs the SVM runs directly (System, Vote, the
-/// BPF loaders, ComputeBudget, loader-v4, the ZK proof programs), straight from
-/// agave's canonical `solana_builtins::BUILTINS` list so the set stays exactly in
-/// sync with the runtime.
-///
-/// Stake, Config, and AddressLookupTable are deliberately absent: they've been
-/// migrated to Core BPF, so they run as ordinary BPF programs loaded from their
-/// on-chain bytecode through the loaders above, not as native builtins. That's
-/// also why no 3.x crate for them exists to register.
-///
-/// Every entry is registered because we run with all features enabled. Once we
-/// compute the exact per-slot feature set, gate on `enable_feature_id` so a
-/// program only counts as a builtin from the slot its feature activated.
+// From agave's canonical BUILTINS so the set stays in sync. Stake/Config/ALT are absent, migrated to Core BPF, so they run as ordinary loaded programs.
 pub fn register_builtins(
     bank: &mut ReplayBank,
     processor: &TransactionBatchProcessor<SlateForkGraph>,
@@ -504,11 +396,7 @@ pub fn register_builtins(
     }
 }
 
-/// A feature account's activation slot: `Some(slot)` when the account is owned by
-/// the feature program and its `Feature { activated_at }` is set, `None` otherwise
-/// (wrong owner, too small, unparsable, or not yet activated). `Feature` is a lone
-/// `Option<u64>` field, so it decodes straight as one; an inactive account's
-/// zero-padded body simply fails to decode as `Some`, which is the answer we want.
+// A feature account's activation slot, or None (wrong owner/too small/unparsable/inactive). Feature is a lone Option<u64>, so it decodes straight as one.
 fn feature_activation(account: &AccountSharedData) -> Option<u64> {
     use solana_account::ReadableAccount;
     // 9 == Feature::size_of() (1-byte Option tag + u64).
@@ -520,12 +408,7 @@ fn feature_activation(account: &AccountSharedData) -> Option<u64> {
         .flatten()
 }
 
-/// Build the feature set active at `slot` from the feature accounts already in
-/// `bank` (seeded from the snapshot), instead of `FeatureSet::all_enabled()`. A
-/// feature counts as active only if its account carries an activation slot at or
-/// before `slot`. This is the exact set the runtime executed against; feature-
-/// gated program behavior (and the derived syscall set) depends on getting it
-/// right, which `all_enabled` doesn't for a historical slot.
+// Build the feature set active at slot from on-chain feature accounts (not all_enabled), the exact set the runtime executed against; feature-gated behavior depends on it.
 pub fn build_feature_set(bank: &ReplayBank, slot: u64) -> FeatureSet {
     let mut feature_set = FeatureSet::default(); // everything inactive to start
     for feature_id in agave_feature_set::FEATURE_NAMES.keys() {
@@ -539,11 +422,7 @@ pub fn build_feature_set(bank: &ReplayBank, slot: u64) -> FeatureSet {
     feature_set
 }
 
-// Precompile verification (ed25519 / secp256k1 / secp256r1) is wired to
-// agave-precompiles, so a tx carrying a precompile instruction is verified rather
-// than failing. Every precompile-enabling feature is active at the epoch-808
-// floor, so all of them count as enabled. Epoch stake stays at the default 0,
-// fine for anything that doesn't touch rewards.
+// Precompile verification wired to agave-precompiles; all precompile features are active at the epoch-808 floor, so all count as enabled.
 impl InvokeContextCallback for ReplayBank {
     fn is_precompile(&self, program_id: &Pubkey) -> bool {
         agave_precompiles::is_precompile(program_id, |_| true)
@@ -566,53 +445,38 @@ impl InvokeContextCallback for ReplayBank {
 
 impl TransactionProcessingCallback for ReplayBank {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, u64)> {
-        // A zero-lamport account is dead: the runtime purges it, so a read returns the
-        // default (empty, system-owned). Keep it in the map so the lattice roll can
-        // still mix it out, but hand reads nothing — otherwise stale bytes on a drained
-        // account make a later System Allocate at that address fail "already in use"
-        // where the chain re-creates it fresh. Mirrors the snapshot loader's
-        // retain(lamports > 0), which drops dead accounts at seed time.
+        // Zero-lamport = dead: hand reads nothing (else stale bytes fail a later System Allocate "already in use"), but keep it in the map so the lattice can mix it out.
         self.store
             .get(pubkey)
             .filter(|(account, _)| account.lamports() > 0)
     }
 }
 
-/// The per-replay SVM harness. Owns the fork graph (the processor only holds a
-/// `Weak` to it, so someone must keep the `Arc` alive) and the transaction
-/// processor. Grows to hold the bank, environment, and config as we wire them.
+// Owns the fork graph, the processor holds only a Weak, so someone must keep the Arc alive.
 pub struct Replayer {
     _fork_graph: Arc<RwLock<SlateForkGraph>>,
     pub processor: TransactionBatchProcessor<SlateForkGraph>,
-    /// Runtime feature set, used to parse each tx's compute-budget limits.
+    // Runtime feature set, used to parse each tx's compute-budget limits.
     feature_set: FeatureSet,
-    /// The SVM view of `feature_set`, held once for the per-batch environment.
+    // SVM view of feature_set, held once for the per-batch environment.
     svm_feature_set: SVMFeatureSet,
 }
 
 impl Replayer {
-    /// The runtime feature set this replayer was built against — the exact per-slot
-    /// set, used to gate compat shims (e.g. re-supplied removed builtins).
+    // The exact per-slot feature set, used to gate compat shims (e.g. re-supplied removed builtins).
     pub fn feature_set(&self) -> &FeatureSet {
         &self.feature_set
     }
 
-    /// Build an execution-ready processor for `slot`/`epoch` with every feature
-    /// enabled. Fine for the fixtures and any builtin-only path; a faithful replay
-    /// of a real slot uses [`Replayer::new_with_feature_set`] with the exact set
-    /// from [`build_feature_set`].
+    // Processor with every feature enabled, fine for fixtures; a faithful replay uses new_with_feature_set.
     pub fn new(slot: u64, epoch: u64) -> Self {
         Self::new_with_feature_set(slot, epoch, FeatureSet::all_enabled())
     }
 
-    /// Build the processor against an explicit `feature_set` — the exact per-slot
-    /// set derived from the on-chain feature accounts. The VM environment's syscall
-    /// set and costs, and the compute-budget parser, both key off it, so feature-
-    /// gated execution matches what ran on chain.
+    // Build against an explicit per-slot feature_set; the VM syscall set/costs and the compute-budget parser key off it.
     pub fn new_with_feature_set(slot: u64, epoch: u64, feature_set: FeatureSet) -> Self {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
-        // The SVM environment takes the derived SVMFeatureSet; the compute-budget
-        // parser takes the runtime FeatureSet. Both are held for reuse per batch.
+        // SVM env takes the derived SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
         let svm_feature_set = feature_set.runtime_features();
         let budget = SVMTransactionExecutionBudget::default();
         let loader = Arc::new(
@@ -634,15 +498,11 @@ impl Replayer {
         }
     }
 
-    /// The per-batch runtime settings the SVM executes against. `blockhash` comes
-    /// from the transaction; `feature_set` is `all_enabled` for the skeleton (the
-    /// real slot-derived set comes later). `epoch_total_stake` defaults to 0,
-    /// fine for anything that doesn't touch stake.
+    // Per-batch runtime settings; epoch_total_stake defaults to 0, fine for anything that doesn't touch stake.
     pub fn environment(&self, blockhash: Hash, epoch: u64) -> TransactionProcessingEnvironment {
         TransactionProcessingEnvironment {
             blockhash,
-            // non-zero so fees aren't disabled; the exact fee comes from the
-            // per-tx check results, not from this field.
+            // non-zero so fees aren't disabled; the exact fee comes from the per-tx check results.
             blockhash_lamports_per_signature: 5_000,
             feature_set: self.svm_feature_set,
             program_runtime_environments_for_execution: self
@@ -656,11 +516,7 @@ impl Replayer {
         }
     }
 
-    /// Execute one sanitized transaction against `bank` and return its processing
-    /// result. `fee` is the block meta's total fee, used to build the pre-validated
-    /// check result the bank's fee validation would otherwise produce. Runs a batch
-    /// of one and hands back the single result. This is the primitive the per-slot
-    /// loop calls for each transaction, in order.
+    // Execute one sanitized tx; fee is the block meta's total, used to build the pre-validated check result.
     pub fn execute(
         &self,
         bank: &ReplayBank,
@@ -672,9 +528,7 @@ impl Replayer {
         self.execute_with(&self.processor, bank, tx, fee, epoch, blockhash)
     }
 
-    /// Like [`Replayer::execute`] but against an explicit `processor`. The per-slot
-    /// loop passes a `new_from` processor so each slot executes against a fresh
-    /// sysvar cache while sharing the program cache and builtins.
+    // Like execute but against an explicit processor (new_from gives a fresh sysvar cache while sharing the program cache/builtins).
     fn execute_with(
         &self,
         processor: &TransactionBatchProcessor<SlateForkGraph>,
@@ -684,16 +538,9 @@ impl Replayer {
         epoch: u64,
         blockhash: Hash,
     ) -> TransactionProcessingResult {
-        // The environment blockhash is the block's, NOT the tx's recent_blockhash.
-        // A durable-nonce tx carries the nonce itself as its recent_blockhash, but
-        // the nonce advances from the blockhash the bank is on at this slot (the
-        // block's previousBlockhash). For non-nonce txs the environment blockhash is
-        // otherwise unobserved, so sourcing it from the block is correct and safe.
+        // Environment blockhash is the block's, not the tx's recent_blockhash, a durable nonce advances from the block's previousBlockhash; non-nonce txs don't observe it.
         let env = self.environment(blockhash, epoch);
-        // Parse the tx's OWN compute-budget instructions for its real CU limit,
-        // price, and loaded-data-size limit — not a default. A tx that exhausts its
-        // requested limit on chain must exhaust it here too. A malformed budget is
-        // rejected on chain, so we fail it here the same way.
+        // Parse the tx's own compute-budget instructions for its real CU limit (not a default), so it exhausts/fails exactly as on chain.
         let check_result = match process_compute_budget_instructions(
             SVMMessage::program_instructions_iter(tx),
             &self.feature_set,
@@ -704,19 +551,7 @@ impl Replayer {
                     FeeDetails::new(fee, 0),
                     true,
                 );
-                // Decide durable-nonce vs normal. A tx whose first instruction is System
-                // AdvanceNonceAccount looks like a durable nonce, but if its
-                // recent_blockhash is a real recent blockhash it's just a normal tx
-                // topping up its own nonce — agave validates that via the blockhash queue
-                // (nonce = None) and the advance runs as an ordinary instruction. It's a
-                // real durable-nonce tx only when the recent_blockhash IS the account's
-                // stored nonce, so we compare against that directly. (Earlier this asked
-                // whether the blockhash was in RecentBlockhashes, but that sysvar holds
-                // 150 entries — ages 0-149 — while agave's age check accepts age 150 too,
-                // so a normal tx built on the oldest-still-valid blockhash got mis-routed
-                // to the nonce path and failed BlockhashNotFound.) On the nonce path the
-                // SVM validates and advances the nonce, and on failure still rolls it back
-                // advanced — which a normal tx's fee-only rollback would not.
+                // Durable-nonce only when recent_blockhash IS the account's stored nonce (compare directly, not via the 150-entry RecentBlockhashes window that's one short of agave's age-150 check and mis-routed normal txs). On the nonce path a failed tx still rolls the nonce forward advanced.
                 let nonce = match tx.get_durable_nonce().copied() {
                     Some(address)
                         if bank.stored_durable_nonce(&address).as_ref()
@@ -730,9 +565,7 @@ impl Replayer {
             }
             Err(err) => Err(err),
         };
-        // Record program logs so a divergence can be diagnosed by comparing the
-        // replay's log stream against the chain's getBlock logMessages. CPI and
-        // return-data recording stay off; only the log stream is needed.
+        // Record program logs to diagnose divergences against getBlock logMessages; CPI/return-data recording stay off.
         let config = TransactionProcessingConfig {
             recording_config: ExecutionRecordingConfig {
                 enable_log_recording: true,
@@ -752,17 +585,12 @@ impl Replayer {
         output.processing_results.remove(0)
     }
 
-    /// Replay every transaction in `block` in order against `bank`, reconciling
-    /// each against the block meta and committing a successful tx's writes back so
-    /// the next tx sees them. Stops at the first transaction it can't replay (a
-    /// v0/lookup-table tx, unsupported for now) or whose result diverges from the
-    /// chain — a divergence leaves the bank unreliable, so continuing is pointless.
-    /// `bank` must already be seeded and have its builtins registered.
+    // Replay every tx in block in order, committing successes so the next tx sees them; stops at the first tx that can't replay or diverges. bank must be seeded with builtins registered.
     pub fn replay_block(&self, bank: &mut ReplayBank, block: &Block, epoch: u64) -> BlockReplay {
         self.replay_block_with(&self.processor, bank, block, epoch)
     }
 
-    /// Replay `block` against an explicit `processor` (see [`Replayer::execute_with`]).
+    // Replay block against an explicit processor (see execute_with).
     fn replay_block_with(
         &self,
         processor: &TransactionBatchProcessor<SlateForkGraph>,
@@ -770,10 +598,7 @@ impl Replayer {
         block: &Block,
         epoch: u64,
     ) -> BlockReplay {
-        // With the bank-hash roll active, record the slot's writes and prepend the
-        // parent's bank hash into SlotHashes (as the runtime's update_slot_hashes does
-        // at slot start), so this slot's txs — including votes, which validate against
-        // SlotHashes — read the real recent history.
+        // With the roll active, record slot writes and prepend the parent's bank hash into SlotHashes (like the runtime) so votes read real recent history.
         let rolling = bank.parent_bank_hash().is_some();
         if rolling {
             bank.begin_slot();
@@ -799,13 +624,7 @@ impl Replayer {
                 epoch,
                 block.previous_blockhash,
             );
-            // SIMD-0162 compat. The solana-svm 3.1.x Slate runs on removed the runtime's
-            // "an instruction may not modify an executable account" checks for good (the
-            // feature is code-complete, not gated). That's right for current mainnet but
-            // wrong for a slot before the feature activated, where the chain still enforced
-            // them — so we re-supply the check here. A tx that changed a pre-existing
-            // executable account failed on chain (ExecutableLamportChange); mark ours failed
-            // too, and reconcile + commit roll it back to fees-only, matching the chain.
+            // SIMD-0162 compat: the 3.1.x SVM permanently dropped the "no modifying an executable account" check, but slots before the feature activated still enforced it, re-supply it, marking the tx failed (ExecutableLamportChange) so commit rolls it back to fees-only.
             if !self
                 .feature_set
                 .is_active(&agave_feature_set::remove_accounts_executable_flag_checks::id())
@@ -832,9 +651,7 @@ impl Replayer {
             commit_writes(bank, &tx, &result, block.slot);
         }
 
-        // Apply the runtime's freeze-time sysvar writes (SlotHistory, RecentBlockhashes),
-        // then roll the lattice over everything this slot wrote and compute the slot's
-        // bank hash; it becomes the parent for the next slot's SlotHashes prepend.
+        // Apply freeze-time sysvar writes, then roll the lattice and compute this slot's bank hash (parent for the next slot's SlotHashes prepend).
         if rolling {
             bank.freeze_slot(block.slot, block.blockhash, block.fee_reward);
             let signature_count = block
@@ -850,24 +667,9 @@ impl Replayer {
         BlockReplay::complete(block.transactions.len())
     }
 
-    /// Replay a contiguous range of blocks in slot order against one `bank`, which
-    /// rolls forward from block to block (each block's committed writes are visible
-    /// to the next). Each block gets a fresh per-slot processor via `new_from`, so
-    /// the sysvar cache (Clock, etc.) advances with the slot while the program cache
-    /// and builtins carry over — programs aren't reloaded every slot. Stops at the
-    /// first block that doesn't fully replay and reports where.
-    ///
-    /// Intra-epoch only: crossing an epoch boundary needs feature-activation and
-    /// reward machinery that isn't built yet, and the feature set is fixed at
-    /// construction. `bank` must already be seeded with builtins registered.
+    // Replay a contiguous range in slot order against one bank that rolls forward; each block gets a fresh per-slot processor (new_from) sharing the program cache. Intra-epoch only, crossing an epoch needs machinery not built yet.
     pub fn replay_range(&self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
-        // Self-verify against consensus as we go. A validator vote carries the bank
-        // hash of the slot it votes on, so votes in later blocks confirm earlier
-        // slots' computed hashes. `computed` holds our hashes awaiting a vote (with
-        // the block index, so a mismatch can stop coverage at the last good slot);
-        // `confirmed` holds votes awaiting their slot. Each slot reconciles once, so
-        // both stay bounded to the ~30-slot vote lag. A mismatch means our state
-        // diverged from what a supermajority of stake agreed on: halt.
+        // Self-verify against consensus: a vote carries the voted slot's bank hash, so later votes confirm earlier computed hashes. computed/confirmed pair them up (bounded to the ~30-slot vote lag); a mismatch means we diverged from a stake supermajority, halt.
         let first_slot = blocks.first().map_or(0, |b| b.slot);
         let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
         let mut confirmed: HashMap<u64, Hash> = HashMap::new();
@@ -896,7 +698,6 @@ impl Replayer {
                 }
             }
 
-            // Replay the slot.
             let epoch = block.slot / 432_000;
             let processor = self.processor.new_from(block.slot, epoch);
             let block_replay = self.replay_block_with(&processor, bank, block, epoch);
@@ -927,8 +728,7 @@ impl Replayer {
             }
         }
 
-        // The tail (~30 slots) can't be confirmed here: their votes fall past the
-        // range end, so they're reported unverified, not wrong.
+        // The tail (~30 slots) can't be confirmed here, their votes fall past the range end, so they're unverified, not wrong.
         let mut unconfirmed: Vec<u64> = computed.keys().copied().collect();
         unconfirmed.sort_unstable();
         if unconfirmed.is_empty() {
@@ -940,8 +740,7 @@ impl Replayer {
             );
         }
 
-        // Commit any buffered writes so the disk store's file is complete (no-op for
-        // the in-memory store).
+        // Flush buffered writes so the disk store's file is complete (no-op for the in-memory store).
         bank.flush();
 
         RangeReplay {
@@ -951,27 +750,7 @@ impl Replayer {
     }
 }
 
-/// Apply a processed transaction's account changes back into the bank so later
-/// transactions in the same block see them, mirroring how agave commits a batch
-/// (`update_accounts_for_executed_tx`):
-///
-/// - **Executed + successful:** write back only the accounts the tx could have
-///   modified — the writable ones. A read-only account can't change, so
-///   re-storing it would fabricate a write at this slot.
-/// - **Executed but failed:** every state change rolls back except the fee charge
-///   and any advanced nonce, so commit just those rollback accounts. Without this
-///   the payer's fee deduction is lost and the next tx's payer balance no longer
-///   lines up.
-/// - **Fees-only (loaded but not executed):** the fee payer was still charged, so
-///   commit its rollback too.
-/// - **Not processed:** nothing hit the chain, so nothing to commit.
-/// Re-supply SIMD-0162's removed check: an instruction may not change an executable
-/// account's lamports, data, or owner. Scans a successful tx's post-state for a writable
-/// account that was *already* executable and came out changed — exactly what the chain
-/// rejected before the feature activated. Returns its index in the tx's account list, or
-/// `None` if the tx touched no executable account (the common case, so the scan is cheap:
-/// executable accounts are rarely writable). A freshly created account (no pre-state) is
-/// skipped — a program deploy sets executable legitimately and isn't this violation.
+// Re-supply SIMD-0162's removed check: flag a writable account that was already executable and came out changed (returns its index); skips freshly created accounts (a legit program deploy).
 fn executable_modification(
     bank: &ReplayBank,
     message: &impl SVMMessage,
@@ -998,6 +777,7 @@ fn executable_modification(
     None
 }
 
+// Commit a tx's account changes so later txs see them: success writes back only writable accounts; failed/fees-only commit just the fee-payer + advanced-nonce rollback.
 fn commit_writes(
     bank: &mut ReplayBank,
     message: &impl SVMMessage,
@@ -1023,23 +803,19 @@ fn commit_writes(
     }
 }
 
-/// Write a failed / fees-only tx's rollback accounts — the charged fee payer, plus
-/// an advanced nonce if the tx used one — back into the bank.
+// Write a failed/fees-only tx's rollback accounts (charged fee payer + advanced nonce) back into the bank.
 fn commit_rollback(bank: &mut ReplayBank, rollback: &RollbackAccounts, slot: u64) {
     for (address, account) in rollback {
         bank.commit_write(*address, account.clone(), slot);
     }
 }
 
-/// The outcome of replaying a block: how many transactions committed cleanly, and
-/// where it stopped if it didn't finish.
 #[derive(Debug)]
 pub struct BlockReplay {
     pub replayed: usize,
     pub halt: Option<Halt>,
 }
 
-/// Where and why a block replay stopped early.
 #[derive(Debug)]
 pub struct Halt {
     pub tx_index: usize,
@@ -1061,14 +837,11 @@ impl BlockReplay {
         }
     }
 
-    /// Whether the whole block replayed and reconciled.
     pub fn is_complete(&self) -> bool {
         self.halt.is_none()
     }
 }
 
-/// The outcome of replaying a range of blocks: how many completed, and where it
-/// stopped if a block diverged — the slot plus that block's [`BlockReplay`].
 #[derive(Debug)]
 pub struct RangeReplay {
     pub blocks_completed: usize,
@@ -1076,7 +849,6 @@ pub struct RangeReplay {
 }
 
 impl RangeReplay {
-    /// Whether every block in the range replayed and reconciled.
     pub fn is_complete(&self) -> bool {
         self.halt.is_none()
     }
@@ -1122,8 +894,7 @@ mod tests {
             assert!(acct.executable(), "{} should be executable", builtin.name);
             assert_eq!(*acct.owner(), solana_sdk_ids::native_loader::id());
         }
-        // Vote and loader-v4 specifically — loader-v4 was missing from the old
-        // hand-written set, so this pins the expansion.
+        // Vote and loader-v4 specifically, loader-v4 was missing from the old hand-written set, so this pins the expansion.
         assert!(
             bank.get_account_shared_data(&solana_sdk_ids::vote::id())
                 .is_some()
@@ -1154,13 +925,7 @@ mod tests {
         use solana_account::ReadableAccount;
         let system = solana_sdk_ids::system_program::id();
 
-        // The real on-chain system_program account carries its runtime name
-        // "solana_system_program" (21 bytes) as data — that's what a snapshot
-        // footprint loads. `solana_builtins` knows it by the short name
-        // "system_program" (14 bytes). If register_builtins stubbed over the
-        // loaded account, its serialized length would drop by 8 (after BPF u128
-        // alignment) and every following instruction account would shift in the
-        // VM input region — the slot-030 +8 pointer bug.
+        // Real system_program data is the 21-byte runtime name "solana_system_program"; solana_builtins' 14-byte short name would shrink it by 8 (BPF u128 align) and shift following input-region accounts, the slot-030 +8 pointer bug.
         let mut bank = ReplayBank::default();
         bank.insert(
             system,
@@ -1261,14 +1026,12 @@ mod tests {
 
         let epoch = fixture::SLOT / 432_000;
 
-        // --- assemble every input ---
         let mut bank = fixture::seed_bank();
         let replayer = Replayer::new(fixture::SLOT, epoch);
         register_builtins(&mut bank, &replayer.processor);
         bank.configure_sysvars(fixture::SLOT, fixture::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
-        // --- run it ---
         let result = replayer.execute(
             &bank,
             &fixture::sanitized_transaction(),
@@ -1277,7 +1040,6 @@ mod tests {
             Hash::default(),
         );
 
-        // --- reconcile against the getBlock oracle ---
         let executed = match &result {
             Ok(ProcessedTransaction::Executed(e)) => e,
             other => panic!("expected an executed transaction, got {other:?}"),
@@ -1410,9 +1172,7 @@ mod tests {
                 .find_map(|(k, a)| (k == pk).then(|| a.lamports()))
                 .unwrap()
         };
-        // The proof that matters: account state reconstructs bit-exact *through*
-        // the CPI. The program did an inner System::transfer and every balance
-        // lands on the on-chain value. State is the only thing Slate serves.
+        // The proof that matters: state reconstructs bit-exact through the CPI (inner System::transfer), and state is all Slate serves.
         assert_eq!(
             lamports(&fixture::cpi::PAYER.parse().unwrap()),
             fixture::cpi::PAYER_POST,
@@ -1433,12 +1193,7 @@ mod tests {
             fixture::cpi::FEE,
             "fee"
         );
-        // Compute units do NOT reconcile here: replay charges 11_451 vs chain's
-        // 11_343 (~1%). Unlike the transfer/memo fixtures (bit-exact CU), this CPI
-        // path touches a cost that `all_enabled()` accounts differently than the
-        // exact feature set live at this epoch. It's a CU-accounting gap, not a
-        // state error (balances above are exact). Guarding our own number so any
-        // drift surfaces; exact-CU is a Phase-1 feature-set task.
+        // CU does NOT reconcile here (replay 11_451 vs chain 11_343, ~1%): all_enabled() accounts a CPI cost differently than the exact per-epoch feature set. A CU-accounting gap, not a state error; we guard our number so drift surfaces.
         assert_eq!(
             executed.execution_details.executed_units,
             11_451,
@@ -1467,8 +1222,7 @@ mod tests {
         );
         assert_eq!(outcome.replayed, 1);
 
-        // The commit landed in the bank: the CPI recipient now holds its post
-        // balance, so a following tx in the same block would read it.
+        // The commit landed: the CPI recipient holds its post balance, so a following tx would read it.
         let (recipient, _) = bank
             .get_account_shared_data(&fixture::cpi::WALLET2.parse().unwrap())
             .expect("recipient present after commit");
@@ -1530,8 +1284,7 @@ mod tests {
             post_token_balances: vec![],
         };
 
-        // src -> mid, then mid -> dst. mid's pre-balance in tx2 only lines up if
-        // tx1 committed first, so this exercises the tx-to-tx commit chaining.
+        // src -> mid then mid -> dst: tx2's pre-balance only lines up if tx1 committed first, exercising tx-to-tx chaining.
         let block = block::Block {
             slot,
             parent_slot: slot - 1,
@@ -1566,11 +1319,7 @@ mod tests {
 
     #[test]
     fn re_supplies_the_executable_account_check() {
-        // SIMD-0162 compat. The 3.1.x SVM lets a transfer to an executable account
-        // succeed — the runtime check was removed. Before the feature activated the chain
-        // rejected it (ExecutableLamportChange). `executable_modification` re-supplies the
-        // check: a writable account that was already executable and came out of the tx
-        // changed is the violation.
+        // SIMD-0162 compat: the 3.1.x SVM lets a transfer to an executable account succeed, but pre-activation the chain rejected it (ExecutableLamportChange); executable_modification re-supplies that check.
         use solana_instruction::{AccountMeta, Instruction};
         use solana_message::{Message, VersionedMessage};
         use solana_signature::Signature;
@@ -1588,8 +1337,7 @@ mod tests {
         pre_prog.set_executable(true);
         bank.insert(program, pre_prog.clone(), 100);
 
-        // transfer(payer -> program): compiled account order is [payer (writable signer),
-        // program (writable), system_program (readonly)].
+        // transfer(payer -> program): account order is [payer (writable signer), program (writable), system (readonly)].
         let mut data = vec![2u8, 0, 0, 0]; // SystemInstruction::Transfer discriminant
         data.extend_from_slice(&500_000u64.to_le_bytes());
         let ix = Instruction {
@@ -1605,8 +1353,7 @@ mod tests {
         let tx = sanitize(&vtx, &block::LoadedAddresses::default()).unwrap();
 
         let system_acct = AccountSharedData::new(1, 0, &loader);
-        // Post-state where the transfer landed: `program` gained lamports — the violation,
-        // at its account index (1).
+        // Post-state where the transfer landed: program gained lamports, the violation, at account index 1.
         let mut post_prog = pre_prog.clone();
         post_prog.set_lamports(1_500_000);
         let changed = vec![
@@ -1620,7 +1367,7 @@ mod tests {
             "a write to an existing executable account is flagged"
         );
 
-        // Control: the executable account is untouched — nothing to flag.
+        // Control: the executable account is untouched, nothing to flag.
         let untouched = vec![
             (payer, AccountSharedData::new(4_495_000, 0, &system)),
             (program, pre_prog.clone()),
@@ -1632,7 +1379,7 @@ mod tests {
             "an unchanged executable account is fine"
         );
 
-        // Control: same change, but the account was never executable — allowed.
+        // Control: same change, but the account was never executable, allowed.
         bank.insert(program, AccountSharedData::new(1_000_000, 0, &system), 100);
         assert_eq!(
             executable_modification(&bank, &tx, &changed),
@@ -1735,8 +1482,7 @@ mod tests {
         let replayer = Replayer::new(slot, epoch);
         register_builtins(&mut bank, &replayer.processor);
 
-        // Transfer ten times what the payer holds: it loads and executes, then
-        // fails on insufficient funds. The fee is charged; the transfer rolls back.
+        // Transfer 10x the payer's balance: loads and executes, then fails on insufficient funds, fee charged, transfer rolled back.
         let mut data = vec![2u8, 0, 0, 0]; // System Transfer (4-byte disc)
         data.extend_from_slice(&(start * 10).to_le_bytes());
         let ix = Instruction {
@@ -1756,7 +1502,7 @@ mod tests {
 
         let result = replayer.execute(&bank, &tx, fee, epoch, Hash::default());
 
-        // Executed but not successful — the branch that used to commit nothing.
+        // Executed but not successful, the branch that used to commit nothing.
         assert!(
             matches!(&result, Ok(ProcessedTransaction::Executed(e)) if !e.was_successful()),
             "over-transfer should execute then fail, got {result:?}"
@@ -1775,7 +1521,7 @@ mod tests {
         );
         assert!(
             bank.get_account_shared_data(&dst).is_none(),
-            "recipient must not exist — the transfer rolled back"
+            "recipient must not exist, the transfer rolled back"
         );
     }
 
@@ -1831,14 +1577,11 @@ mod tests {
         );
         let replayer = Replayer::new(slot, epoch);
         register_builtins(&mut bank, &replayer.processor);
-        // AdvanceNonceAccount reads RecentBlockhashes from the sysvar cache, so it
-        // has to be configured and pulled in before the tx runs.
+        // AdvanceNonceAccount reads RecentBlockhashes from the sysvar cache, so configure + pull it in first.
         bank.configure_sysvars(slot, 1_700_000_000);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
-        // Durable-nonce tx: advance the nonce, then over-transfer so the tx fails.
-        // Its recent_blockhash IS the stored nonce, which is how a durable-nonce tx
-        // is formed and how the runtime rolls the advanced nonce forward on failure.
+        // Durable-nonce tx: advance the nonce then over-transfer so it fails. recent_blockhash IS the stored nonce, that's what makes it durable.
         let advance = Instruction {
             program_id: system,
             accounts: vec![
@@ -1866,9 +1609,7 @@ mod tests {
         )
         .unwrap();
 
-        // The block's blockhash — what a durable nonce advances FROM. Deliberately
-        // different from the tx's recent_blockhash (the nonce) so the test proves
-        // the advance uses the block's blockhash, not the tx's.
+        // Block blockhash, what a durable nonce advances FROM; deliberately different from the tx's nonce so the test proves the advance uses the block's.
         let block_blockhash = Hash::new_from_array([7u8; 32]);
         let result = replayer.execute(&bank, &tx, fee, epoch, block_blockhash);
         assert!(
@@ -1878,8 +1619,7 @@ mod tests {
 
         commit_writes(&mut bank, &tx, &result, slot);
 
-        // The payoff: the transfer failed, but the nonce still advanced (a regular
-        // failed tx leaves it untouched), and the fee payer was charged.
+        // The payoff: transfer failed but the nonce still advanced (a regular failed tx wouldn't), and the fee payer was charged.
         let (nonce_acct, _) = bank
             .get_account_shared_data(&nonce_key)
             .expect("nonce account present");
@@ -1902,13 +1642,7 @@ mod tests {
 
     #[test]
     fn a_normal_tx_topping_up_its_own_nonce_is_not_durable() {
-        // Gap-#2 regression. A tx whose first instruction is AdvanceNonceAccount but
-        // whose recent_blockhash is a REAL blockhash (not the stored nonce) is a normal
-        // tx, so on failure the nonce rolls back with everything else — unlike a durable
-        // one, which keeps the advance. The old check asked "is recent_blockhash in the
-        // 150-entry RecentBlockhashes set?" and mis-routed this to the nonce path when
-        // the blockhash sat one slot past that window (agave accepts age 150; the sysvar
-        // holds only ages 0-149). We now compare against the account's stored nonce.
+        // Gap-#2 regression: an AdvanceNonce tx whose recent_blockhash is a REAL blockhash (not the stored nonce) is normal, so a failure rolls the nonce back. The old 150-entry RecentBlockhashes check mis-routed it (agave accepts age 150; the sysvar holds only 0-149); we now compare the stored nonce.
         use solana_account::ReadableAccount;
         use solana_instruction::{AccountMeta, Instruction};
         use solana_message::{Message, VersionedMessage};
@@ -1999,8 +1733,7 @@ mod tests {
         );
         commit_writes(&mut bank, &tx, &result, slot);
 
-        // Normal-path payoff: the nonce did NOT advance (a durable tx would have kept
-        // it), and only the fee was charged.
+        // Normal-path payoff: the nonce did NOT advance (a durable tx would keep it), and only the fee was charged.
         let (nonce_acct, _) = bank
             .get_account_shared_data(&nonce_key)
             .expect("nonce account present");
@@ -2068,8 +1801,7 @@ mod tests {
             result
         };
 
-        // Tx1: create the account and let the Vote program initialize its state,
-        // so we never hand-build a VoteState.
+        // Tx1: create the account and let the Vote program initialize its state (never hand-build a VoteState).
         let vote_init = VoteInit {
             node_pubkey: identity,
             authorized_voter: identity,
@@ -2089,10 +1821,7 @@ mod tests {
             "create + initialize should succeed (proves the Vote builtin runs): {r1:?}"
         );
 
-        // Tx2: vote for `voted_slot` via TowerSync (what mainnet uses; the legacy
-        // Vote instruction is deprecated under the current feature set). The program
-        // reads SlotHashes from the sysvar cache to check the slot is real, so this
-        // only passes because we seeded SlotHashes with (voted_slot, voted_hash).
+        // Tx2: vote via TowerSync (mainnet's path; legacy Vote is deprecated now). The program reads SlotHashes to check the slot is real, so this passes only because we seeded (voted_slot, voted_hash).
         let vote_ix = tower_sync(
             &vote_pubkey,
             &identity,
@@ -2123,8 +1852,7 @@ mod tests {
         let a2 = 1_000_000u64;
         let base_slot = 300u64;
 
-        // A one-transfer block plus the meta the oracle reconciles against
-        // (account order is [from, to, system]).
+        // A one-transfer block plus the meta the oracle reconciles against (account order [from, to, system]).
         let transfer_block = |from: Pubkey, to: Pubkey, amount: u64, from_pre: u64, slot: u64| {
             let mut data = vec![2u8, 0, 0, 0]; // System Transfer
             data.extend_from_slice(&amount.to_le_bytes());
@@ -2178,8 +1906,7 @@ mod tests {
         let replayer = Replayer::new(base_slot, base_slot / 432_000);
         register_builtins(&mut bank, &replayer.processor);
 
-        // Block N: src -> mid. Block N+1: mid -> dst, which only reconciles if
-        // block N's write to `mid` rolled forward into the next slot.
+        // Block N: src -> mid; block N+1: mid -> dst, which only reconciles if block N's write to mid rolled forward.
         let blocks = [
             transfer_block(src, mid, a1, src_pre, base_slot),
             transfer_block(mid, dst, a2, a1, base_slot + 1),
@@ -2213,8 +1940,7 @@ mod tests {
         assert!(bank.is_precompile(&ed25519));
         assert!(!bank.is_precompile(&Pubkey::new_unique()));
 
-        // A valid ed25519 signature over a message, built into a self-contained
-        // precompile instruction, verifies through process_precompile.
+        // A valid ed25519 signature in a self-contained precompile instruction verifies through process_precompile.
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let message = b"slate precompile test";
         let signature = signing_key.sign(message).to_bytes();

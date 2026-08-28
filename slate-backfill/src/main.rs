@@ -1,14 +1,3 @@
-//! slate-backfill: reconstruct one program's historical account state.
-//!
-//! Given a full snapshot and a slot range, replay every block in the range
-//! through the SVM (seeded from the snapshot) and write the program's per-slot
-//! account history into ClickHouse. This is the one-command entry point over the
-//! `slate_replay::backfill` engine.
-//!
-//! `--dry-run` skips the snapshot and execution: it fetches, parses, and
-//! sanitizes the range and reports what it looks like, so a target range can be
-//! validated before committing to a large snapshot download.
-
 use std::{fs::File, io::Read, str::FromStr, sync::Arc};
 
 use anyhow::Context;
@@ -53,7 +42,7 @@ struct Args {
     /// Account store: `memory` (RAM, small ranges) or `disk` (redb, large ranges).
     #[arg(long, default_value = "memory")]
     store: String,
-    /// Disk store's redb page-cache size in bytes — its whole RAM budget. Default 8 GiB.
+    /// Disk store's redb page-cache size in bytes, its whole RAM budget. Default 8 GiB.
     #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
     cache_size: usize,
     /// Path for the disk store's redb file.
@@ -64,7 +53,7 @@ struct Args {
     #[arg(long, default_value_t = 2000)]
     chunk_slots: usize,
     /// After replaying, diff the reconstructed end-state against this snapshot (the real
-    /// snapshot at --to) byte-for-byte over the footprint — the data-fidelity proof the
+    /// snapshot at --to) byte-for-byte over the footprint, the data-fidelity proof the
     /// per-tx oracle can't give. Optional; verification only, logs and never gates the run.
     #[arg(long)]
     verify_boundary: Option<String>,
@@ -77,9 +66,7 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Preflight: fail fast on cheap local checks and unreachable services before
-    // fetching a single block, so a typo or a down dependency costs seconds rather
-    // than an hour into a run.
+    // Preflight: fail fast on cheap local checks before fetching a single block.
     if args.from >= args.to {
         anyhow::bail!(
             "--from ({}) must be below --to ({}); the range (from, to] would be empty",
@@ -101,8 +88,7 @@ fn main() -> anyhow::Result<()> {
         return dry_run_report(&blocks);
     }
 
-    // A real run validates the program, snapshot, config, and ClickHouse before the
-    // expensive fetch, so none of them can fail an hour in.
+    // Validate program, snapshot, config, and ClickHouse before the expensive fetch.
     let program_str = args
         .program
         .as_ref()
@@ -118,9 +104,7 @@ fn main() -> anyhow::Result<()> {
     check_clickhouse(&cfg.clickhouse.url)?;
     println!("preflight ok: RPC, program, snapshot, config, and ClickHouse all check out");
 
-    // Bootstrap the bank-hash roll from the snapshot manifest — the lattice hash and
-    // bank hash at s_snap — so SlotHashes rolls forward with real bank hashes and the
-    // programs that read it (and votes) reconcile past the first block.
+    // Bootstrap the bank-hash roll from the manifest (lattice + bank hash at s_snap) so SlotHashes rolls real hashes.
     let manifest = read_manifest_hashes(
         File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?,
         args.from,
@@ -146,7 +130,7 @@ fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("--store must be `memory` or `disk`, got `{other}`"),
     };
 
-    // Seed, replay, and persist. This part is async because the store writes are.
+    // Seed, replay, persist; async because the store writes are.
     tokio::runtime::Runtime::new()?.block_on(async {
         let store = ClickHouseClient::with_config(
             &cfg.clickhouse.url,
@@ -154,9 +138,7 @@ fn main() -> anyhow::Result<()> {
             &cfg.clickhouse.user,
             &cfg.clickhouse.password,
         );
-        // Stream blocks from the RPC-backed source (a local yellowstone-faithful in
-        // production, or any getBlock provider). The trait is the seam — Jetstreamer or
-        // direct CAR reads drop in here without touching backfill.
+        // RPC-backed source; the trait is the seam, other providers drop in without touching backfill.
         let source: Arc<dyn BlockSource> =
             Arc::new(RpcBlockSource::new(&args.rpc).with_concurrency(args.fetch_concurrency));
         // Optional byte-exact end-state check against the snapshot at --to.
@@ -198,8 +180,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        // Boundary verdict: the byte-exact fidelity proof. Loud pass, and a hard failure
-        // (non-zero exit) on any mismatch so a silent data divergence can't slip through.
+        // Boundary verdict: hard failure (non-zero exit) on any mismatch so a divergence can't slip through silently.
         if let Some(diff) = &result.boundary {
             println!("{}", diff.summary());
             for m in diff.mismatches.iter().take(20) {
@@ -207,7 +188,7 @@ fn main() -> anyhow::Result<()> {
             }
             if !diff.is_exact() {
                 anyhow::bail!(
-                    "boundary diff: {} mismatch(es) — reconstructed end-state is NOT byte-exact vs the snapshot at --to",
+                    "boundary diff: {} mismatch(es); reconstructed end-state is NOT byte-exact vs the snapshot at --to",
                     diff.mismatches.len()
                 );
             }
@@ -217,8 +198,7 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-/// Fetch every confirmed block in `(from, to]`. Blocking, so it must run before
-/// any tokio runtime exists (`fetch_block` panics nested inside one).
+// Fetch confirmed blocks in (from, to]; blocking, so it must run before any tokio runtime (fetch_block panics nested).
 fn fetch_range(args: &Args) -> anyhow::Result<Vec<Block>> {
     let slots = fetch_confirmed_slots(&args.rpc, args.from + 1, args.to)?;
     println!(
@@ -233,8 +213,7 @@ fn fetch_range(args: &Args) -> anyhow::Result<Vec<Block>> {
         .collect()
 }
 
-/// Confirm the snapshot exists and starts with the zstd frame magic, so a wrong
-/// path or a non-`.tar.zst` file fails now instead of deep in the loader.
+// Check the snapshot exists and has the zstd magic, so a wrong path fails now, not deep in the loader.
 fn check_snapshot_file(path: &str) -> anyhow::Result<()> {
     let mut file = File::open(path).with_context(|| format!("cannot open snapshot {path}"))?;
     let mut magic = [0u8; 4];
@@ -247,8 +226,7 @@ fn check_snapshot_file(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Probe ClickHouse's HTTP `/ping` endpoint so a down or misconfigured store
-/// fails before the range is fetched and replayed.
+// Ping ClickHouse so a down store fails before the range is fetched.
 fn check_clickhouse(url: &str) -> anyhow::Result<()> {
     let ping = format!("{}/ping", url.trim_end_matches('/'));
     reqwest::blocking::get(&ping)
@@ -258,10 +236,7 @@ fn check_clickhouse(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Report what the fetched range looks like and whether every transaction
-/// sanitizes, without a snapshot or any execution. This exercises the whole
-/// pre-execution path (getBlock parse + v0/ALT resolution + sanitize) on real
-/// blocks, so a range that would halt the real run shows up here first.
+// Report the range and whether every tx sanitizes, no snapshot/execution; a range that would halt shows up here first.
 fn dry_run_report(blocks: &[Block]) -> anyhow::Result<()> {
     let mut total = 0usize;
     let (mut v0_alt, mut failed, mut token) = (0usize, 0usize, 0usize);
