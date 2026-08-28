@@ -54,7 +54,8 @@ struct Args {
     chunk_slots: usize,
     /// After replaying, diff the reconstructed end-state against this snapshot (the real
     /// snapshot at --to) byte-for-byte over the footprint, the data-fidelity proof the
-    /// per-tx oracle can't give. Optional; verification only, logs and never gates the run.
+    /// per-tx oracle can't give. Optional. Prints the diff and exits non-zero if the
+    /// end-state isn't byte-exact, so a silent divergence can't pass.
     #[arg(long)]
     verify_boundary: Option<String>,
     /// How many blocks to fetch concurrently. 1 (serial) suits a rate-limited RPC like
