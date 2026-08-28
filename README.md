@@ -12,7 +12,7 @@ Slate is open source and self-hostable. You run it, point it at the program you 
 
 ## Status
 
-v1. Proven end to end on devnet: live capture, as-of-slot reads, and a differential check against an independent RPC. It has not been validated at mainnet scale yet. See [Roadmap](#roadmap) for what's next.
+v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale. Backfill is new: a mainnet run vote-verified 21,963 consecutive slots bit-exact against consensus. Its fidelity has a long tail still being closed, so the replay records coverage up to the last verified slot and never guesses. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -23,6 +23,8 @@ Slate needs a complete starting point, then everything that changes after it.
 3. **Coverage.** It records the contiguous slot ranges it has actually captured. If the stream drops and reconnects, the hole is recorded, not papered over.
 
 Every read carries a fidelity flag. `Exact` means the answer sits inside a captured range. `Uncertain` means the query is below the floor or across a gap, so Slate still returns its best answer but tells you it can't vouch for it. It won't silently hand back stale or guessed state.
+
+That's the live path. Backfill is the other way to fill history: instead of streaming forward, it replays a past slot range through the SVM (seeded from a snapshot, pulling blocks from an archive) and writes the same per-slot history. Use it for slots before you started, or a program you weren't watching. See [Backfill](#backfill).
 
 ```mermaid
 flowchart LR
@@ -37,6 +39,7 @@ flowchart LR
 
 - Capture live account writes from any Yellowstone gRPC endpoint, finalized commitment.
 - Bootstrap from a `getProgramAccounts` baseline or a full snapshot file.
+- Backfill past slots by replaying them through the SVM, seeded from a snapshot and self-verified against on-chain consensus.
 - Standard Solana JSON-RPC, every method takes an as-of slot.
 - Honest coverage: a fidelity flag on every response, recorded gaps on reconnect.
 - Keyset pagination for large program scans.
@@ -48,11 +51,11 @@ The account methods take the pubkey(s) plus a config object. `asOfSlot` is optio
 
 | Method | Params | Returns |
 | --- | --- | --- |
-| `getAccountInfo` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value }` — the account (base64) or `null`. |
+| `getAccountInfo` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value }`. The account as base64, or `null`. |
 | `getProgramAccounts` | `programId, { asOfSlot?, limit?, cursor? }` | `{ context: { slot, fidelity, nextCursor? }, value: [{ pubkey, account }] }`. Pass `limit` for keyset pagination and thread `nextCursor` until it's `null`. `cursor` is only applied with `limit`. |
 | `getBalance` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value: lamports }`. |
-| `getMultipleAccounts` | `pubkeys[], { asOfSlot? }` | `{ context: { slot, fidelities }, value: [...] }` — accounts in order, `null` per missing, one fidelity per position. |
-| `getCoverage` | none | `{ segments: [{ firstSlot, lastSlot }] }` — captured slot ranges, ascending; gaps are the space between segments. |
+| `getMultipleAccounts` | `pubkeys[], { asOfSlot? }` | `{ context: { slot, fidelities }, value: [...] }`. Accounts in order, `null` per missing, one fidelity per position. |
+| `getCoverage` | none | `{ segments: [{ firstSlot, lastSlot }] }`. Captured slot ranges, ascending; gaps are the space between segments. |
 | `getFirstAvailableSlot` | none | The earliest captured slot (number), or error `-32000` when nothing is captured yet. |
 
 **Fidelity.** Every account read carries `context.fidelity`. `exact` means the answer sits inside a captured range; `uncertain` means it's below the floor or across a gap, so Slate still returns its best answer but flags that it can't vouch for it. New values may be added later, so treat anything you don't recognize as `uncertain`.
@@ -94,6 +97,53 @@ curl -s localhost:8899 -X POST -H 'content-type: application/json' \
 
 The response's `context.fidelity` tells you whether Slate can vouch for that slot.
 
+## Backfill
+
+Live capture only covers slots from when you started. Backfill fills the past: it replays a slot range through the SVM, seeded from a snapshot, and writes the same per-slot history. Use it for slots you missed, or a program you weren't watching.
+
+It needs two things live capture doesn't: a **snapshot** at the start of the range to seed from, and an **archive** to pull the range's blocks from.
+
+**Block source.** Slate reads blocks over `getBlock`, so any JSON-RPC archive works. For old slots that means [Old Faithful](https://github.com/rpcpool/yellowstone-faithful) (`faithful-cli`), which serves any historical block out of the CAR archives without downloading them.
+
+Build `faithful-cli` from source. The prebuilt macOS release won't run on Apple Silicon (unsigned, killed on launch). It's one command:
+
+```sh
+git clone --depth 1 https://github.com/rpcpool/yellowstone-faithful
+cd yellowstone-faithful && make   # needs Go; produces ./bin/faithful-cli
+```
+
+`getBlock` needs only two indexes per epoch (~11 GB), not the 837 GB CAR. The CAR is range-served over HTTP. Download the indexes and point a config at them:
+
+```sh
+EPOCH=808
+CID=$(curl -s https://files.old-faithful.net/$EPOCH/epoch-$EPOCH.cid)
+for t in slot-to-cid cid-to-offset-and-size; do
+  curl -sL -O "https://files.old-faithful.net/$EPOCH/epoch-$EPOCH-$CID-mainnet-$t.index"
+done
+faithful-cli rpc --listen :8888 epoch-$EPOCH.yml   # config points at the two local indexes + the remote CAR
+```
+
+**Snapshot.** Seed from a full snapshot at the first slot of your range (mainnet snapshots live in the warehouse buckets, e.g. `gs://mainnet-beta-ledger-us-ny5/`, requester-pays). Point `--verify-boundary` at a second snapshot at the end to check the result byte-for-byte.
+
+Backfill writes to the same ClickHouse as live capture. Have it running with the tables created ([Quick start](#quick-start) steps 1 and 2) and `[clickhouse]` set in `slate.toml`.
+
+**Run it.**
+
+```sh
+cargo run -p slate-backfill --release -- \
+  snapshot-<from>.tar.zst \
+  --from <start_slot> --to <end_slot> \
+  --program <pubkey> \
+  --rpc http://localhost:8888 \
+  --store disk --store-path accounts.redb --cache-size 34359738368 \
+  --fetch-concurrency 16 \
+  --verify-boundary snapshot-<to>.tar.zst
+```
+
+`--store disk` keeps a range too big for RAM on disk (pure Rust, no extra deps). Old Faithful flakes under load, so the fetch retries hard; `--fetch-concurrency 16` is a safe default. Drop `--verify-boundary` if you don't have the end snapshot.
+
+**What you get.** As it replays, Slate rolls each slot's bank hash forward and checks it against the consensus hash carried in that block's own vote transactions, so every slot is verified against what the network agreed on, no external oracle needed. It stops at the first slot it can't reproduce and records coverage up to the last good one. The same account history lands in ClickHouse, served through the same as-of-slot RPC.
+
 ## Configuration
 
 Config lives in `slate.toml` (pass `--config` to point elsewhere). Copy `slate.example.toml` and fill it in. The gRPC token can sit in `[ingest].x-token` or in the `GRPC_TOKEN` env var, which overrides the file. Keep the real `slate.toml` out of git; it's already gitignored.
@@ -117,7 +167,7 @@ bind = "127.0.0.1:8899"
 
 ## Validation
 
-Slate ships a differential harness that checks its historical answers against a source it never saw. It reads a program's full account set from a reference RPC at that RPC's current finalized slot, waits until Slate has streamed past that slot, then diffs Slate's as-of answer against it. A match means Slate's reconstruction of a now-past slot agrees with an independent RPC, account for account.
+Backfill self-verifies against the consensus hash in each block's votes (see [Backfill](#backfill)), so it needs no reference RPC. The live path is checked separately, by a differential harness: it reads a program's accounts from a reference RPC at that RPC's current slot, waits for Slate to stream past it, then diffs Slate's as-of answer. A match means Slate's reconstruction of a now-past slot agrees with an RPC it never saw, account for account.
 
 ```sh
 # use an RPC that is NOT the one seeding Slate's baseline
@@ -129,6 +179,8 @@ REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate --
 | Crate | Purpose |
 | --- | --- |
 | `slate-ingest` | Live capture, baseline bootstrap, and the validation harness. |
+| `slate-replay` | SVM replay engine: seed from a snapshot, replay blocks, self-verify each slot's bank hash. |
+| `slate-backfill` | Backfill CLI: drives the replay over a slot range and persists the history. |
 | `slate-store` | ClickHouse access: as-of reads, coverage, fidelity. |
 | `slate-rpc` | JSON-RPC server. |
 | `slate-common` | Config. |
@@ -157,11 +209,13 @@ cargo test --workspace -- --test-threads=1
 
 ## Roadmap
 
-- **Fill the past.** Reconstruct pre-baseline and deep-gap writes from an earlier snapshot, or by replaying archived transactions through the SVM.
+- **Backfill fidelity.** Close the long tail of historical transactions the replay can't yet reproduce, a class at a time.
+- **Resumable runs.** Checkpoint a backfill and cache fetched blocks, so a long run survives an interruption and doesn't re-fetch.
+- **Multi-epoch backfill.** Span successive snapshot windows to reconstruct a whole epoch and beyond.
 - **Gap repair.** Heal recorded coverage holes from incremental snapshots while they're still in retention.
-- **Durable source.** Ingest from Fumarole with cursor replay, so most gaps heal on their own.
+- **Durable source.** Ingest from a replayable stream (Triton's Fumarole, Helius's LaserStream, and the like), so a reconnect rewinds and most gaps heal on their own.
 - **asOfTime.** Query by timestamp, not just slot.
-- **More surface.** `getTokenAccountsByOwner`, `memcmp` / `dataSize` filters, base58 and jsonParsed encodings, and a `getCoverage` endpoint that exposes the captured ranges directly.
+- **More surface.** `getTokenAccountsByOwner`, `memcmp` / `dataSize` filters, base58 and jsonParsed encodings.
 - **Scale.** Cheap deep history via S3 tiering, and multi-node.
 
 ## License

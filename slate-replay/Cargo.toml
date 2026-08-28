@@ -1,0 +1,81 @@
+[package]
+name = "slate-replay"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+# SVM execution engine, 3.1.x line, matches slate-ingest's solana-accounts-db
+# and what mainnet stable runs. Read the API from THIS version, not agave HEAD.
+solana-svm = { version = "3", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-svm-callback = "3"
+solana-program-runtime = "3"
+solana-compute-budget = { version = "3", features = ["agave-unstable-api"] }
+solana-account = "3"
+solana-pubkey = "4"
+solana-sdk-ids = "3"
+solana-system-program = { version = "3", features = ["agave-unstable-api"] }
+solana-clock = "3.1.1"
+solana-rent = "3.1.0"
+solana-epoch-schedule = "3.2.0"
+solana-sysvar-id = "3.1.0"
+bincode = "1.3"
+# Native Stake program, vendored from solana-stake-program 3.0.14 (the last version
+# that shipped the native processor before it was repurposed to core BPF at 4.0.0).
+# Its 5 pinned =3.0.14 deps are repointed to =3.1.14 to build against our runtime.
+# Re-supplied for pre-migration replay via the compat module.
+solana-stake-program = { path = "../vendor/solana-stake-program" }
+solana-transaction = { version = "3.1.0", features = ["serde", "blake3", "bincode"] }
+solana-message = "3.1.0"
+solana-transaction-error = "3"
+# InstructionError variants (incl. ExecutableLamportChange) for the SIMD-0162 compat shim.
+# transaction-error 3.x carries its InstructionError from the 2.x line, so pin to match.
+solana-instruction-error = "2"
+base64 = "0.22"
+zstd = "0.13"
+tar = "0.4"
+# Disk-backed account store for ranges too big for RAM. Pure Rust (no C++ toolchain);
+# swappable for RocksDB later behind the AccountStore trait if it hits a scale wall.
+redb = "2"
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+agave-reserved-account-keys = { version = "3.1.12", features = ["agave-unstable-api"] }
+agave-feature-set = { version = "3.1.14", features = ["agave-unstable-api"] }
+solana-compute-budget-instruction = { version = "3.1.12", features = ["agave-unstable-api"] }
+solana-svm-transaction = "3.1.14"
+agave-syscalls = "3.1.14"
+solana-slot-hashes = "3.1.0"
+solana-fee-structure = "3.0.0"
+solana-svm-feature-set = "3.1.14"
+solana-hash = "3.1.0"
+# Decode validator votes: a TowerSync/VoteStateUpdate carries the bank hash of the
+# slot it votes on, so votes in later blocks let the replay self-verify each slot
+# against consensus (block::vote_confirmations + the hash check in replay_range).
+solana-vote-interface = { version = "4", features = ["bincode"] }
+solana-sysvar = { version = "3.1.1", features = ["serde"] }
+# Decode a nonce account's stored blockhash, to tell a real durable-nonce tx (its
+# recent_blockhash IS the stored nonce) from a normal tx that just tops up its own
+# nonce (recent_blockhash is a real blockhash), see execute_with.
+solana-nonce = { version = "3.1.0", features = ["serde"] }
+# Bank-hash computation (lattice-hash regime). LtHash is agave's standalone
+# solana-lattice-hash crate, zero solana deps, consensus-frozen format, pinned to
+# the epoch-807 target so it's byte-exact. blake3 feeds the per-account element;
+# sha2 is the hashv combine.
+solana-lattice-hash = "=2.2.20"
+blake3 = "1"
+sha2 = "0.10"
+
+anyhow = "1"
+solana-builtins = { version = "3", features = ["agave-unstable-api"] }
+agave-precompiles = { version = "3.1.12", features = ["agave-unstable-api"] }
+solana-precompile-error = "3"
+slate-store = { path = "../slate-store" }
+# spawn_blocking: the block source's fetch is blocking reqwest, run off the async worker
+# so it can't panic inside (or stall) the runtime that persists to ClickHouse.
+tokio = { workspace = true }
+
+[dev-dependencies]
+solana-message = "3"
+solana-instruction = "3"
+solana-signature = "3"
+solana-ed25519-program = "3"
+ed25519-dalek = "2"

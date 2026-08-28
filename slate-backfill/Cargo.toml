@@ -1,0 +1,14 @@
+[package]
+name = "slate-backfill"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+slate-replay = { path = "../slate-replay" }
+slate-store = { path = "../slate-store" }
+slate-common = { path = "../slate-common" }
+solana-pubkey = "4.0.0"
+anyhow = "1"
+clap = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
