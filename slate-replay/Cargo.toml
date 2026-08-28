@@ -1,10 +1,10 @@
 [package]
 name = "slate-replay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-# SVM execution engine — 3.1.x line, matches slate-ingest's solana-accounts-db
+# SVM execution engine, 3.1.x line, matches slate-ingest's solana-accounts-db
 # and what mainnet stable runs. Read the API from THIS version, not agave HEAD.
 solana-svm = { version = "3", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-svm-callback = "3"
@@ -54,10 +54,10 @@ solana-vote-interface = { version = "4", features = ["bincode"] }
 solana-sysvar = { version = "3.1.1", features = ["serde"] }
 # Decode a nonce account's stored blockhash, to tell a real durable-nonce tx (its
 # recent_blockhash IS the stored nonce) from a normal tx that just tops up its own
-# nonce (recent_blockhash is a real blockhash) — see execute_with.
+# nonce (recent_blockhash is a real blockhash), see execute_with.
 solana-nonce = { version = "3.1.0", features = ["serde"] }
 # Bank-hash computation (lattice-hash regime). LtHash is agave's standalone
-# solana-lattice-hash crate — zero solana deps, consensus-frozen format, pinned to
+# solana-lattice-hash crate, zero solana deps, consensus-frozen format, pinned to
 # the epoch-807 target so it's byte-exact. blake3 feeds the per-account element;
 # sha2 is the hashv combine.
 solana-lattice-hash = "=2.2.20"

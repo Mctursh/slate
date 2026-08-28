@@ -3920,11 +3920,11 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slate"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "slate-backfill"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "slate-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3947,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "slate-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "slate-replay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -4026,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "slate-rpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "slate-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clickhouse",
  "hex",
