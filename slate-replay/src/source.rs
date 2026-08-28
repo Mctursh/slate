@@ -16,9 +16,13 @@ use reqwest::blocking::Client;
 
 use crate::block::{fetch_block_opt, fetch_confirmed_slots, Block};
 
-/// How many times to retry a transient fetch failure (429/timeout/dropped connection)
-/// before giving up on a block.
-const MAX_RETRIES: usize = 4;
+/// How many times to retry a transient fetch failure (429/timeout/dropped connection, or
+/// Old Faithful failing to range-fetch a block from the remote CAR) before giving up.
+/// A footprint or replay pass over a 50k-slot range fetches tens of thousands of blocks;
+/// a single unrecovered miss aborts the whole pass, so the budget has to outlast a
+/// transient CDN window (seconds to a couple of minutes), not just a blip. With the
+/// backoff below this is ~12 min of retrying per block — long, but a pass is worth hours.
+const MAX_RETRIES: usize = 40;
 
 /// Where the replay gets its blocks. `Send + Sync` so a shared source can be handed to a
 /// blocking fetch task while the async loop persists the previous chunk.
@@ -76,7 +80,12 @@ impl RpcBlockSource {
                             "fetching block {slot} failed after {MAX_RETRIES} retries"
                         )));
                     }
-                    std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                    // Exponential backoff capped at 20s: 0.5s, 1, 2, 4, 8, 16, then 20s.
+                    // Old Faithful's transient range-fetch failures clear on their own in
+                    // seconds to a couple of minutes; longer, spaced-out retries ride them
+                    // out instead of hammering a saturated CDN connection.
+                    let backoff_ms = (500u64 << (attempt as u32 - 1).min(6)).min(20_000);
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                 }
             }
         }

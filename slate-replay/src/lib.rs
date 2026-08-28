@@ -53,6 +53,8 @@ use solana_svm::{
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use solana_svm_feature_set::SVMFeatureSet;
 use solana_svm_transaction::svm_message::SVMMessage;
+use solana_instruction_error::InstructionError;
+use solana_transaction_error::TransactionError;
 use solana_sysvar_id::SysvarId;
 use solana_transaction::sanitized::SanitizedTransaction;
 
@@ -426,6 +428,27 @@ impl ReplayBank {
             .unwrap_or_default()
     }
 
+    /// The blockhash an initialized System nonce account currently stores, or `None`
+    /// if `address` isn't one. A durable-nonce transaction's recent_blockhash equals
+    /// this exactly — that's what makes it durable — so comparing against it tells a
+    /// real durable-nonce tx from a normal tx that merely advances its own nonce as an
+    /// ordinary instruction. Exact, unlike the [`Self::recent_blockhashes`] window
+    /// whose 150 entries stop one short of agave's age-150 validity (a normal tx built
+    /// on the oldest-still-valid blockhash looked "not recent" and got mis-routed).
+    pub fn stored_durable_nonce(&self, address: &Pubkey) -> Option<Hash> {
+        let (account, _) = self.get_account_shared_data(address)?;
+        if *account.owner() != solana_sdk_ids::system_program::id() {
+            return None;
+        }
+        match bincode::deserialize::<solana_nonce::versions::Versions>(account.data())
+            .ok()?
+            .state()
+        {
+            solana_nonce::state::State::Initialized(data) => Some(*data.durable_nonce.as_hash()),
+            solana_nonce::state::State::Uninitialized => None,
+        }
+    }
+
     /// Populate the SlotHashes sysvar from recent `(slot, hash)` pairs (newest
     /// first, as the runtime keeps them). Vote transactions read it to check the
     /// slot they vote on is real.
@@ -681,22 +704,23 @@ impl Replayer {
                     FeeDetails::new(fee, 0),
                     true,
                 );
-                // Decide durable-nonce vs normal the way agave's age check does:
-                // blockhash queue FIRST, nonce only as the fallback. A tx whose first
-                // instruction is System AdvanceNonceAccount looks like a durable nonce,
-                // but if its recent_blockhash is a real recent blockhash it's just a
-                // normal tx topping up its own nonce — agave validates it via the queue
-                // (nonce = None) and the advance runs as an ordinary instruction. Only
-                // when the blockhash isn't recent is it really the stored nonce; then we
-                // hand the SVM the nonce account so it validates and advances it (and, on
-                // failure, still rolls it back advanced, which a normal tx's fee-only
-                // rollback would not). The block is trusted, so we don't re-check the
-                // value, just point the SVM at the account.
+                // Decide durable-nonce vs normal. A tx whose first instruction is System
+                // AdvanceNonceAccount looks like a durable nonce, but if its
+                // recent_blockhash is a real recent blockhash it's just a normal tx
+                // topping up its own nonce — agave validates that via the blockhash queue
+                // (nonce = None) and the advance runs as an ordinary instruction. It's a
+                // real durable-nonce tx only when the recent_blockhash IS the account's
+                // stored nonce, so we compare against that directly. (Earlier this asked
+                // whether the blockhash was in RecentBlockhashes, but that sysvar holds
+                // 150 entries — ages 0-149 — while agave's age check accepts age 150 too,
+                // so a normal tx built on the oldest-still-valid blockhash got mis-routed
+                // to the nonce path and failed BlockhashNotFound.) On the nonce path the
+                // SVM validates and advances the nonce, and on failure still rolls it back
+                // advanced — which a normal tx's fee-only rollback would not.
                 let nonce = match tx.get_durable_nonce().copied() {
                     Some(address)
-                        if !bank
-                            .recent_blockhashes()
-                            .contains(tx.message().recent_blockhash()) =>
+                        if bank.stored_durable_nonce(&address).as_ref()
+                            == Some(tx.message().recent_blockhash()) =>
                     {
                         Some(address)
                     }
@@ -767,7 +791,7 @@ impl Replayer {
             };
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
-            let result = self.execute_with(
+            let mut result = self.execute_with(
                 processor,
                 bank,
                 &tx,
@@ -775,6 +799,31 @@ impl Replayer {
                 epoch,
                 block.previous_blockhash,
             );
+            // SIMD-0162 compat. The solana-svm 3.1.x Slate runs on removed the runtime's
+            // "an instruction may not modify an executable account" checks for good (the
+            // feature is code-complete, not gated). That's right for current mainnet but
+            // wrong for a slot before the feature activated, where the chain still enforced
+            // them — so we re-supply the check here. A tx that changed a pre-existing
+            // executable account failed on chain (ExecutableLamportChange); mark ours failed
+            // too, and reconcile + commit roll it back to fees-only, matching the chain.
+            if !self
+                .feature_set
+                .is_active(&agave_feature_set::remove_accounts_executable_flag_checks::id())
+            {
+                if let Ok(ProcessedTransaction::Executed(executed)) = &mut result {
+                    if executed.was_successful() {
+                        if let Some(idx) =
+                            executable_modification(bank, &tx, &executed.loaded_transaction.accounts)
+                        {
+                            executed.execution_details.status =
+                                Err(TransactionError::InstructionError(
+                                    idx as u8,
+                                    InstructionError::ExecutableLamportChange,
+                                ));
+                        }
+                    }
+                }
+            }
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {
                 return BlockReplay::halted(i, reconciliation.issues.join("; "));
@@ -916,6 +965,39 @@ impl Replayer {
 /// - **Fees-only (loaded but not executed):** the fee payer was still charged, so
 ///   commit its rollback too.
 /// - **Not processed:** nothing hit the chain, so nothing to commit.
+/// Re-supply SIMD-0162's removed check: an instruction may not change an executable
+/// account's lamports, data, or owner. Scans a successful tx's post-state for a writable
+/// account that was *already* executable and came out changed — exactly what the chain
+/// rejected before the feature activated. Returns its index in the tx's account list, or
+/// `None` if the tx touched no executable account (the common case, so the scan is cheap:
+/// executable accounts are rarely writable). A freshly created account (no pre-state) is
+/// skipped — a program deploy sets executable legitimately and isn't this violation.
+fn executable_modification(
+    bank: &ReplayBank,
+    message: &impl SVMMessage,
+    accounts: &[(Pubkey, AccountSharedData)],
+) -> Option<usize> {
+    for (i, (key, post)) in accounts.iter().enumerate() {
+        if !message.is_writable(i) {
+            continue;
+        }
+        let Some((pre, _)) = bank.get_account_shared_data(key) else {
+            continue;
+        };
+        if !pre.executable() {
+            continue;
+        }
+        if pre.lamports() != post.lamports()
+            || pre.owner() != post.owner()
+            || pre.executable() != post.executable()
+            || pre.data() != post.data()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn commit_writes(
     bank: &mut ReplayBank,
     message: &impl SVMMessage,
@@ -1483,6 +1565,83 @@ mod tests {
     }
 
     #[test]
+    fn re_supplies_the_executable_account_check() {
+        // SIMD-0162 compat. The 3.1.x SVM lets a transfer to an executable account
+        // succeed — the runtime check was removed. Before the feature activated the chain
+        // rejected it (ExecutableLamportChange). `executable_modification` re-supplies the
+        // check: a writable account that was already executable and came out of the tx
+        // changed is the violation.
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let loader = solana_sdk_ids::native_loader::id();
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+
+        // Pre-state: `program` is an existing executable account.
+        let mut bank = ReplayBank::default();
+        bank.insert(payer, AccountSharedData::new(5_000_000, 0, &system), 100);
+        let mut pre_prog = AccountSharedData::new(1_000_000, 0, &loader);
+        pre_prog.set_executable(true);
+        bank.insert(program, pre_prog.clone(), 100);
+
+        // transfer(payer -> program): compiled account order is [payer (writable signer),
+        // program (writable), system_program (readonly)].
+        let mut data = vec![2u8, 0, 0, 0]; // SystemInstruction::Transfer discriminant
+        data.extend_from_slice(&500_000u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: system,
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(program, false)],
+            data,
+        };
+        let message = Message::new_with_blockhash(&[ix], Some(&payer), &Hash::default());
+        let vtx = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(message),
+        };
+        let tx = sanitize(&vtx, &block::LoadedAddresses::default()).unwrap();
+
+        let system_acct = AccountSharedData::new(1, 0, &loader);
+        // Post-state where the transfer landed: `program` gained lamports — the violation,
+        // at its account index (1).
+        let mut post_prog = pre_prog.clone();
+        post_prog.set_lamports(1_500_000);
+        let changed = vec![
+            (payer, AccountSharedData::new(4_495_000, 0, &system)),
+            (program, post_prog),
+            (system, system_acct.clone()),
+        ];
+        assert_eq!(
+            executable_modification(&bank, &tx, &changed),
+            Some(1),
+            "a write to an existing executable account is flagged"
+        );
+
+        // Control: the executable account is untouched — nothing to flag.
+        let untouched = vec![
+            (payer, AccountSharedData::new(4_495_000, 0, &system)),
+            (program, pre_prog.clone()),
+            (system, system_acct.clone()),
+        ];
+        assert_eq!(
+            executable_modification(&bank, &tx, &untouched),
+            None,
+            "an unchanged executable account is fine"
+        );
+
+        // Control: same change, but the account was never executable — allowed.
+        bank.insert(program, AccountSharedData::new(1_000_000, 0, &system), 100);
+        assert_eq!(
+            executable_modification(&bank, &tx, &changed),
+            None,
+            "changing a non-executable account is allowed"
+        );
+    }
+
+    #[test]
     fn honors_the_transactions_compute_unit_limit() {
         use solana_instruction::{AccountMeta, Instruction};
         use solana_message::{Message, VersionedMessage};
@@ -1736,6 +1895,122 @@ mod tests {
             data.durable_nonce,
             DurableNonce::from_blockhash(&block_blockhash),
             "the nonce advances from the block's blockhash, not the tx's nonce value"
+        );
+        let (payer_acct, _) = bank.get_account_shared_data(&payer).unwrap();
+        assert_eq!(payer_acct.lamports(), start - fee, "fee payer charged the fee");
+    }
+
+    #[test]
+    fn a_normal_tx_topping_up_its_own_nonce_is_not_durable() {
+        // Gap-#2 regression. A tx whose first instruction is AdvanceNonceAccount but
+        // whose recent_blockhash is a REAL blockhash (not the stored nonce) is a normal
+        // tx, so on failure the nonce rolls back with everything else — unlike a durable
+        // one, which keeps the advance. The old check asked "is recent_blockhash in the
+        // 150-entry RecentBlockhashes set?" and mis-routed this to the nonce path when
+        // the blockhash sat one slot past that window (agave accepts age 150; the sysvar
+        // holds only ages 0-149). We now compare against the account's stored nonce.
+        use solana_account::ReadableAccount;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::{Message, VersionedMessage};
+        use solana_nonce::{
+            state::{DurableNonce, State},
+            versions::Versions,
+        };
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let system = solana_sdk_ids::system_program::id();
+        let recent_blockhashes = solana_sdk_ids::sysvar::recent_blockhashes::id();
+        let payer = Pubkey::new_unique();
+        let nonce_key = Pubkey::new_unique();
+        let dst = Pubkey::new_unique();
+        let slot = 300;
+        let epoch = slot / 432_000;
+        let fee = 5_000u64;
+        let start = 1_000_000u64;
+
+        let stored = DurableNonce::from_blockhash(&Hash::new_from_array([9u8; 32]));
+        let nonce_data =
+            bincode::serialize(&Versions::new(State::new_initialized(&payer, stored, fee))).unwrap();
+
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            payer,
+            AccountSharedData::from(Account {
+                lamports: start,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        bank.insert(
+            nonce_key,
+            AccountSharedData::from(Account {
+                lamports: 1_500_000,
+                data: nonce_data,
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        let replayer = Replayer::new(slot, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+        bank.configure_sysvars(slot, 1_700_000_000);
+        replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+
+        let advance = Instruction {
+            program_id: system,
+            accounts: vec![
+                AccountMeta::new(nonce_key, false),
+                AccountMeta::new_readonly(recent_blockhashes, false),
+                AccountMeta::new_readonly(payer, true),
+            ],
+            data: vec![4, 0, 0, 0], // AdvanceNonceAccount
+        };
+        let mut xfer = vec![2u8, 0, 0, 0]; // Transfer, over-balance so the tx fails
+        xfer.extend_from_slice(&(start * 10).to_le_bytes());
+        let transfer = Instruction {
+            program_id: system,
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(dst, false)],
+            data: xfer,
+        };
+
+        // The tell: recent_blockhash is a real blockhash, NOT the stored nonce value.
+        let real_blockhash = Hash::new_from_array([3u8; 32]);
+        assert_ne!(real_blockhash, *stored.as_hash());
+        let message =
+            Message::new_with_blockhash(&[advance, transfer], Some(&payer), &real_blockhash);
+        let tx = sanitize(
+            &VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: VersionedMessage::Legacy(message),
+            },
+            &crate::block::LoadedAddresses::default(),
+        )
+        .unwrap();
+
+        let result = replayer.execute(&bank, &tx, fee, epoch, Hash::new_from_array([7u8; 32]));
+        assert!(
+            matches!(&result, Ok(ProcessedTransaction::Executed(e)) if !e.was_successful()),
+            "should execute then fail on the transfer (not fail to load), got {result:?}"
+        );
+        commit_writes(&mut bank, &tx, &result, slot);
+
+        // Normal-path payoff: the nonce did NOT advance (a durable tx would have kept
+        // it), and only the fee was charged.
+        let (nonce_acct, _) = bank
+            .get_account_shared_data(&nonce_key)
+            .expect("nonce account present");
+        let after: Versions = bincode::deserialize(nonce_acct.data()).unwrap();
+        let State::Initialized(data) = after.state() else {
+            panic!("nonce should still be initialized");
+        };
+        assert_eq!(
+            data.durable_nonce, stored,
+            "a normal failed tx must roll the nonce back, not advance it"
         );
         let (payer_acct, _) = bank.get_account_shared_data(&payer).unwrap();
         assert_eq!(payer_acct.lamports(), start - fee, "fee payer charged the fee");

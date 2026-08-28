@@ -27,6 +27,9 @@ solana-stake-program = { path = "../vendor/solana-stake-program" }
 solana-transaction = { version = "3.1.0", features = ["serde", "blake3", "bincode"] }
 solana-message = "3.1.0"
 solana-transaction-error = "3"
+# InstructionError variants (incl. ExecutableLamportChange) for the SIMD-0162 compat shim.
+# transaction-error 3.x carries its InstructionError from the 2.x line, so pin to match.
+solana-instruction-error = "2"
 base64 = "0.22"
 zstd = "0.13"
 tar = "0.4"
@@ -49,6 +52,10 @@ solana-hash = "3.1.0"
 # against consensus (block::vote_confirmations + the hash check in replay_range).
 solana-vote-interface = { version = "4", features = ["bincode"] }
 solana-sysvar = { version = "3.1.1", features = ["serde"] }
+# Decode a nonce account's stored blockhash, to tell a real durable-nonce tx (its
+# recent_blockhash IS the stored nonce) from a normal tx that just tops up its own
+# nonce (recent_blockhash is a real blockhash) — see execute_with.
+solana-nonce = { version = "3.1.0", features = ["serde"] }
 # Bank-hash computation (lattice-hash regime). LtHash is agave's standalone
 # solana-lattice-hash crate — zero solana deps, consensus-frozen format, pinned to
 # the epoch-807 target so it's byte-exact. blake3 feeds the per-account element;
@@ -72,4 +79,3 @@ solana-instruction = "3"
 solana-signature = "3"
 solana-ed25519-program = "3"
 ed25519-dalek = "2"
-solana-nonce = { version = "3.1.0", features = ["serde"] }
