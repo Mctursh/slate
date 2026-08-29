@@ -187,13 +187,13 @@ impl ReplayBank {
     // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
     pub fn finalize_slot_bankhash(
         &mut self,
+        changes: &[(Pubkey, Option<AccountSharedData>, AccountSharedData)],
         signature_count: u64,
         blockhash: &Hash,
     ) -> Option<Hash> {
-        let changes = self.take_slot_changes();
         self.bankhash_roller
             .as_mut()
-            .map(|r| r.roll_slot(&changes, signature_count, blockhash))
+            .map(|r| r.roll_slot(changes, signature_count, blockhash))
     }
 
     // Prepend (slot, bank_hash) to SlotHashes like the runtime's update_slot_hashes (newest-first, truncated to 512).
@@ -533,6 +533,31 @@ impl Replayer {
         self.execute_with(&self.processor, bank, tx, fee, epoch, blockhash)
     }
 
+    // A mid-range upgrade rewrites a program's bytecode but leaves the old compiled copy in the shared
+    // cache; evict every written program account so the next invocation reloads from the account.
+    pub fn invalidate_upgraded_programs(
+        &self,
+        changes: &[(Pubkey, Option<AccountSharedData>, AccountSharedData)],
+    ) {
+        let ids: Vec<Pubkey> = changes
+            .iter()
+            .filter(|(_, _, a)| {
+                a.executable()
+                    && (solana_sdk_ids::bpf_loader_upgradeable::check_id(a.owner())
+                        || solana_sdk_ids::bpf_loader::check_id(a.owner())
+                        || solana_sdk_ids::bpf_loader_deprecated::check_id(a.owner()))
+            })
+            .map(|(k, _, _)| *k)
+            .collect();
+        if !ids.is_empty() {
+            self.processor
+                .global_program_cache
+                .write()
+                .unwrap()
+                .remove_programs(ids.into_iter());
+        }
+    }
+
     // Like execute but against an explicit processor (new_from gives a fresh sysvar cache while sharing the program cache/builtins).
     fn execute_with(
         &self,
@@ -659,7 +684,11 @@ impl Replayer {
                 .iter()
                 .map(|tx| tx.transaction.signatures.len() as u64)
                 .sum();
-            if let Some(bank_hash) = bank.finalize_slot_bankhash(signature_count, &block.blockhash)
+            // Evict any program upgraded this slot; the same changes then roll into the lattice.
+            let changes = bank.take_slot_changes();
+            self.invalidate_upgraded_programs(&changes);
+            if let Some(bank_hash) =
+                bank.finalize_slot_bankhash(&changes, signature_count, &block.blockhash)
             {
                 eprintln!("slot {} computed bank_hash {bank_hash}", block.slot);
             }
@@ -1210,6 +1239,72 @@ mod tests {
             11_451,
             "replay CU (chain was {})",
             fixture::cpi::COMPUTE_UNITS
+        );
+    }
+
+    // A program upgraded mid-range must run the new bytecode, not a stale copy from the shared cache.
+    #[test]
+    fn a_mid_range_program_upgrade_is_not_served_stale() {
+        use solana_account::{Account, ReadableAccount};
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
+
+        let s = fixture::cpi::SLOT;
+        let epoch = s / 432_000;
+        let mut bank = fixture::cpi::seed_bank();
+        let replayer = Replayer::new(s, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+        bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
+        replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+
+        let tx = fixture::cpi::sanitized_transaction();
+        let program: Pubkey = fixture::cpi::PROGRAM.parse().unwrap();
+        let programdata: Pubkey = fixture::cpi::PROGRAMDATA.parse().unwrap();
+        let wallet2: Pubkey = fixture::cpi::WALLET2.parse().unwrap();
+
+        let warm = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
+        assert!(
+            matches!(&warm, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "warm-up CPI tx should succeed and cache v1, got {warm:?}"
+        );
+
+        // Upgrade it: swap the CPI bytecode for Memo (no transfer), via begin_slot so it's a recorded write.
+        let (pd, _) = bank.store().get(&programdata).unwrap();
+        let mut bytes = pd.data().to_vec();
+        let elf_at = bytes
+            .windows(4)
+            .position(|w| w == [0x7f, b'E', b'L', b'F'])
+            .expect("upgradeable programData carries an ELF");
+        bytes.truncate(elf_at);
+        bytes.extend_from_slice(fixture::memo::program_bytecode());
+        let pd = AccountSharedData::from(Account {
+            lamports: pd.lamports(),
+            data: bytes,
+            owner: *pd.owner(),
+            executable: pd.executable(),
+            rent_epoch: pd.rent_epoch(),
+        });
+        let (proxy, _) = bank.store().get(&program).unwrap();
+        let upgrade_slot = s + 1;
+        bank.begin_slot();
+        bank.insert(programdata, pd, upgrade_slot);
+        bank.insert(program, proxy, upgrade_slot);
+        let changes = bank.take_slot_changes();
+        replayer.invalidate_upgraded_programs(&changes);
+
+        // Invoke again. execute() doesn't commit, so only the bytecode changed: a faithful replay runs
+        // Memo (no transfer), the stale-cache bug re-runs the cached CPI and refunds WALLET2.
+        let after = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
+        let ran_stale_cpi = matches!(
+            &after,
+            Ok(ProcessedTransaction::Executed(e))
+                if e.was_successful()
+                    && e.loaded_transaction.accounts.iter()
+                        .any(|(k, a)| k == &wallet2 && a.lamports() == fixture::cpi::WALLET2_POST)
+        );
+        assert!(
+            !ran_stale_cpi,
+            "after the programData was upgraded away from the CPI program, invoking it ran the \
+             STALE cached CPI bytecode (transferred to WALLET2) instead of the new program: {after:?}"
         );
     }
 
