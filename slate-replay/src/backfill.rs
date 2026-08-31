@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io::Read, sync::Arc};
+use std::{collections::HashSet, io::Read, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use slate_store::ClickHouseClient;
@@ -10,7 +10,7 @@ use crate::{
     RangeReplay, ReplayBank, Replayer, WriteRecord,
     block::{self, Block},
     boundary, build_feature_set, compat, persist, register_builtins, snapshot,
-    source::BlockSource,
+    source::{BlockSource, CachingBlockSource},
     store::{AccountStore, DiskStore, MemStore},
 };
 
@@ -32,6 +32,7 @@ pub async fn backfill(
     snapshot: impl Read,
     s_snap: u64,
     source: Arc<dyn BlockSource>,
+    block_cache: Option<PathBuf>,
     from: u64,
     to: u64,
     program: &Pubkey,
@@ -42,6 +43,10 @@ pub async fn backfill(
     verify_end: Option<Box<dyn Read>>,
 ) -> Result<BackfillReport> {
     let chunk_slots = chunk_slots.max(1);
+    let source: Arc<dyn BlockSource> = match block_cache {
+        None => source,
+        Some(path) => Arc::new(CachingBlockSource::new(source, path)?),
+    };
     // Slots are just u64s (bounded), so hold them all; the blocks themselves never all fit.
     let slots = {
         let src = Arc::clone(&source);
@@ -266,6 +271,7 @@ mod tests {
             SNAPSHOT,
             s_snap,
             source,
+            None,
             s_snap,
             s + 1,
             &system,
@@ -343,6 +349,7 @@ mod tests {
             SNAPSHOT,
             200,
             source,
+            None,
             200,
             200,
             &system,

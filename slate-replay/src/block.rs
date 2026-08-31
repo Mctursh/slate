@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use agave_reserved_account_keys::ReservedAccountKeys;
 use anyhow::{Context, Result};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use solana_hash::Hash;
 use solana_message::{
     AddressLoader,
@@ -15,7 +16,7 @@ use solana_transaction::{
 };
 use solana_transaction_error::AddressLoaderError;
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
@@ -28,13 +29,13 @@ pub struct Block {
     pub fee_reward: Option<(Pubkey, u64)>,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BlockTx {
     pub transaction: VersionedTransaction,
     pub meta: TxMeta,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TxMeta {
     pub err: Option<String>,
     pub fee: u64,
@@ -51,14 +52,14 @@ impl TxMeta {
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TokenBalance {
     pub account_index: u8,
     pub mint: Pubkey,
     pub amount: u64,
 }
 
-#[derive(Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct LoadedAddresses {
     pub writable: Vec<Pubkey>,
     pub readonly: Vec<Pubkey>,

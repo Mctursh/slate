@@ -1,18 +1,21 @@
 use std::{
+    collections::HashMap,
+    path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::Result;
+use redb::{Database, Durability, TableDefinition};
 use reqwest::blocking::Client;
 
 use crate::block::{Block, fetch_block_opt, fetch_confirmed_slots};
 
 // Big retry budget: one unrecovered miss aborts a whole pass, and Old Faithful flakes transiently (CDN range-fetch), so it has to outlast a transient window, not just a blip.
-const MAX_RETRIES: usize = 40;
+const MAX_RETRIES: usize = 80;
 
 // Send + Sync so a shared source can be handed to a blocking fetch task while the async loop persists the previous chunk.
 pub trait BlockSource: Send + Sync {
@@ -27,6 +30,23 @@ pub struct RpcBlockSource {
     rpc_url: String,
     client: Client,
     concurrency: usize,
+}
+
+const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
+
+pub struct CachingBlockSource {
+    inner: Arc<dyn BlockSource>,
+    db: Database,
+}
+
+impl CachingBlockSource {
+    pub fn new(inner: Arc<dyn BlockSource>, cache_path: PathBuf) -> Result<Self> {
+        let db = Database::create(&cache_path)?;
+        let txn = db.begin_write()?;
+        txn.open_table(BLOCKS)?;
+        txn.commit()?;
+        Ok(Self { inner, db })
+    }
 }
 
 impl RpcBlockSource {
@@ -123,6 +143,49 @@ impl BlockSource for RpcBlockSource {
             }
         }
         Ok(out)
+    }
+}
+
+impl BlockSource for CachingBlockSource {
+    fn confirmed_slots(&self, from: u64, to: u64) -> Result<Vec<u64>> {
+        self.inner.confirmed_slots(from, to)
+    }
+
+    fn fetch(&self, slots: &[u64]) -> Result<Vec<Block>> {
+        let mut hits: HashMap<u64, Block> = HashMap::new();
+        let mut misses: Vec<u64> = Vec::new();
+
+        {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(BLOCKS)?;
+            for &slot in slots {
+                match table.get(slot)? {
+                    Some(g) => {
+                        hits.insert(slot, bincode::deserialize(g.value())?);
+                    }
+                    None => misses.push(slot),
+                }
+            }
+        }
+
+        let fresh = self.inner.fetch(&misses)?;
+        if !fresh.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut table = txn.open_table(BLOCKS)?;
+                for b in &fresh {
+                    table.insert(b.slot, bincode::serialize(&b)?.as_slice())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        for b in fresh {
+            hits.insert(b.slot, b);
+        }
+
+        Ok(slots.iter().filter_map(|s| hits.remove(s)).collect())
     }
 }
 
