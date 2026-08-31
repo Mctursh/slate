@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, str::FromStr, sync::Arc};
+use std::{fs::File, io::Read, path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
@@ -46,6 +46,10 @@ struct Args {
     /// Path for the disk store's redb file.
     #[arg(long, default_value = "slate-accounts.redb")]
     store_path: String,
+    /// Block cache path (redb). Point runs of the same cluster at one file to skip
+    /// re-fetching on retries. Omit to disable.
+    #[arg(long)]
+    block_cache: Option<String>,
     /// Replay this many slots per chunk before flushing writes to ClickHouse and
     /// clearing the log. Bounds write-log RAM over long ranges.
     #[arg(long, default_value_t = 2000)]
@@ -151,6 +155,7 @@ fn main() -> anyhow::Result<()> {
             snapshot,
             args.from,
             source,
+            args.block_cache.as_ref().map(PathBuf::from),
             args.from,
             args.to,
             &program,

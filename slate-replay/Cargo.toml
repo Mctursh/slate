@@ -73,6 +73,8 @@ slate-store = { path = "../slate-store" }
 # so it can't panic inside (or stall) the runtime that persists to ClickHouse.
 tokio = { workspace = true }
 
+serde = { workspace = true, features = ["derive"] }
+
 [dev-dependencies]
 solana-message = "3"
 solana-instruction = "3"
