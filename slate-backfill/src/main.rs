@@ -15,8 +15,8 @@ use solana_pubkey::Pubkey;
 #[derive(Parser)]
 #[command(about = "Reconstruct a program's historical account state by replaying a slot range")]
 struct Args {
-    /// Path to the full snapshot the range starts from (omit with --dry-run).
-    #[arg(required_unless_present = "dry_run")]
+    /// Path to the full snapshot the range starts from (omit with --dry-run or --resume).
+    #[arg(required_unless_present_any = ["dry_run", "resume"])]
     snapshot: Option<String>,
     /// Slot the snapshot was taken at. Replay covers (from, to].
     #[arg(long)]
@@ -37,6 +37,11 @@ struct Args {
     /// report what it looks like. A preflight to run before downloading a snapshot.
     #[arg(long)]
     dry_run: bool,
+    /// Resume a crashed or halted run from the store's last checkpoint instead of seeding
+    /// fresh. Needs --store disk at the same --store-path (and the same --block-cache to
+    /// skip re-fetching). No snapshot needed.
+    #[arg(long)]
+    resume: bool,
     /// Account store: `memory` (RAM, small ranges) or `disk` (redb, large ranges).
     #[arg(long, default_value = "memory")]
     store: String,
@@ -91,38 +96,59 @@ fn main() -> anyhow::Result<()> {
         return dry_run_report(&blocks);
     }
 
-    // Validate program, snapshot, config, and ClickHouse before the expensive fetch.
+    // Validate program, config, and ClickHouse before the expensive fetch.
     let program_str = args
         .program
         .as_ref()
         .context("--program is required for a real run")?;
     let program = Pubkey::from_str(program_str)
         .with_context(|| format!("invalid program pubkey {program_str}"))?;
-    let snapshot_path = args
-        .snapshot
-        .as_ref()
-        .context("<snapshot> is required for a real run")?;
-    check_snapshot_file(snapshot_path)?;
     let cfg = Config::load(&args.config)?;
     check_clickhouse(&cfg.clickhouse.url)?;
-    println!("preflight ok: RPC, program, snapshot, config, and ClickHouse all check out");
 
-    // Bootstrap the bank-hash roll from the manifest (lattice + bank hash at s_snap) so SlotHashes rolls real hashes.
-    let manifest = read_manifest_hashes(
-        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?,
-        args.from,
-    )
-    .context("reading the snapshot manifest bank hash")?;
-    let lt_hash = read_manifest_lt_hash(
-        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?,
-        args.from,
-    )
-    .context("reading the snapshot manifest lattice hash")?
-    .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
-    let bootstrap = Some((lt_hash, manifest.bank_hash));
+    // A fresh run reads its seed and roll bootstrap from the snapshot; --resume takes the roll state from the store's checkpoint, so no snapshot.
+    let snapshot_path = if args.resume {
+        None
+    } else {
+        let path = args
+            .snapshot
+            .as_ref()
+            .context("<snapshot> is required for a fresh run")?;
+        check_snapshot_file(path)?;
+        Some(path)
+    };
+    if args.resume {
+        println!(
+            "preflight ok: RPC, program, config, and ClickHouse check out (resume: no snapshot)"
+        );
+    } else {
+        println!("preflight ok: RPC, program, config, ClickHouse, and snapshot all check out");
+    }
 
-    let snapshot =
-        File::open(snapshot_path).with_context(|| format!("opening snapshot {snapshot_path}"))?;
+    let bootstrap = match snapshot_path {
+        None => None,
+        Some(path) => {
+            let manifest = read_manifest_hashes(
+                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
+                args.from,
+            )
+            .context("reading the snapshot manifest bank hash")?;
+            let lt_hash = read_manifest_lt_hash(
+                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
+                args.from,
+            )
+            .context("reading the snapshot manifest lattice hash")?
+            .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
+            Some((lt_hash, manifest.bank_hash))
+        }
+    };
+
+    let snapshot: Box<dyn Read> = match snapshot_path {
+        None => Box::new(std::io::empty()),
+        Some(path) => {
+            Box::new(File::open(path).with_context(|| format!("opening snapshot {path}"))?)
+        }
+    };
 
     let account_store = match args.store.as_str() {
         "memory" => AccountStoreChoice::Memory,
@@ -164,6 +190,7 @@ fn main() -> anyhow::Result<()> {
             account_store,
             args.chunk_slots,
             verify_end,
+            args.resume,
         )
         .await?;
         match &result.replay.halt {

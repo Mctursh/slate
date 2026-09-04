@@ -1,6 +1,6 @@
 use std::{collections::HashSet, io::Read, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use slate_store::ClickHouseClient;
 use solana_hash::Hash;
 use solana_lattice_hash::lt_hash::LtHash;
@@ -41,6 +41,7 @@ pub async fn backfill(
     account_store: AccountStoreChoice,
     chunk_slots: usize,
     verify_end: Option<Box<dyn Read>>,
+    resume: bool,
 ) -> Result<BackfillReport> {
     let chunk_slots = chunk_slots.max(1);
     let source: Arc<dyn BlockSource> = match block_cache {
@@ -53,18 +54,19 @@ pub async fn backfill(
         tokio::task::spawn_blocking(move || src.confirmed_slots(from, to)).await??
     };
 
-    // Footprint pass: stream the range once; never more than a chunk of blocks resident.
+    // Footprint pass: stream the range once to build the seed set. A resume skips the seed, so this only runs then if the boundary diff needs it to filter the end snapshot.
     let mut footprint = HashSet::new();
-    for chunk in slots.chunks(chunk_slots) {
-        let blocks = fetch_chunk(&source, chunk).await?;
-        block::extend_footprint(&mut footprint, &blocks);
+    if !resume || verify_end.is_some() {
+        for chunk in slots.chunks(chunk_slots) {
+            let blocks = fetch_chunk(&source, chunk).await?;
+            block::extend_footprint(&mut footprint, &blocks);
+        }
+        block::footprint_fixed(&mut footprint);
+        // programData PDAs and SlotHashes are read, not declared as keys, so the footprint misses them.
+        let programdata = block::programdata_addresses(&footprint);
+        footprint.extend(programdata);
+        footprint.insert(solana_sdk_ids::sysvar::slot_hashes::id());
     }
-    block::footprint_fixed(&mut footprint);
-    // Seed programData accounts: PDAs of the program ids, never declared keys, so the footprint misses them.
-    let programdata = block::programdata_addresses(&footprint);
-    footprint.extend(programdata);
-    // Seed SlotHashes: read via syscall not as an account, so the footprint misses it; the first block needs it.
-    footprint.insert(solana_sdk_ids::sysvar::slot_hashes::id());
 
     // Remember the store backing so a boundary diff loads the end snapshot into the same kind.
     let end_store_mode = match &account_store {
@@ -74,41 +76,74 @@ pub async fn backfill(
         }
     };
 
-    // Seed the bank from the snapshot into the chosen store: a RAM map, or redb on disk.
-    let (mut bank, baseline) = match account_store {
-        AccountStoreChoice::Memory => {
-            let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
-            let baseline = persist::baseline_rows(&accounts, program, s_snap);
-            let mut bank = ReplayBank::default();
-            for (pubkey, (account, slot)) in &accounts {
-                bank.insert(*pubkey, account.clone(), *slot);
+    // Fresh run: seed the bank from the snapshot and roll from the manifest hashes. Resume: reopen the store and roll from its checkpoint. Third value is the slot to resume after (S_snap for a fresh run).
+    let (mut bank, baseline, resume_from) = if resume {
+        let AccountStoreChoice::Disk { path, cache_bytes } = account_store else {
+            anyhow::bail!("--resume requires --store disk");
+        };
+        let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
+        let (slot, roll) = disk
+            .read_checkpoint()
+            .context("--resume: the store has no checkpoint to resume from")?;
+        disk.set_checkpoint_mode(true);
+        let mut bank = ReplayBank::with_store(Box::new(disk));
+        // Empty roll = the original run had the bank-hash roll off; keep it off.
+        if !roll.is_empty() {
+            let (lt_hash, bank_hash) = crate::bankhash::deserialize_roll_state(&roll)
+                .context("--resume: checkpoint roll state is corrupt")?;
+            bank.bootstrap_bankhash(lt_hash, bank_hash);
+        }
+        eprintln!("resuming after checkpoint at slot {slot}");
+        (bank, Vec::new(), slot)
+    } else {
+        let (mut bank, baseline) = match account_store {
+            AccountStoreChoice::Memory => {
+                let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
+                let baseline = persist::baseline_rows(&accounts, program, s_snap);
+                let mut bank = ReplayBank::default();
+                for (pubkey, (account, slot)) in &accounts {
+                    bank.insert(*pubkey, account.clone(), *slot);
+                }
+                (bank, baseline)
             }
-            (bank, baseline)
+            AccountStoreChoice::Disk { path, cache_bytes } => {
+                let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
+                let (written, owned) = snapshot::stream_into_store(
+                    snapshot,
+                    &mut disk,
+                    Some(&footprint),
+                    Some(program),
+                )?;
+                eprintln!(
+                    "seeded {written} accounts into disk store {}",
+                    path.display()
+                );
+                // Seed's done (auto-flushed in batches); from here hold writes so only checkpoint_flush commits.
+                disk.set_checkpoint_mode(true);
+                let baseline = persist::baseline_rows(&owned, program, s_snap);
+                (ReplayBank::with_store(Box::new(disk)), baseline)
+            }
+        };
+        if let Some((lt_hash, bank_hash)) = bootstrap {
+            bank.bootstrap_bankhash(lt_hash, bank_hash);
         }
-        AccountStoreChoice::Disk { path, cache_bytes } => {
-            let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
-            let (written, owned) =
-                snapshot::stream_into_store(snapshot, &mut disk, Some(&footprint), Some(program))?;
-            eprintln!(
-                "seeded {written} accounts into disk store {}",
-                path.display()
-            );
-            // The seed's program-owned accounts ARE the S_snap baseline (same set the memory path derives).
-            let baseline = persist::baseline_rows(&owned, program, s_snap);
-            (ReplayBank::with_store(Box::new(disk)), baseline)
-        }
+        (bank, baseline, s_snap)
     };
-    // Start the bank-hash roll from the manifest's lattice + bank hash so SlotHashes rolls real hashes.
-    if let Some((lt_hash, bank_hash)) = bootstrap {
-        bank.bootstrap_bankhash(lt_hash, bank_hash);
+
+    // Fresh run: checkpoint at s_snap right after seeding, so a crash before chunk 1's checkpoint still resumes (skips the ~expensive re-seed) instead of finding no checkpoint.
+    if !resume {
+        bank.checkpoint(s_snap)?;
     }
 
-    // Baseline first, then replay each chunk and persist its writes, clearing the log so it stays bounded.
-    store.insert_accounts(&baseline).await?;
+    // Fresh run inserts the S_snap baseline; a resume already has it.
+    if !baseline.is_empty() {
+        store.insert_accounts(&baseline).await?;
+    }
 
-    // covered_hi comes from the fetched blocks, not indexing slots, the candidate list includes skipped slots.
-    let mut covered_hi = s_snap;
-    let result = if let Some(&first_slot) = slots.first() {
+    // On resume, replay only the slots past the checkpoint; earlier ones are already persisted.
+    let replay_slots: Vec<u64> = slots.into_iter().filter(|&s| s > resume_from).collect();
+    let mut covered_hi = resume_from;
+    let result = if let Some(&first_slot) = replay_slots.first() {
         let epoch = first_slot / 432_000;
         let feature_set = build_feature_set(&bank, first_slot);
         let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
@@ -118,7 +153,7 @@ pub async fn backfill(
 
         let mut completed = 0usize;
         let mut halt = None;
-        for chunk in slots.chunks(chunk_slots) {
+        for chunk in replay_slots.chunks(chunk_slots) {
             let blocks = fetch_chunk(&source, chunk).await?;
             let chunk_replay = replayer.replay_range(&mut bank, &blocks);
             let done = chunk_replay.blocks_completed;
@@ -139,6 +174,8 @@ pub async fn backfill(
                 halt = Some(h);
                 break;
             }
+            // Checkpoint clean chunks only. On a halt the roller sits one slot past covered_hi, so we skip it and let the halting chunk's buffered writes drop unflushed; resume re-runs that chunk.
+            bank.checkpoint(covered_hi)?;
         }
         RangeReplay {
             blocks_completed: completed,
@@ -153,8 +190,8 @@ pub async fn backfill(
 
     store.record_coverage(s_snap, covered_hi).await?;
 
-    // Boundary diff (verification only, doesn't gate): byte-exact end-state vs the real snapshot over the footprint.
-    let boundary = if let Some(end_snapshot) = verify_end {
+    // Boundary diff (verification only): byte-exact end-state vs the real snapshot over the footprint. Skipped on a halt: the end-state is incomplete, and skipping it avoids touching the store past the last checkpoint.
+    let boundary = if let (Some(end_snapshot), None) = (verify_end, &result.halt) {
         bank.flush();
         let mut end_store: Box<dyn AccountStore> = match &end_store_mode {
             None => Box::new(MemStore::default()),
@@ -280,6 +317,7 @@ mod tests {
             AccountStoreChoice::Memory,
             2000,
             None,
+            false,
         )
         .await
         .expect("backfill");
@@ -358,6 +396,7 @@ mod tests {
             AccountStoreChoice::Memory,
             2000,
             Some(Box::new(SNAPSHOT)),
+            false,
         )
         .await
         .expect("backfill");
@@ -373,5 +412,139 @@ mod tests {
             boundary.mismatches.len(),
             &boundary.mismatches[..boundary.mismatches.len().min(5)]
         );
+    }
+
+    // Resume: run the first half fresh, --resume the rest from the checkpoint; the final per-slot
+    // state must match a straight run. Disk store, since resume needs a checkpoint to reopen.
+    #[tokio::test]
+    #[ignore = "needs a local ClickHouse (slate_test db)"]
+    async fn resume_continues_from_a_checkpoint() {
+        let system = solana_sdk_ids::system_program::id();
+        let accounts = snapshot::load_accounts(SNAPSHOT, None, None).unwrap();
+        let (src, src_balance) = accounts
+            .iter()
+            .filter(|(_, (a, _))| *a.owner() == system && a.data().is_empty())
+            .map(|(k, (a, _))| (*k, a.lamports()))
+            .max_by_key(|&(_, bal)| bal)
+            .expect("a fundable wallet");
+        let (w1, w2, w3) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let fee = 5_000u64;
+
+        let transfer =
+            |from: &Pubkey, to: &Pubkey, amount: u64, from_pre: u64, slot: u64| -> Block {
+                let mut data = vec![2u8, 0, 0, 0];
+                data.extend_from_slice(&amount.to_le_bytes());
+                let ix = Instruction {
+                    program_id: system,
+                    accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
+                    data,
+                };
+                let message = Message::new_with_blockhash(&[ix], Some(from), &Hash::default());
+                Block {
+                    slot,
+                    parent_slot: slot - 1,
+                    blockhash: Hash::default(),
+                    previous_blockhash: Hash::default(),
+                    block_time: 1_700_000_000,
+                    transactions: vec![BlockTx {
+                        transaction: VersionedTransaction {
+                            signatures: vec![Signature::default()],
+                            message: VersionedMessage::Legacy(message),
+                        },
+                        meta: TxMeta {
+                            err: None,
+                            fee,
+                            compute_units_consumed: 150,
+                            pre_balances: vec![from_pre, 0, 1],
+                            post_balances: vec![from_pre - amount - fee, amount, 1],
+                            loaded_addresses: LoadedAddresses::default(),
+                            post_token_balances: vec![],
+                        },
+                    }],
+                    fee_reward: None,
+                }
+            };
+
+        // One hop per slot: src -> w1 (201), w1 -> w2 (202), w2 -> w3 (203).
+        let blocks = vec![
+            transfer(&src, &w1, 3_000_000, src_balance, 201),
+            transfer(&w1, &w2, 2_000_000, 3_000_000, 202),
+            transfer(&w2, &w3, 1_000_000, 2_000_000, 203),
+        ];
+
+        let store = ClickHouseClient::with_database("http://localhost:8123", "slate_test");
+        let path = std::env::temp_dir().join("slate_resume_test.redb");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("end.redb"));
+        let disk = || AccountStoreChoice::Disk {
+            path: path.clone(),
+            cache_bytes: 32 * 1024 * 1024,
+        };
+        let source = || Arc::new(VecBlockSource::new(blocks.clone())) as Arc<dyn BlockSource>;
+
+        // Fresh run over (200, 202]: replays 201, 202 and checkpoints each (chunk_slots = 1).
+        backfill(
+            SNAPSHOT,
+            200,
+            source(),
+            None,
+            200,
+            202,
+            &system,
+            &store,
+            None,
+            disk(),
+            1,
+            None,
+            false,
+        )
+        .await
+        .expect("fresh run");
+
+        // --resume over (200, 203]: picks up from the checkpoint at 202 and replays only 203.
+        let out = backfill(
+            SNAPSHOT,
+            200,
+            source(),
+            None,
+            200,
+            203,
+            &system,
+            &store,
+            None,
+            disk(),
+            1,
+            None,
+            true,
+        )
+        .await
+        .expect("resume run");
+        assert!(
+            out.replay.is_complete(),
+            "resume halted: {:?}",
+            out.replay.halt
+        );
+
+        // w3 is funded only at 203, past the checkpoint: proves the resume replayed on.
+        let w3_end = store
+            .get_account_info(&w3.to_bytes(), 203)
+            .await
+            .unwrap()
+            .expect("w3 present at 203");
+        assert_eq!(w3_end.lamports, 1_000_000);
+        // w1's slot-202 value from the fresh run survived the reopen.
+        let w1_end = store
+            .get_account_info(&w1.to_bytes(), 203)
+            .await
+            .unwrap()
+            .expect("w1 present");
+        assert_eq!(w1_end.lamports, 3_000_000 - 2_000_000 - fee);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("end.redb"));
     }
 }

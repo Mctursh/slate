@@ -32,6 +32,27 @@ fn lt_hash_bytes(lt: &LtHash) -> [u8; 2048] {
     bytes
 }
 
+// Roll state for a checkpoint: 2048 LE lattice bytes ++ 32 hash bytes (the snapshot-trailer layout).
+pub(crate) fn serialize_roll_state(lt: &LtHash, bank_hash: &Hash) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2048 + 32);
+    out.extend_from_slice(&lt_hash_bytes(lt));
+    out.extend_from_slice(bank_hash.as_ref());
+    out
+}
+
+// Inverse of serialize_roll_state; None on a wrong length.
+pub(crate) fn deserialize_roll_state(bytes: &[u8]) -> Option<(LtHash, Hash)> {
+    if bytes.len() != 2048 + 32 {
+        return None;
+    }
+    let mut lanes = [0u16; 1024];
+    for (lane, chunk) in lanes.iter_mut().zip(bytes[..2048].chunks_exact(2)) {
+        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
+    }
+    let bank_hash = Hash::new_from_array(bytes[2048..2080].try_into().ok()?);
+    Some((LtHash(lanes), bank_hash))
+}
+
 // Lattice-regime bank hash: SHA256(SHA256(parent||sig_count_LE||blockhash)||lt_hash[2048]). No accounts-delta (SIMD-0223), no epoch-accounts-hash (SIMD-0215).
 pub fn bank_hash(
     parent_bank_hash: &Hash,
@@ -65,6 +86,11 @@ impl BankHashRoller {
     // Current bank hash; prepended into SlotHashes for the next slot.
     pub fn bank_hash(&self) -> Hash {
         self.bank_hash
+    }
+
+    // By reference: LtHash is large and deliberately not Copy.
+    pub fn lt_hash(&self) -> &LtHash {
+        &self.lt_hash
     }
 
     pub fn roll_slot(
@@ -112,6 +138,19 @@ mod tests {
             75, 109, 182, 198, 119, 61, 11, 81, 41, 70, 24, 87, 100, 85,
         ];
         assert_eq!(lt.checksum().0, expected);
+    }
+
+    #[test]
+    fn roll_state_round_trips() {
+        let mut lanes = [0u16; 1024];
+        for (i, l) in lanes.iter_mut().enumerate() {
+            *l = (i as u16).wrapping_mul(7).wrapping_add(1);
+        }
+        let lt = LtHash(lanes);
+        let hash = Hash::new_from_array([3u8; 32]);
+        let (lt2, hash2) = deserialize_roll_state(&serialize_roll_state(&lt, &hash)).unwrap();
+        assert_eq!(lt.0, lt2.0);
+        assert_eq!(hash, hash2);
     }
 
     // The bank-hash combine is two nested SHA-256s over the four inputs.
