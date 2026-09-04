@@ -184,6 +184,16 @@ impl ReplayBank {
         self.bankhash_roller.as_ref().map(|r| r.bank_hash())
     }
 
+    // Durably checkpoint at `slot`: flush accounts + roll state in one atomic commit, so --resume can continue from here. A no-op roll (tests) serializes to empty.
+    pub fn checkpoint(&mut self, slot: u64) -> anyhow::Result<()> {
+        let roll = self
+            .bankhash_roller
+            .as_ref()
+            .map(|r| crate::bankhash::serialize_roll_state(r.lt_hash(), &r.bank_hash()))
+            .unwrap_or_default();
+        self.store.checkpoint_flush(slot, &roll)
+    }
+
     // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
     pub fn finalize_slot_bankhash(
         &mut self,
