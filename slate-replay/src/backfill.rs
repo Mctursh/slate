@@ -114,7 +114,10 @@ pub async fn backfill(
                     Some(&footprint),
                     Some(program),
                 )?;
-                eprintln!("seeded {written} accounts into disk store {}", path.display());
+                eprintln!(
+                    "seeded {written} accounts into disk store {}",
+                    path.display()
+                );
                 // Seed's done (auto-flushed in batches); from here hold writes so only checkpoint_flush commits.
                 disk.set_checkpoint_mode(true);
                 let baseline = persist::baseline_rows(&owned, program, s_snap);
@@ -424,42 +427,47 @@ mod tests {
             .map(|(k, (a, _))| (*k, a.lamports()))
             .max_by_key(|&(_, bal)| bal)
             .expect("a fundable wallet");
-        let (w1, w2, w3) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let (w1, w2, w3) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
         let fee = 5_000u64;
 
-        let transfer = |from: &Pubkey, to: &Pubkey, amount: u64, from_pre: u64, slot: u64| -> Block {
-            let mut data = vec![2u8, 0, 0, 0];
-            data.extend_from_slice(&amount.to_le_bytes());
-            let ix = Instruction {
-                program_id: system,
-                accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
-                data,
+        let transfer =
+            |from: &Pubkey, to: &Pubkey, amount: u64, from_pre: u64, slot: u64| -> Block {
+                let mut data = vec![2u8, 0, 0, 0];
+                data.extend_from_slice(&amount.to_le_bytes());
+                let ix = Instruction {
+                    program_id: system,
+                    accounts: vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
+                    data,
+                };
+                let message = Message::new_with_blockhash(&[ix], Some(from), &Hash::default());
+                Block {
+                    slot,
+                    parent_slot: slot - 1,
+                    blockhash: Hash::default(),
+                    previous_blockhash: Hash::default(),
+                    block_time: 1_700_000_000,
+                    transactions: vec![BlockTx {
+                        transaction: VersionedTransaction {
+                            signatures: vec![Signature::default()],
+                            message: VersionedMessage::Legacy(message),
+                        },
+                        meta: TxMeta {
+                            err: None,
+                            fee,
+                            compute_units_consumed: 150,
+                            pre_balances: vec![from_pre, 0, 1],
+                            post_balances: vec![from_pre - amount - fee, amount, 1],
+                            loaded_addresses: LoadedAddresses::default(),
+                            post_token_balances: vec![],
+                        },
+                    }],
+                    fee_reward: None,
+                }
             };
-            let message = Message::new_with_blockhash(&[ix], Some(from), &Hash::default());
-            Block {
-                slot,
-                parent_slot: slot - 1,
-                blockhash: Hash::default(),
-                previous_blockhash: Hash::default(),
-                block_time: 1_700_000_000,
-                transactions: vec![BlockTx {
-                    transaction: VersionedTransaction {
-                        signatures: vec![Signature::default()],
-                        message: VersionedMessage::Legacy(message),
-                    },
-                    meta: TxMeta {
-                        err: None,
-                        fee,
-                        compute_units_consumed: 150,
-                        pre_balances: vec![from_pre, 0, 1],
-                        post_balances: vec![from_pre - amount - fee, amount, 1],
-                        loaded_addresses: LoadedAddresses::default(),
-                        post_token_balances: vec![],
-                    },
-                }],
-                fee_reward: None,
-            }
-        };
 
         // One hop per slot: src -> w1 (201), w1 -> w2 (202), w2 -> w3 (203).
         let blocks = vec![
@@ -480,18 +488,46 @@ mod tests {
 
         // Fresh run over (200, 202]: replays 201, 202 and checkpoints each (chunk_slots = 1).
         backfill(
-            SNAPSHOT, 200, source(), None, 200, 202, &system, &store, None, disk(), 1, None, false,
+            SNAPSHOT,
+            200,
+            source(),
+            None,
+            200,
+            202,
+            &system,
+            &store,
+            None,
+            disk(),
+            1,
+            None,
+            false,
         )
         .await
         .expect("fresh run");
 
         // --resume over (200, 203]: picks up from the checkpoint at 202 and replays only 203.
         let out = backfill(
-            SNAPSHOT, 200, source(), None, 200, 203, &system, &store, None, disk(), 1, None, true,
+            SNAPSHOT,
+            200,
+            source(),
+            None,
+            200,
+            203,
+            &system,
+            &store,
+            None,
+            disk(),
+            1,
+            None,
+            true,
         )
         .await
         .expect("resume run");
-        assert!(out.replay.is_complete(), "resume halted: {:?}", out.replay.halt);
+        assert!(
+            out.replay.is_complete(),
+            "resume halted: {:?}",
+            out.replay.halt
+        );
 
         // w3 is funded only at 203, past the checkpoint: proves the resume replayed on.
         let w3_end = store

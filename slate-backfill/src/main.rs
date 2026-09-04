@@ -118,7 +118,9 @@ fn main() -> anyhow::Result<()> {
         Some(path)
     };
     if args.resume {
-        println!("preflight ok: RPC, program, config, and ClickHouse check out (resume: no snapshot)");
+        println!(
+            "preflight ok: RPC, program, config, and ClickHouse check out (resume: no snapshot)"
+        );
     } else {
         println!("preflight ok: RPC, program, config, ClickHouse, and snapshot all check out");
     }
