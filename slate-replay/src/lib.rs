@@ -694,6 +694,20 @@ impl Replayer {
                 return BlockReplay::halted(i, reconciliation.issues.join("; "));
             }
 
+            // A deploy or upgrade hands back cache entries whose effective_slot is deployment_slot+1,
+            // so the program is not yet visible for the rest of this slot. Merging them on commit (as
+            // the runtime does) makes later transactions in the same block fail as "not deployed"
+            // instead of running the superseded bytecode.
+            if let Ok(ProcessedTransaction::Executed(executed)) = &result
+                && executed.was_successful()
+                && !executed.programs_modified_by_tx.is_empty()
+            {
+                processor
+                    .global_program_cache
+                    .write()
+                    .unwrap()
+                    .merge(&processor.environments, &executed.programs_modified_by_tx);
+            }
             commit_writes(bank, &tx, &result, block.slot);
         }
 
@@ -1260,6 +1274,178 @@ mod tests {
             11_451,
             "replay CU (chain was {})",
             fixture::cpi::COMPUTE_UNITS
+        );
+    }
+
+    // Lamports sent to the incinerator are destroyed at freeze. Leaving them on the account keeps
+    // lamports in the lattice that consensus burned, which is what diverged slot 349276865.
+    #[test]
+    fn the_incinerator_is_burned_at_freeze() {
+        use solana_account::{Account, ReadableAccount};
+
+        let incinerator = solana_sdk_ids::incinerator::id();
+        let mut bank = ReplayBank::default();
+        bank.begin_slot();
+        bank.insert(
+            incinerator,
+            AccountSharedData::from(Account {
+                lamports: 6216,
+                data: vec![],
+                owner: solana_sdk_ids::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            }),
+            9,
+        );
+
+        bank.freeze_slot(9, Hash::default(), None);
+
+        let (account, _) = bank
+            .store()
+            .get(&incinerator)
+            .expect("the burn stores a zeroed account, it does not drop the key");
+        assert_eq!(
+            account.lamports(),
+            0,
+            "freeze must destroy the incinerator balance, not carry it into the lattice"
+        );
+        assert!(account.data().is_empty());
+    }
+
+    // The burn is guarded on "written this slot" (the runtime's modified-since-parent). A balance
+    // left from an earlier slot is not this slot's to destroy, and firing anyway would write an
+    // account the real slot never touched.
+    #[test]
+    fn freeze_leaves_an_untouched_incinerator_alone() {
+        use solana_account::{Account, ReadableAccount};
+
+        let incinerator = solana_sdk_ids::incinerator::id();
+        let mut bank = ReplayBank::default();
+        // Seeded before begin_slot, so it is not recorded as written this slot.
+        bank.insert(
+            incinerator,
+            AccountSharedData::from(Account {
+                lamports: 4242,
+                data: vec![],
+                owner: solana_sdk_ids::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            }),
+            8,
+        );
+        bank.begin_slot();
+
+        bank.freeze_slot(9, Hash::default(), None);
+
+        let (account, _) = bank.store().get(&incinerator).expect("still present");
+        assert_eq!(
+            account.lamports(),
+            4242,
+            "an incinerator the slot never wrote must be left untouched"
+        );
+    }
+
+    // A program deployed or upgraded in a slot is not visible until the next one: the runtime loads
+    // it with effective_slot = deployment_slot + 1, so invoking it in its own deploy slot must fail
+    // as "not deployed" rather than run the bytecode. Chain enforced this at 349296581, where seven
+    // transactions after a mid-block Raydium upgrade failed while Slate ran them.
+    #[test]
+    fn a_program_is_not_invokable_in_its_own_deploy_slot() {
+        use solana_account::{Account, ReadableAccount};
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
+
+        let deploy_slot = fixture::cpi::SLOT;
+        let programdata: Pubkey = fixture::cpi::PROGRAMDATA.parse().unwrap();
+
+        // programData is [variant u32][deployment slot u64][Option<authority>][ELF]; stamping the
+        // slot is exactly what an upgrade does, and is what the loader reads to date the program.
+        let run_at = |slot: u64| {
+            let mut bank = fixture::cpi::seed_bank();
+            let (pd, _) = bank.store().get(&programdata).unwrap();
+            let mut bytes = pd.data().to_vec();
+            bytes[4..12].copy_from_slice(&deploy_slot.to_le_bytes());
+            let pd = AccountSharedData::from(Account {
+                lamports: pd.lamports(),
+                data: bytes,
+                owner: *pd.owner(),
+                executable: pd.executable(),
+                rent_epoch: pd.rent_epoch(),
+            });
+            bank.insert(programdata, pd, deploy_slot);
+
+            let epoch = slot / 432_000;
+            let replayer = Replayer::new(slot, epoch);
+            register_builtins(&mut bank, &replayer.processor);
+            bank.configure_sysvars(slot, fixture::cpi::BLOCK_TIME);
+            replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+            let tx = fixture::cpi::sanitized_transaction();
+            replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default())
+        };
+
+        let in_deploy_slot = run_at(deploy_slot);
+        assert!(
+            !matches!(&in_deploy_slot, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "a program deployed this slot must not be invokable in it: {in_deploy_slot:?}"
+        );
+
+        // The slot after, it goes live. This half also proves the stamp landed on the slot field
+        // rather than corrupting the header, which would fail both halves.
+        let next_slot = run_at(deploy_slot + 1);
+        assert!(
+            matches!(&next_slot, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "the program must become invokable the slot after deployment: {next_slot:?}"
+        );
+    }
+
+    // A tx that deploys or upgrades hands back program-cache entries, and they have to reach the
+    // shared cache or the rest of the block keeps invoking the superseded program. That is what ran
+    // seven transactions at 349296581 which chain rejected. A tombstone stands in for what a real
+    // upgrade hands back; what is under test is that merging reaches the cache execution reads.
+    #[test]
+    fn program_entries_modified_by_a_tx_reach_the_shared_cache() {
+        use solana_program_runtime::loaded_programs::{
+            ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
+        };
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
+        use std::collections::HashMap;
+
+        let s = fixture::cpi::SLOT;
+        let epoch = s / 432_000;
+        let mut bank = fixture::cpi::seed_bank();
+        let replayer = Replayer::new(s, epoch);
+        register_builtins(&mut bank, &replayer.processor);
+        bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
+        replayer.processor.fill_missing_sysvar_cache_entries(&bank);
+
+        let tx = fixture::cpi::sanitized_transaction();
+        let program: Pubkey = fixture::cpi::PROGRAM.parse().unwrap();
+
+        let warm = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
+        assert!(
+            matches!(&warm, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "warm-up should succeed and cache the program: {warm:?}"
+        );
+
+        let modified: HashMap<Pubkey, std::sync::Arc<ProgramCacheEntry>> = HashMap::from([(
+            program,
+            std::sync::Arc::new(ProgramCacheEntry::new_tombstone(
+                s,
+                ProgramCacheEntryOwner::LoaderV3,
+                ProgramCacheEntryType::Closed,
+            )),
+        )]);
+        replayer
+            .processor
+            .global_program_cache
+            .write()
+            .unwrap()
+            .merge(&replayer.processor.environments, &modified);
+
+        let after = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
+        assert!(
+            !matches!(&after, Ok(ProcessedTransaction::Executed(e)) if e.was_successful()),
+            "entries merged from a tx must be visible to the cache execution reads, but the \
+             superseded program still ran: {after:?}"
         );
     }
 
