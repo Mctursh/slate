@@ -423,10 +423,14 @@ mod tests {
 
     #[tokio::test]
     async fn coverage_only_matches_spans_inside_a_segment() {
-        store().record_coverage(100, 150).await.unwrap();
-        assert!(store().is_covered(120, 140).await.unwrap());
-        assert!(!store().is_covered(120, 200).await.unwrap());
-        assert!(!store().is_covered(90, 140).await.unwrap());
+        // Slots unique to this test. Every crate's tests share the one slate_test database, and
+        // `is_covered` takes max(segment_hi) per segment_lo, so a segment another test records at
+        // the same segment_lo would widen this one's and mask the boundary being asserted (which
+        // is exactly what persist.rs recording (100, 200) did to a segment starting at 100).
+        store().record_coverage(4_100_100, 4_100_150).await.unwrap();
+        assert!(store().is_covered(4_100_120, 4_100_140).await.unwrap());
+        assert!(!store().is_covered(4_100_120, 4_100_200).await.unwrap());
+        assert!(!store().is_covered(4_100_090, 4_100_140).await.unwrap());
     }
 
     #[tokio::test]
