@@ -12,7 +12,11 @@ Slate is open source and self-hostable. You run it, point it at the program you 
 
 ## Status
 
-v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale. Backfill is new: a mainnet run vote-verified 21,963 consecutive slots bit-exact against consensus. Its fidelity has a long tail still being closed, so the replay records coverage up to the last verified slot and never guesses. See [Roadmap](#roadmap).
+v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale.
+
+Backfill has replayed a full snapshot-to-snapshot mainnet window, 50,079 slots, verified two independent ways: every slot's bank hash checked against the consensus hash carried in that block's own vote transactions, and the end state diffed byte-for-byte against the official snapshot at the end of the range, 8,412,739 accounts with zero mismatches.
+
+That run is epoch 808. Other epochs need the feature gating in [Roadmap](#roadmap) first, since builtin registration and precompiles currently assume the feature set at that floor. Fidelity has a tail still being closed, so the replay records coverage up to the last verified slot and never guesses.
 
 ## How it works
 
@@ -136,11 +140,25 @@ cargo run -p slate-backfill --release -- \
   --program <pubkey> \
   --rpc http://localhost:8888 \
   --store disk --store-path accounts.redb --cache-size 34359738368 \
+  --block-cache blocks.redb \
   --fetch-concurrency 16 \
   --verify-boundary snapshot-<to>.tar.zst
 ```
 
 `--store disk` keeps a range too big for RAM on disk (pure Rust, no extra deps). Old Faithful flakes under load, so the fetch retries hard; `--fetch-concurrency 16` is a safe default. Drop `--verify-boundary` if you don't have the end snapshot.
+
+**Long runs.** A run checkpoints its accounts and bank-hash roll state together every `--chunk-slots` (default 2000). If it stops, for any reason, `--resume` continues from the last checkpoint instead of re-seeding from the snapshot:
+
+```sh
+cargo run -p slate-backfill --release -- --resume \
+  --from <start_slot> --to <end_slot> \
+  --program <pubkey> \
+  --rpc http://localhost:8888 \
+  --store disk --store-path accounts.redb \
+  --block-cache blocks.redb
+```
+
+`--resume` needs the same `--store-path`, and takes no snapshot argument. `--block-cache` keeps every fetched block, so a resume or re-run doesn't pull them again; point successive runs of the same range at one file.
 
 **What you get.** As it replays, Slate rolls each slot's bank hash forward and checks it against the consensus hash carried in that block's own vote transactions, so every slot is verified against what the network agreed on, no external oracle needed. It stops at the first slot it can't reproduce and records coverage up to the last good one. The same account history lands in ClickHouse, served through the same as-of-slot RPC.
 
@@ -167,7 +185,9 @@ bind = "127.0.0.1:8899"
 
 ## Validation
 
-Backfill self-verifies against the consensus hash in each block's votes (see [Backfill](#backfill)), so it needs no reference RPC. The live path is checked separately, by a differential harness: it reads a program's accounts from a reference RPC at that RPC's current slot, waits for Slate to stream past it, then diffs Slate's as-of answer. A match means Slate's reconstruction of a now-past slot agrees with an RPC it never saw, account for account.
+Backfill self-verifies two ways, neither needing a reference RPC. Per slot, it checks its computed bank hash against the consensus hash carried in that block's own vote transactions (see [Backfill](#backfill)), and halts at the first slot it can't reproduce. At the end of a range, `--verify-boundary` diffs the reconstructed state against the official snapshot at `--to`, account by account, comparing lamports, owner, executable flag and data, and exits non-zero on any mismatch. The first proves each step against what the network agreed on; the second proves the destination against an artifact Slate didn't produce.
+
+The live path is checked separately, by a differential harness: it reads a program's accounts from a reference RPC at that RPC's current slot, waits for Slate to stream past it, then diffs Slate's as-of answer. A match means Slate's reconstruction of a now-past slot agrees with an RPC it never saw, account for account.
 
 ```sh
 # use an RPC that is NOT the one seeding Slate's baseline
@@ -209,8 +229,8 @@ cargo test --workspace -- --test-threads=1
 
 ## Roadmap
 
-- **Backfill fidelity.** Close the long tail of historical transactions the replay can't yet reproduce, a class at a time.
-- **Resumable runs.** Checkpoint a backfill and cache fetched blocks, so a long run survives an interruption and doesn't re-fetch.
+- **Feature gating for other epochs.** Builtin registration and precompile verification currently assume the feature set at the epoch-808 floor, so an earlier range would use programs that weren't active yet. Gate them on the per-slot feature set the replay already builds.
+- **Backfill fidelity.** Close the remaining tail of historical transactions the replay can't yet reproduce, a class at a time.
 - **Multi-epoch backfill.** Span successive snapshot windows to reconstruct a whole epoch and beyond.
 - **Gap repair.** Heal recorded coverage holes from incremental snapshots while they're still in retention.
 - **Durable source.** Ingest from a replayable stream (Triton's Fumarole, Helius's LaserStream, and the like), so a reconnect rewinds and most gaps heal on their own.
