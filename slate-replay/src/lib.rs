@@ -314,6 +314,17 @@ impl ReplayBank {
                 bincode::serialize(&history).unwrap(),
             );
         }
+        // Incinerator burn (agave Bank::run_incinerator): lamports sent here are destroyed at freeze,
+        // only when the account was written this slot. Must land before the lattice roll or the burned
+        // lamports stay in the bank hash.
+        let incinerator = solana_sdk_ids::incinerator::id();
+        if self
+            .slot_dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.contains_key(&incinerator))
+        {
+            self.insert(incinerator, AccountSharedData::default(), slot);
+        }
         #[allow(deprecated)]
         if let Some(current) = self
             .get_account_shared_data(&solana_sdk_ids::sysvar::recent_blockhashes::id())
