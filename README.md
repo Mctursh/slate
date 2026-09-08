@@ -16,7 +16,7 @@ v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale.
 
 Backfill has replayed a full snapshot-to-snapshot mainnet window, 50,079 slots, verified two independent ways: every slot's bank hash checked against the consensus hash carried in that block's own vote transactions, and the end state diffed byte-for-byte against the official snapshot at the end of the range, 8,412,739 accounts with zero mismatches.
 
-That run is epoch 808. Other epochs need the feature gating in [Roadmap](#roadmap) first, since builtin registration and precompiles currently assume the feature set at that floor. Fidelity has a tail still being closed, so the replay records coverage up to the last verified slot and never guesses.
+That run is epoch 808, the only range verified so far. Builtin registration and precompile verification key off the per-slot feature set the replay builds from the on-chain feature accounts, so a range elsewhere in history gets the programs that actually existed at those slots, as long as it stays inside one epoch (see [Roadmap](#roadmap)). Fidelity has a tail still being closed, so the replay records coverage up to the last verified slot and never guesses.
 
 ## How it works
 
@@ -229,9 +229,8 @@ cargo test --workspace -- --test-threads=1
 
 ## Roadmap
 
-- **Feature gating for other epochs.** Builtin registration and precompile verification currently assume the feature set at the epoch-808 floor, so an earlier range would use programs that weren't active yet. Gate them on the per-slot feature set the replay already builds.
 - **Backfill fidelity.** Close the remaining tail of historical transactions the replay can't yet reproduce, a class at a time.
-- **Multi-epoch backfill.** Span successive snapshot windows to reconstruct a whole epoch and beyond.
+- **Multi-epoch backfill.** Span successive snapshot windows to reconstruct a whole epoch and beyond. A range has to stay inside one epoch for now: the feature set is built once from the range's first slot, and features activate on epoch boundaries, so a range that crosses one would replay its tail against the previous epoch's set.
 - **Gap repair.** Heal recorded coverage holes from incremental snapshots while they're still in retention.
 - **Durable source.** Ingest from a replayable stream (Triton's Fumarole, Helius's LaserStream, and the like), so a reconnect rewinds and most gaps heal on their own.
 - **asOfTime.** Query by timestamp, not just slot.
