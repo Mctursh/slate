@@ -6,7 +6,10 @@ use slate_replay::{ReplayBank, build_feature_set, store::DiskStore};
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: <accounts.redb> <slot>");
-    let slot: u64 = args.next().expect("usage: <accounts.redb> <slot>").parse()?;
+    let slot: u64 = args
+        .next()
+        .expect("usage: <accounts.redb> <slot>")
+        .parse()?;
 
     let store = DiskStore::create(&path, 1 << 30)?;
     let bank = ReplayBank::with_store(Box::new(store));
