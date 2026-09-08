@@ -80,6 +80,9 @@ pub struct ReplayBank {
     slot_dirty: Option<HashMap<Pubkey, Option<AccountSharedData>>>,
     // Running lattice + bank hash; None for tests that don't need forward bank hashes.
     bankhash_roller: Option<BankHashRoller>,
+    // Per-slot feature set, consulted by the precompile callbacks. Defaults to all-enabled so
+    // fixtures keep working; a faithful replay overwrites it via set_feature_set once seeded.
+    feature_set: FeatureSet,
 }
 
 impl Default for ReplayBank {
@@ -90,6 +93,7 @@ impl Default for ReplayBank {
             write_version: 0,
             slot_dirty: None,
             bankhash_roller: None,
+            feature_set: FeatureSet::all_enabled(),
         }
     }
 }
@@ -106,11 +110,15 @@ impl ReplayBank {
     pub fn with_store(store: Box<dyn AccountStore>) -> Self {
         Self {
             store,
-            writes: Vec::new(),
-            write_version: 0,
-            slot_dirty: None,
-            bankhash_roller: None,
+            ..Self::default()
         }
+    }
+
+    // The precompile callbacks read this. Set it after seeding, since build_feature_set derives the
+    // set from the feature accounts the seed just supplied; the default is all-enabled, which is
+    // right for fixtures and wrong for any range below a precompile's activation slot.
+    pub fn set_feature_set(&mut self, feature_set: FeatureSet) {
+        self.feature_set = feature_set;
     }
 
     // Flush buffered writes to disk (no-op for the in-memory store).
@@ -411,8 +419,14 @@ impl ReplayBank {
 pub fn register_builtins(
     bank: &mut ReplayBank,
     processor: &TransactionBatchProcessor<SlateForkGraph>,
+    feature_set: &FeatureSet,
 ) {
     for builtin in solana_builtins::BUILTINS {
+        if let Some(feature_id) = builtin.enable_feature_id
+            && !feature_set.is_active(&feature_id)
+        {
+            continue; // gated behind a feature not yet active at this slot: it did not exist here
+        }
         bank.add_builtin(
             processor,
             builtin.program_id,
@@ -448,10 +462,12 @@ pub fn build_feature_set(bank: &ReplayBank, slot: u64) -> FeatureSet {
     feature_set
 }
 
-// Precompile verification wired to agave-precompiles; all precompile features are active at the epoch-808 floor, so all count as enabled.
+// Precompile verification wired to agave-precompiles, gated on the bank's per-slot feature set.
+// secp256k1 and ed25519 are always enabled; secp256r1 is behind enable_secp256r1_precompile, so a
+// range before its activation must not resolve it as a precompile at all.
 impl InvokeContextCallback for ReplayBank {
     fn is_precompile(&self, program_id: &Pubkey) -> bool {
-        agave_precompiles::is_precompile(program_id, |_| true)
+        agave_precompiles::is_precompile(program_id, |id| self.feature_set.is_active(id))
     }
 
     fn process_precompile(
@@ -460,10 +476,8 @@ impl InvokeContextCallback for ReplayBank {
         data: &[u8],
         instruction_datas: Vec<&[u8]>,
     ) -> Result<(), PrecompileError> {
-        match agave_precompiles::get_precompile(program_id, |_| true) {
-            Some(precompile) => {
-                precompile.verify(data, &instruction_datas, &FeatureSet::all_enabled())
-            }
+        match agave_precompiles::get_precompile(program_id, |id| self.feature_set.is_active(id)) {
+            Some(precompile) => precompile.verify(data, &instruction_datas, &self.feature_set),
             None => Err(PrecompileError::InvalidPublicKey),
         }
     }
@@ -945,7 +959,7 @@ mod tests {
         use solana_account::ReadableAccount;
         let mut bank = fixture::seed_bank();
         let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let (acct, _) = bank
             .get_account_shared_data(&solana_system_program::id())
@@ -959,7 +973,7 @@ mod tests {
         use solana_account::ReadableAccount;
         let mut bank = fixture::seed_bank();
         let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         // Every builtin agave lists is registered, executable, and native-owned.
         for builtin in solana_builtins::BUILTINS {
@@ -978,6 +992,53 @@ mod tests {
             bank.get_account_shared_data(&solana_sdk_ids::loader_v4::id())
                 .is_some()
         );
+    }
+
+    // A builtin behind an inactive feature did not exist at that slot, so registering it would let
+    // transactions invoke a program the real cluster would have rejected. zk_elgamal is the gate that
+    // matters in practice: it is the only one of the three that ever activated on mainnet (slot
+    // 315_792_000), so every range before that must not have it.
+    #[test]
+    fn a_builtin_gated_by_an_inactive_feature_is_not_registered() {
+        let gated = solana_sdk_ids::zk_elgamal_proof_program::id();
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::zk_elgamal_proof_program_enabled::id());
+
+        let mut bank = fixture::seed_bank();
+        let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
+        register_builtins(&mut bank, &replayer.processor, &feature_set);
+
+        let cache = replayer.processor.global_program_cache.read().unwrap();
+        assert!(
+            cache.get_slot_versions_for_tests(&gated).is_empty(),
+            "zk_elgamal is gated off, so it must not reach the program cache"
+        );
+    }
+
+    // The inverse, and the one that actually earns its keep: a gate that reads the wrong field skips
+    // every builtin, which the test above would still pass. This one fails on it.
+    #[test]
+    fn an_ungated_builtin_survives_a_partial_feature_set() {
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::zk_elgamal_proof_program_enabled::id());
+
+        let mut bank = fixture::seed_bank();
+        let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
+        register_builtins(&mut bank, &replayer.processor, &feature_set);
+
+        let cache = replayer.processor.global_program_cache.read().unwrap();
+        for builtin in solana_builtins::BUILTINS
+            .iter()
+            .filter(|b| b.enable_feature_id.is_none())
+        {
+            assert!(
+                !cache
+                    .get_slot_versions_for_tests(&builtin.program_id)
+                    .is_empty(),
+                "{} has no feature gate, deactivating an unrelated feature must not drop it",
+                builtin.name
+            );
+        }
     }
 
     #[test]
@@ -1015,7 +1076,7 @@ mod tests {
         );
 
         let replayer = Replayer::new(0, 0);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let (acct, _) = bank
             .get_account_shared_data(&system)
@@ -1103,7 +1164,7 @@ mod tests {
 
         let mut bank = fixture::seed_bank();
         let replayer = Replayer::new(fixture::SLOT, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(fixture::SLOT, fixture::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -1164,7 +1225,7 @@ mod tests {
 
         let mut bank = fixture::memo::seed_bank();
         let replayer = Replayer::new(m, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(m, fixture::memo::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -1222,7 +1283,7 @@ mod tests {
 
         let mut bank = fixture::cpi::seed_bank();
         let replayer = Replayer::new(s, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -1375,7 +1436,7 @@ mod tests {
 
             let epoch = slot / 432_000;
             let replayer = Replayer::new(slot, epoch);
-            register_builtins(&mut bank, &replayer.processor);
+            register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
             bank.configure_sysvars(slot, fixture::cpi::BLOCK_TIME);
             replayer.processor.fill_missing_sysvar_cache_entries(&bank);
             let tx = fixture::cpi::sanitized_transaction();
@@ -1413,7 +1474,7 @@ mod tests {
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
         let replayer = Replayer::new(s, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -1459,7 +1520,7 @@ mod tests {
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
         let replayer = Replayer::new(s, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -1523,7 +1584,7 @@ mod tests {
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
         let replayer = Replayer::new(s, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let block = fixture::cpi::block();
         let outcome = replayer.replay_block(&mut bank, &block, epoch);
@@ -1571,7 +1632,7 @@ mod tests {
         let epoch = slot / 432_000;
         let mut bank = snapshot::seed_bank_from_snapshot(SNAPSHOT, None).unwrap();
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let transfer = |from: &Pubkey, to: &Pubkey, lamports: u64| -> VersionedTransaction {
             let mut data = vec![2u8, 0, 0, 0]; // SystemInstruction::Transfer discriminant
@@ -1756,7 +1817,7 @@ mod tests {
                 slot,
             );
             let replayer = Replayer::new(slot, epoch);
-            register_builtins(&mut bank, &replayer.processor);
+            register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
             let tx = sanitize(&build(cu_limit), &crate::block::LoadedAddresses::default()).unwrap();
             let result = replayer.execute(&bank, &tx, 5_000, epoch, Hash::default());
             matches!(&result, Ok(ProcessedTransaction::Executed(e)) if e.was_successful())
@@ -1796,7 +1857,7 @@ mod tests {
             slot,
         );
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         // Transfer 10x the payer's balance: loads and executes, then fails on insufficient funds, fee charged, transfer rolled back.
         let mut data = vec![2u8, 0, 0, 0]; // System Transfer (4-byte disc)
@@ -1893,7 +1954,7 @@ mod tests {
             slot,
         );
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         // AdvanceNonceAccount reads RecentBlockhashes from the sysvar cache, so configure + pull it in first.
         bank.configure_sysvars(slot, 1_700_000_000);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
@@ -2013,7 +2074,7 @@ mod tests {
             slot,
         );
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(slot, 1_700_000_000);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -2110,7 +2171,7 @@ mod tests {
         bank.insert(vote_pubkey, wallet(0), current_slot); // tx1 creates it
 
         let replayer = Replayer::new(current_slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(current_slot, 1_700_000_000);
         bank.set_slot_hashes(&[(voted_slot, voted_hash)]);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
@@ -2230,7 +2291,7 @@ mod tests {
             base_slot,
         );
         let replayer = Replayer::new(base_slot, base_slot / 432_000);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         // Block N: src -> mid; block N+1: mid -> dst, which only reconciles if block N's write to mid rolled forward.
         let blocks = [
@@ -2290,5 +2351,53 @@ mod tests {
                 .is_err(),
             "a corrupted precompile instruction must fail"
         );
+    }
+
+    // secp256r1 is the only feature-gated precompile (enable_secp256r1_precompile, activated at slot
+    // 345_600_000, the first slot of epoch 800). Before that the cluster had no secp256r1 precompile
+    // at all, so a range below it must not resolve one.
+    #[test]
+    fn a_precompile_gated_by_an_inactive_feature_is_not_recognised() {
+        let secp256r1 = solana_sdk_ids::secp256r1_program::id();
+
+        // Baseline: with the feature active it IS a precompile, so the assertion below is about the
+        // gate and not about secp256r1 being unsupported outright.
+        assert!(ReplayBank::default().is_precompile(&secp256r1));
+
+        let mut bank = ReplayBank::default();
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::enable_secp256r1_precompile::id());
+        bank.set_feature_set(feature_set);
+
+        assert!(
+            !bank.is_precompile(&secp256r1),
+            "secp256r1 is gated off, so the runtime must not treat it as a precompile"
+        );
+        assert!(
+            bank.process_precompile(&secp256r1, &[], vec![]).is_err(),
+            "verifying through a precompile that did not exist yet must fail"
+        );
+    }
+
+    // Weaker than its builtin counterpart, deliberately: Precompile::check_id short-circuits on
+    // `feature.is_none_or(..)`, so the predicate is never consulted for an ungated precompile and no
+    // predicate bug can drop these two. The over-gating guard is the baseline assert in the test
+    // above. This pins the invariant against a future rewrite of the callback itself.
+    #[test]
+    fn ungated_precompiles_survive_a_partial_feature_set() {
+        let mut bank = ReplayBank::default();
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::enable_secp256r1_precompile::id());
+        bank.set_feature_set(feature_set);
+
+        for id in [
+            solana_sdk_ids::ed25519_program::id(),
+            solana_sdk_ids::secp256k1_program::id(),
+        ] {
+            assert!(
+                bank.is_precompile(&id),
+                "{id} has no feature gate, deactivating an unrelated feature must not disable it"
+            );
+        }
     }
 }

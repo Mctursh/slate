@@ -180,13 +180,14 @@ fn check_token_balances(
 mod tests {
     use super::*;
     use crate::{Replayer, block::LoadedAddresses, fixture, register_builtins};
+    use agave_feature_set::FeatureSet;
 
     fn replay_cpi() -> (Vec<Pubkey>, TransactionProcessingResult) {
         let s = fixture::cpi::SLOT;
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
         let replayer = Replayer::new(s, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
         bank.configure_sysvars(s, fixture::cpi::BLOCK_TIME);
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
 
@@ -268,7 +269,7 @@ mod tests {
             slot,
         );
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let ix = Instruction {
             program_id: fake_program,
@@ -418,7 +419,7 @@ mod tests {
             slot,
         );
         let replayer = Replayer::new(slot, epoch);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let mut data = vec![2u8, 0, 0, 0]; // System Transfer
         data.extend_from_slice(&100_000_000u64.to_le_bytes()); // more than the payer holds

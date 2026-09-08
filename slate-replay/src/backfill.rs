@@ -146,8 +146,10 @@ pub async fn backfill(
     let result = if let Some(&first_slot) = replay_slots.first() {
         let epoch = first_slot / 432_000;
         let feature_set = build_feature_set(&bank, first_slot);
+        // The bank needs its own copy: the SVM reaches the precompile callbacks through the bank, not the replayer.
+        bank.set_feature_set(feature_set.clone());
         let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
-        register_builtins(&mut bank, &replayer.processor);
+        register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
         // Compat: re-supply native builtins agave deleted post core-BPF migration (e.g. Stake), gated per feature so it's a no-op once active.
         compat::register_removed_builtins(&mut bank, &replayer.processor, replayer.feature_set());
 
