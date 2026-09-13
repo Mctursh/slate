@@ -245,7 +245,7 @@ mod tests {
     #[test]
     #[ignore = "needs the local mainnet snapshot at /Users/mctursh/slate-data"]
     fn keystone_reproduces_the_mainnet_bank_hash() {
-        use crate::snapshot::{read_manifest_hashes, read_manifest_lt_hash};
+        use crate::snapshot::{read_manifest_fields, read_manifest_lt_hash};
         use std::fs::File;
 
         let path = "/Users/mctursh/slate-data/\
@@ -253,7 +253,7 @@ mod tests {
         let slot = 349047024;
 
         // Manifest front: bank_hash(s_snap) and parent_hash (= bank_hash(s_snap-1)).
-        let mh = read_manifest_hashes(File::open(path).unwrap(), slot).unwrap();
+        let mh = read_manifest_fields(File::open(path).unwrap(), slot).unwrap();
         // Manifest tail: the accounts lattice hash.
         let lt = read_manifest_lt_hash(File::open(path).unwrap(), slot)
             .unwrap()

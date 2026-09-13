@@ -56,6 +56,39 @@ Trimmed to only what compiles into the library:
    `.cargo_vcs_info.json`. Cargo doesn't read them for a path dependency, and the
    source commit they carried is recorded under Source above.
 
+## The reward math is from 2.2.17, not 3.0.14
+
+`src/rewards.rs` and the arithmetic half of `src/points.rs` come from agave
+**v2.2.17**, `programs/stake/src/`. Everything else in this crate is 3.0.14.
+
+3.0.14 does not have them. Between 2.2.x and 3.x the epoch-reward calculation was
+moved out of the stake program into `runtime/src/inflation_rewards/`, and 3.0.14's
+`points.rs` is 45 lines of types with no math.
+
+Taking the 2.2.17 copy rather than the relocated 3.0.14 one:
+
+- The arithmetic is identical. `calculate_stake_rewards` differs between the two
+  only in `VoteState` vs `VoteStateView`, a read API, not a computation.
+- 2.2.17 is what mainnet ran at epoch 808, the range Slate replays.
+- It needs no new dependencies. The 3.0.14 version wants `solana-vote`
+  (`VoteStateView`), which Slate does not depend on; the 2.2.17 version uses
+  `solana-vote-interface`, which this crate already has.
+
+Build fixes, same class as the ones above:
+
+6. `StakeHistory` imported from `solana_stake_interface::stake_history` rather
+   than `solana_sysvar::stake_history`, which no longer re-exports it.
+7. `solana_vote_interface::state::VoteStateV3 as VoteState` — renamed in
+   vote-interface 3.0. Aliased so the bodies stay as upstream.
+8. `VoteStateV3` dropped `commission_split` in vote-interface 3.0 (deprecated at
+   2.2.0, "logic was moved into the agave runtime crate"). Appended agave
+   3.0.14's free-function form, `commission_split(commission: u8, on: u64)`,
+   whose arithmetic is byte-identical to the removed method, and changed the one
+   call site to pass `vote_state.commission`.
+
+Not yet verified against mainnet reward numbers: the epoch-boundary sequence that
+consumes this is still being built, so nothing exercises it end to end yet.
+
 ## Re-vendoring a newer version
 
 When Slate's runtime moves off 3.1.14, or to pull a newer stake processor:

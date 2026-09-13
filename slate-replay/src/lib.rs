@@ -9,10 +9,11 @@ use store::{AccountStore, MemStore};
 pub mod fixture;
 pub mod oracle;
 pub mod persist;
+pub mod rewards;
 pub mod snapshot;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -83,6 +84,15 @@ pub struct ReplayBank {
     // Per-slot feature set, consulted by the precompile callbacks. Defaults to all-enabled so
     // fixtures keep working; a faithful replay overwrites it via set_feature_set once seeded.
     feature_set: FeatureSet,
+    // Keys only; membership is re-read at the boundary, so a stale key cannot skew the set.
+    stake_keys: HashSet<Pubkey>,
+    // Manifest-derived reward inputs; None means no crossing can be processed.
+    reward_inputs: Option<rewards::RewardInputs>,
+    // Calculated at a boundary, consumed over the following blocks.
+    pending_partitions: Vec<Vec<rewards::StakeReward>>,
+    // Rolled forward per slot: the epoch reward pool reads it at the boundary, and the seed
+    // slot's value is stale by every fee burned since.
+    capitalization: u64,
 }
 
 impl Default for ReplayBank {
@@ -94,6 +104,10 @@ impl Default for ReplayBank {
             slot_dirty: None,
             bankhash_roller: None,
             feature_set: FeatureSet::all_enabled(),
+            stake_keys: HashSet::new(),
+            reward_inputs: None,
+            pending_partitions: Vec::new(),
+            capitalization: 0,
         }
     }
 }
@@ -121,6 +135,28 @@ impl ReplayBank {
         self.feature_set = feature_set;
     }
 
+    pub fn set_stake_keys(&mut self, keys: HashSet<Pubkey>) {
+        self.stake_keys = keys;
+    }
+
+    pub fn set_reward_inputs(&mut self, inputs: rewards::RewardInputs) {
+        self.reward_inputs = Some(inputs);
+    }
+
+    // agave's stake_delegations. Sorted: the count drives num_partitions.
+    pub fn stake_delegations(&self) -> Vec<(Pubkey, solana_stake_interface::state::Delegation)> {
+        let mut out: Vec<_> = self
+            .stake_keys
+            .iter()
+            .filter_map(|key| {
+                let (account, _) = self.get_account_shared_data(key)?;
+                Some((*key, stake_delegation(&account)?))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(key, _)| *key);
+        out
+    }
+
     // Flush buffered writes to disk (no-op for the in-memory store).
     pub fn flush(&mut self) {
         self.store.flush();
@@ -146,6 +182,10 @@ impl ReplayBank {
 
     // Log the write (for persistence) then apply it; unlike insert, which is for un-persisted setup.
     fn commit_write(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
+        use solana_account::ReadableAccount;
+        if *account.owner() == solana_sdk_ids::stake::id() {
+            self.stake_keys.insert(key);
+        }
         self.write_version += 1;
         self.writes.push(WriteRecord {
             slot,
@@ -199,7 +239,55 @@ impl ReplayBank {
             .as_ref()
             .map(|r| crate::bankhash::serialize_roll_state(r.lt_hash(), &r.bank_hash()))
             .unwrap_or_default();
+        // Persist the stake key set too: it is accumulated across the whole replay, so a resume
+        // cannot reconstruct it and would silently fold a different delegation set.
+        if !self.stake_keys.is_empty() {
+            let mut blob = Vec::with_capacity(self.stake_keys.len() * 32);
+            for key in &self.stake_keys {
+                blob.extend_from_slice(key.as_ref());
+            }
+            self.store.stage_meta("stake_keys", &blob);
+        }
+        self.store
+            .stage_meta("capitalization", &self.capitalization.to_le_bytes());
+        // Calculated at a boundary and consumed over the following blocks: a resume landing inside
+        // that window would otherwise pay out nothing.
+        if !self.pending_partitions.is_empty() {
+            self.store.stage_meta(
+                "pending_partitions",
+                &rewards::encode_pending_partitions(&self.pending_partitions),
+            );
+        }
         self.store.checkpoint_flush(slot, &roll)
+    }
+
+    pub fn load_capitalization(&mut self) -> Option<u64> {
+        let blob = self.store.get_meta("capitalization")?;
+        let value = u64::from_le_bytes(blob.get(..8)?.try_into().ok()?);
+        self.capitalization = value;
+        Some(value)
+    }
+
+    pub fn load_pending_partitions(&mut self) -> usize {
+        let Some(blob) = self.store.get_meta("pending_partitions") else {
+            return 0;
+        };
+        let Some(partitions) = rewards::decode_pending_partitions(&blob) else {
+            return 0;
+        };
+        self.pending_partitions = partitions;
+        self.pending_partitions.len()
+    }
+
+    pub fn load_stake_keys(&mut self) -> usize {
+        let Some(blob) = self.store.get_meta("stake_keys") else {
+            return 0;
+        };
+        self.stake_keys = blob
+            .chunks_exact(32)
+            .filter_map(|c| Pubkey::try_from(c).ok())
+            .collect();
+        self.stake_keys.len()
     }
 
     // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
@@ -209,9 +297,27 @@ impl ReplayBank {
         signature_count: u64,
         blockhash: &Hash,
     ) -> Option<Hash> {
+        use solana_account::ReadableAccount;
+        // Same deltas the lattice rolls, so burned fees leave the supply as they do on-chain.
+        let delta: i128 = changes
+            .iter()
+            .map(|(_, old, new)| {
+                i128::from(new.lamports()) - old.as_ref().map_or(0, |a| i128::from(a.lamports()))
+            })
+            .sum();
+        self.capitalization = u64::try_from(i128::from(self.capitalization) + delta)
+            .expect("capitalization stays within u64");
         self.bankhash_roller
             .as_mut()
             .map(|r| r.roll_slot(changes, signature_count, blockhash))
+    }
+
+    pub fn set_capitalization(&mut self, capitalization: u64) {
+        self.capitalization = capitalization;
+    }
+
+    pub fn capitalization(&self) -> u64 {
+        self.capitalization
     }
 
     // Prepend (slot, bank_hash) to SlotHashes like the runtime's update_slot_hashes (newest-first, truncated to 512).
@@ -248,7 +354,7 @@ impl ReplayBank {
 
     // Build the sysvars this replay needs and insert them as accounts; the processor pulls them in via fill_missing_sysvar_cache_entries.
     pub fn configure_sysvars(&mut self, slot: u64, unix_timestamp: i64) {
-        let epoch = slot / 432_000; // mainnet: no warmup
+        let epoch = epoch_of(slot);
         // Derive Clock from the snapshot's real Clock (epoch fields are constant within an epoch; only slot + timestamp advance); synthesize one only for tests.
         let clock = match self
             .get_account_shared_data(&Clock::id())
@@ -257,6 +363,12 @@ impl ReplayBank {
             Some(mut clock) => {
                 clock.slot = slot;
                 clock.unix_timestamp = unix_timestamp;
+                // ...except across a boundary, which no in-epoch slot exercises.
+                if clock.epoch != epoch {
+                    clock.epoch = epoch;
+                    clock.leader_schedule_epoch = epoch + 1;
+                    clock.epoch_start_timestamp = unix_timestamp;
+                }
                 clock
             }
             None => Clock {
@@ -401,6 +513,18 @@ impl ReplayBank {
         );
     }
 
+    pub fn set_sysvar_at(&mut self, id: Pubkey, data: Vec<u8>, slot: u64) {
+        let lamports = Rent::default().minimum_balance(data.len());
+        let account = AccountSharedData::from(Account {
+            lamports,
+            data,
+            owner: solana_sdk_ids::sysvar::id(),
+            executable: false,
+            rent_epoch: 0,
+        });
+        self.insert(id, account, slot);
+    }
+
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
         // Sysvar accounts are rent-exempt for their exact size; a wrong balance would fail the oracle's balance check and halt the replay.
         let lamports = Rent::default().minimum_balance(data.len());
@@ -413,6 +537,13 @@ impl ReplayBank {
         });
         self.insert(id, account, 0);
     }
+}
+
+// Mainnet cleared the genesis warmup long before Slate's floor, so epochs are a fixed 432k slots.
+pub const SLOTS_PER_EPOCH: u64 = 432_000;
+
+pub fn epoch_of(slot: u64) -> u64 {
+    slot / SLOTS_PER_EPOCH
 }
 
 // From agave's canonical BUILTINS so the set stays in sync. Stake/Config/ALT are absent, migrated to Core BPF, so they run as ordinary loaded programs.
@@ -437,15 +568,56 @@ pub fn register_builtins(
 }
 
 // A feature account's activation slot, or None (wrong owner/too small/unparsable/inactive). Feature is a lone Option<u64>, so it decodes straight as one.
-fn feature_activation(account: &AccountSharedData) -> Option<u64> {
+// Outer None = not a feature account; inner None = a feature account still pending.
+fn read_feature(account: &AccountSharedData) -> Option<Option<u64>> {
     use solana_account::ReadableAccount;
     // 9 == Feature::size_of() (1-byte Option tag + u64).
     if *account.owner() != solana_sdk_ids::feature::id() || account.data().len() < 9 {
         return None;
     }
-    bincode::deserialize::<Option<u64>>(account.data())
-        .ok()
-        .flatten()
+    bincode::deserialize::<Option<u64>>(account.data()).ok()
+}
+
+fn feature_activation(account: &AccountSharedData) -> Option<u64> {
+    read_feature(account).flatten()
+}
+
+// agave's apply_feature_activations: a pending feature activates here and the slot is written back.
+// In place like agave's to_account, so data length and rent padding survive into the bank hash.
+pub fn activate_pending_features(bank: &mut ReplayBank, slot: u64) -> Vec<Pubkey> {
+    use solana_account::WritableAccount;
+    let mut activated = Vec::new();
+    for feature_id in agave_feature_set::FEATURE_NAMES.keys() {
+        let Some((mut account, _)) = bank.get_account_shared_data(feature_id) else {
+            continue;
+        };
+        if read_feature(&account) != Some(None) {
+            continue;
+        }
+        if bincode::serialize_into(account.data_as_mut_slice(), &Some(slot)).is_ok() {
+            bank.insert(*feature_id, account, slot);
+            activated.push(*feature_id);
+        }
+    }
+    activated
+}
+
+// agave's StakesCache membership (stakes.rs check_and_store): stake-owned is not enough, it must be
+// delegated. Counting Initialized-but-undelegated accounts would inflate the reward partition count.
+pub fn stake_state_of(
+    account: &AccountSharedData,
+) -> Option<solana_stake_interface::state::StakeStateV2> {
+    use solana_account::ReadableAccount;
+    if account.lamports() == 0 || *account.owner() != solana_sdk_ids::stake::id() {
+        return None;
+    }
+    bincode::deserialize(account.data()).ok()
+}
+
+pub fn stake_delegation(
+    account: &AccountSharedData,
+) -> Option<solana_stake_interface::state::Delegation> {
+    stake_state_of(account)?.delegation()
 }
 
 // Build the feature set active at slot from on-chain feature accounts (not all_enabled), the exact set the runtime executed against; feature-gated behavior depends on it.
@@ -668,6 +840,22 @@ impl Replayer {
         if rolling {
             bank.begin_slot();
         }
+        // First BLOCK of the epoch, not the boundary slot, which can be skipped.
+        if epoch_of(block.slot) != epoch_of(block.parent_slot)
+            && let Some(inputs) = bank.reward_inputs.clone()
+        {
+            let outcome = rewards::process_epoch_boundary(
+                bank,
+                &inputs,
+                epoch,
+                block.slot,
+                block.previous_blockhash,
+                block.block_height,
+            );
+            bank.set_feature_set(build_feature_set(bank, block.slot));
+            bank.pending_partitions = outcome.partitions;
+        }
+        rewards::distribute_due_partition(bank, block.block_height, block.slot);
         bank.configure_sysvars(block.slot, block.block_time);
         if let Some(parent_hash) = bank.parent_bank_hash() {
             bank.roll_slot_hashes(block.parent_slot, parent_hash);
@@ -782,7 +970,7 @@ impl Replayer {
                 }
             }
 
-            let epoch = block.slot / 432_000;
+            let epoch = epoch_of(block.slot);
             let processor = self.processor.new_from(block.slot, epoch);
             let block_replay = self.replay_block_with(&processor, bank, block, epoch);
             if !block_replay.is_complete() {
@@ -948,10 +1136,293 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crossing_an_epoch_rolls_the_clock_epoch_fields() {
+        use solana_account::ReadableAccount;
+        let read = |b: &ReplayBank| {
+            bincode::deserialize::<Clock>(b.get_account_shared_data(&Clock::id()).unwrap().0.data())
+                .unwrap()
+        };
+        let mut bank = ReplayBank::default();
+
+        bank.configure_sysvars(SLOTS_PER_EPOCH * 807 + 10, 1_000);
+        let before = read(&bank);
+        assert_eq!(before.epoch, 807);
+
+        bank.configure_sysvars(SLOTS_PER_EPOCH * 807 + 20, 1_500);
+        let within = read(&bank);
+        assert_eq!(within.epoch, 807);
+        assert_eq!(within.epoch_start_timestamp, before.epoch_start_timestamp);
+
+        bank.configure_sysvars(SLOTS_PER_EPOCH * 808, 2_000);
+        let crossed = read(&bank);
+        assert_eq!(crossed.epoch, 808);
+        assert_eq!(crossed.leader_schedule_epoch, 809);
+        assert_eq!(crossed.epoch_start_timestamp, 2_000);
+    }
+
+    #[test]
+    fn capitalization_follows_the_lamports_written_each_slot() {
+        let account = |lamports| {
+            AccountSharedData::from(Account {
+                lamports,
+                ..Account::default()
+            })
+        };
+        let mut bank = ReplayBank::default();
+        bank.set_capitalization(1_000);
+        let key = Pubkey::new_unique();
+
+        bank.finalize_slot_bankhash(&[(key, None, account(400))], 0, &Hash::default());
+        assert_eq!(bank.capitalization(), 1_400);
+
+        bank.finalize_slot_bankhash(
+            &[(key, Some(account(400)), account(150))],
+            0,
+            &Hash::default(),
+        );
+        assert_eq!(bank.capitalization(), 1_150);
+    }
+
+    #[test]
     fn skeleton_constructs() {
         // The harness + bank construct and link.
         let _bank = ReplayBank::default();
         let _replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
+    }
+
+    // 9 bytes of `Option<u64>`, plus optional rent padding.
+    fn feature_account(activated_at: Option<u64>, pad: usize) -> AccountSharedData {
+        let mut data = bincode::serialize(&activated_at).unwrap();
+        data.resize(9 + pad, 0xAB);
+        AccountSharedData::from(Account {
+            lamports: 1_000_000,
+            data,
+            owner: solana_sdk_ids::feature::id(),
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    fn some_feature_id() -> Pubkey {
+        *agave_feature_set::FEATURE_NAMES
+            .keys()
+            .next()
+            .expect("agave ships feature ids")
+    }
+
+    fn stake_account_of(
+        state: &solana_stake_interface::state::StakeStateV2,
+        lamports: u64,
+    ) -> AccountSharedData {
+        let mut data = vec![0u8; 200];
+        bincode::serialize_into(data.as_mut_slice(), state).unwrap();
+        AccountSharedData::from(Account {
+            lamports,
+            data,
+            owner: solana_sdk_ids::stake::id(),
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    fn delegated_state(voter: Pubkey) -> solana_stake_interface::state::StakeStateV2 {
+        use solana_stake_interface::{
+            stake_flags::StakeFlags,
+            state::{Delegation, Meta, Stake, StakeStateV2},
+        };
+        StakeStateV2::Stake(
+            Meta::default(),
+            Stake {
+                delegation: Delegation {
+                    voter_pubkey: voter,
+                    stake: 5_000_000_000,
+                    ..Delegation::default()
+                },
+                credits_observed: 7,
+            },
+            StakeFlags::empty(),
+        )
+    }
+
+    #[test]
+    fn the_boundary_set_re_reads_state_so_a_stale_key_is_harmless() {
+        let voter = Pubkey::new_unique();
+        let (delegated, undelegated, closed) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            delegated,
+            stake_account_of(&delegated_state(voter), 5_000_000_000),
+            0,
+        );
+        bank.insert(
+            undelegated,
+            stake_account_of(
+                &solana_stake_interface::state::StakeStateV2::Initialized(Default::default()),
+                5_000_000_000,
+            ),
+            0,
+        );
+        bank.insert(closed, stake_account_of(&delegated_state(voter), 0), 0);
+
+        // Every key is tracked, including two that must not survive the re-read, plus one absent.
+        bank.set_stake_keys(HashSet::from([
+            delegated,
+            undelegated,
+            closed,
+            Pubkey::new_unique(),
+        ]));
+
+        let set = bank.stake_delegations();
+        assert_eq!(set.len(), 1, "only the delegated, funded account counts");
+        assert_eq!(set[0].0, delegated);
+        assert_eq!(set[0].1.voter_pubkey, voter);
+    }
+
+    #[test]
+    fn the_boundary_set_is_deterministically_ordered() {
+        let mut bank = ReplayBank::default();
+        let mut keys: Vec<Pubkey> = (0..8).map(|_| Pubkey::new_unique()).collect();
+        for key in &keys {
+            bank.insert(
+                *key,
+                stake_account_of(&delegated_state(Pubkey::new_unique()), 5_000_000_000),
+                0,
+            );
+        }
+        bank.set_stake_keys(keys.iter().copied().collect());
+        keys.sort_unstable();
+
+        let got: Vec<Pubkey> = bank
+            .stake_delegations()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, keys);
+    }
+
+    #[test]
+    fn a_transaction_write_adds_a_stake_key() {
+        let key = Pubkey::new_unique();
+        let mut bank = ReplayBank::default();
+        assert!(bank.stake_delegations().is_empty());
+
+        bank.commit_write(
+            key,
+            stake_account_of(&delegated_state(Pubkey::new_unique()), 5_000_000_000),
+            10,
+        );
+        assert_eq!(
+            bank.stake_delegations().len(),
+            1,
+            "a stake write must be tracked"
+        );
+    }
+
+    #[test]
+    fn a_delegated_stake_account_is_counted() {
+        let voter = Pubkey::new_unique();
+        let account = stake_account_of(&delegated_state(voter), 5_000_000_000);
+        assert_eq!(stake_delegation(&account).unwrap().voter_pubkey, voter);
+    }
+
+    #[test]
+    fn an_initialized_but_undelegated_stake_account_is_not_counted() {
+        use solana_stake_interface::state::{Meta, StakeStateV2};
+        let account = stake_account_of(&StakeStateV2::Initialized(Meta::default()), 5_000_000_000);
+        assert!(stake_delegation(&account).is_none());
+    }
+
+    #[test]
+    fn an_uninitialized_stake_account_is_not_counted() {
+        use solana_stake_interface::state::StakeStateV2;
+        let account = stake_account_of(&StakeStateV2::Uninitialized, 5_000_000_000);
+        assert!(stake_delegation(&account).is_none());
+    }
+
+    #[test]
+    fn a_closed_stake_account_is_not_counted() {
+        let account = stake_account_of(&delegated_state(Pubkey::new_unique()), 0);
+        assert!(stake_delegation(&account).is_none());
+    }
+
+    #[test]
+    fn a_delegated_state_under_another_owner_is_not_counted() {
+        use solana_account::WritableAccount;
+        let mut account = stake_account_of(&delegated_state(Pubkey::new_unique()), 5_000_000_000);
+        account.set_owner(solana_sdk_ids::system_program::id());
+        assert!(stake_delegation(&account).is_none());
+    }
+
+    #[test]
+    fn a_pending_feature_activates_at_the_boundary_slot() {
+        let id = some_feature_id();
+        let mut bank = ReplayBank::default();
+        bank.insert(id, feature_account(None, 0), 0);
+
+        assert_eq!(activate_pending_features(&mut bank, 500), vec![id]);
+
+        let (account, _) = bank.get_account_shared_data(&id).unwrap();
+        assert_eq!(feature_activation(&account), Some(500));
+    }
+
+    #[test]
+    fn activation_preserves_data_length_and_padding() {
+        use solana_account::ReadableAccount;
+        let id = some_feature_id();
+        let mut bank = ReplayBank::default();
+        bank.insert(id, feature_account(None, 16), 0);
+
+        activate_pending_features(&mut bank, 500);
+
+        let (account, _) = bank.get_account_shared_data(&id).unwrap();
+        assert_eq!(account.data().len(), 25, "length must not change");
+        assert!(
+            account.data()[9..].iter().all(|b| *b == 0xAB),
+            "padding past the 9-byte Feature must survive untouched"
+        );
+        assert_eq!(feature_activation(&account), Some(500));
+    }
+
+    #[test]
+    fn activation_is_recorded_for_the_lattice() {
+        let id = some_feature_id();
+        let mut bank = ReplayBank::default();
+        bank.insert(id, feature_account(None, 0), 0);
+
+        bank.begin_slot();
+        activate_pending_features(&mut bank, 500);
+        let changes = bank.take_slot_changes();
+
+        assert!(
+            changes.iter().any(|(pubkey, _, _)| *pubkey == id),
+            "the activation write must be in the slot's dirty set"
+        );
+    }
+
+    #[test]
+    fn an_already_active_feature_is_left_alone() {
+        let id = some_feature_id();
+        let mut bank = ReplayBank::default();
+        bank.insert(id, feature_account(Some(42), 0), 0);
+
+        assert!(activate_pending_features(&mut bank, 500).is_empty());
+        let (account, _) = bank.get_account_shared_data(&id).unwrap();
+        assert_eq!(feature_activation(&account), Some(42), "slot must not move");
+    }
+
+    #[test]
+    fn a_non_feature_account_at_a_feature_id_is_ignored() {
+        let id = some_feature_id();
+        let mut bank = ReplayBank::default();
+        let mut wrong_owner = feature_account(None, 0);
+        wrong_owner.set_owner(solana_sdk_ids::system_program::id());
+        bank.insert(id, wrong_owner, 0);
+
+        assert!(activate_pending_features(&mut bank, 500).is_empty());
     }
 
     #[test]
@@ -1663,6 +2134,7 @@ mod tests {
             slot,
             parent_slot: slot - 1,
             blockhash: Hash::default(),
+            block_height: 0,
             previous_blockhash: Hash::default(),
             block_time: 1_700_000_000,
             transactions: vec![
@@ -2260,6 +2732,7 @@ mod tests {
                 slot,
                 parent_slot: slot - 1,
                 blockhash: Hash::default(),
+                block_height: 0,
                 previous_blockhash: Hash::default(),
                 block_time: 0,
                 transactions: vec![crate::block::BlockTx {

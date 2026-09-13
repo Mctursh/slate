@@ -46,6 +46,10 @@ agave-syscalls = "3.1.14"
 solana-slot-hashes = "3.1.0"
 solana-fee-structure = "3.0.0"
 solana-svm-feature-set = "3.1.14"
+solana-epoch-rewards = "3.1.0"
+solana-epoch-rewards-hasher = "3.1.0"
+solana-inflation = "3.1.1"
+solana-stake-interface = { version = "2.0.2", features = ["bincode"] }
 solana-hash = "3.1.0"
 # Decode validator votes: a TowerSync/VoteStateUpdate carries the bank hash of the
 # slot it votes on, so votes in later blocks let the replay self-verify each slot

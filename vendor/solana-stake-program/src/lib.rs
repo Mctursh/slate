@@ -9,10 +9,14 @@
 pub use solana_sdk_ids::stake::{check_id, id};
 use {solana_genesis_config::GenesisConfig, solana_native_token::LAMPORTS_PER_SOL};
 
+// Re-exported so callers bind the same vote-interface major this crate compiles against.
+pub use solana_vote_interface;
+
 pub mod config;
 pub mod epoch_rewards;
 #[deprecated(since = "2.2.0")]
 pub mod points;
+pub mod rewards;
 pub mod stake_instruction;
 pub mod stake_state;
 

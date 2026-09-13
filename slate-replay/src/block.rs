@@ -21,6 +21,7 @@ pub struct Block {
     pub slot: u64,
     pub parent_slot: u64,
     pub blockhash: Hash,
+    pub block_height: u64,
     // The bank runs this slot on the parent's blockhash, what a durable nonce advances from, so it's the env blockhash, not any tx's recent_blockhash.
     pub previous_blockhash: Hash,
     pub block_time: i64,
@@ -83,6 +84,9 @@ impl Block {
         let block_time = result["blockTime"]
             .as_i64()
             .context("getBlock missing blockTime")?;
+        let block_height = result["blockHeight"]
+            .as_u64()
+            .context("getBlock missing blockHeight")?;
 
         let raw = result["transactions"]
             .as_array()
@@ -112,6 +116,7 @@ impl Block {
             blockhash,
             previous_blockhash,
             block_time,
+            block_height,
             transactions,
             fee_reward,
         })
@@ -459,6 +464,7 @@ mod tests {
         // legacy tx: no lookup-table addresses
         assert!(t0.meta.loaded_addresses.writable.is_empty());
         assert!(t0.meta.loaded_addresses.readonly.is_empty());
+        assert_eq!(block.block_height, 425_581_515);
     }
 
     #[test]
@@ -480,6 +486,7 @@ mod tests {
             blockhash: Hash::default(),
             previous_blockhash: Hash::default(),
             block_time: 0,
+            block_height: 0,
             transactions: vec![BlockTx {
                 transaction: block.transactions[0].transaction.clone(),
                 meta: TxMeta {

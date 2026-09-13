@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
-use redb::{Database, Durability, TableDefinition};
+use redb::{Database, Durability, ReadableTable, TableDefinition};
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 
@@ -9,11 +9,20 @@ pub trait AccountStore: Send + Sync {
     fn get(&self, key: &Pubkey) -> Option<(AccountSharedData, u64)>;
     fn put(&mut self, key: Pubkey, account: AccountSharedData, slot: u64);
     fn contains(&self, key: &Pubkey) -> bool;
+    // Walk every live account. Only used to rebuild derived sets (e.g. stake keys) after a resume.
+    fn scan(&self, visit: &mut dyn FnMut(Pubkey, &AccountSharedData));
     // Commit buffered writes; no-op for write-through stores.
     fn flush(&mut self);
     // Atomically flush buffered accounts + a resume checkpoint (slot + roll bytes) in one durable commit; no-op if the store can't resume.
     fn checkpoint_flush(&mut self, slot: u64, roll: &[u8]) -> anyhow::Result<()>;
     fn read_checkpoint(&self) -> Option<(u64, Vec<u8>)>;
+    // Small side-blobs (stake keys, capitalization) so a resume doesn't have to rebuild derived
+    // state. Staged, not written: they must land in the SAME commit as the checkpoint, or a crash
+    // in between leaves meta from a later slot than the checkpoint claims.
+    fn stage_meta(&mut self, _key: &str, _value: &[u8]) {}
+    fn get_meta(&self, _key: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 // In-RAM HashMap; for tests and ranges small enough to fit.
@@ -33,6 +42,12 @@ impl AccountStore for MemStore {
 
     fn contains(&self, key: &Pubkey) -> bool {
         self.accounts.contains_key(key)
+    }
+
+    fn scan(&self, visit: &mut dyn FnMut(Pubkey, &AccountSharedData)) {
+        for (key, (account, _)) in &self.accounts {
+            visit(*key, account);
+        }
     }
 
     fn flush(&mut self) {}
@@ -59,6 +74,7 @@ pub struct DiskStore {
     buffered_bytes: usize,
     // Set after seeding: put() stops auto-flushing and flush() no-ops, so checkpoint_flush is the only committer and the redb never holds writes past the last checkpoint (what makes --resume sound).
     checkpoint_mode: bool,
+    meta_staged: HashMap<String, Vec<u8>>,
 }
 
 impl DiskStore {
@@ -72,6 +88,7 @@ impl DiskStore {
             buffer: HashMap::new(),
             buffered_bytes: 0,
             checkpoint_mode: false,
+            meta_staged: HashMap::new(),
         })
     }
 
@@ -112,6 +129,31 @@ impl AccountStore for DiskStore {
         self.buffer.contains_key(key) || self.read_from_disk(key).is_some()
     }
 
+    // Buffered writes shadow the on-disk row, so yield them first and skip those keys on disk.
+    fn scan(&self, visit: &mut dyn FnMut(Pubkey, &AccountSharedData)) {
+        for (key, (account, _)) in &self.buffer {
+            visit(*key, account);
+        }
+        let Ok(txn) = self.db.begin_read() else {
+            return;
+        };
+        let Ok(table) = txn.open_table(ACCOUNTS) else {
+            return;
+        };
+        let Ok(iter) = table.iter() else { return };
+        for row in iter.flatten() {
+            let Ok(key) = Pubkey::try_from(row.0.value()) else {
+                continue;
+            };
+            if self.buffer.contains_key(&key) {
+                continue;
+            }
+            if let Some((account, _)) = decode(row.1.value()) {
+                visit(key, &account);
+            }
+        }
+    }
+
     fn flush(&mut self) {
         // No-op in checkpoint mode (replay_range calls this per chunk); checkpoint_flush is the only committer.
         if self.checkpoint_mode || self.buffer.is_empty() {
@@ -132,6 +174,16 @@ impl AccountStore for DiskStore {
         self.buffered_bytes = 0;
     }
 
+    fn stage_meta(&mut self, key: &str, value: &[u8]) {
+        self.meta_staged.insert(key.to_owned(), value.to_vec());
+    }
+
+    fn get_meta(&self, key: &str) -> Option<Vec<u8>> {
+        let txn = self.db.begin_read().ok()?;
+        let table = txn.open_table(META).ok()?;
+        Some(table.get(key).ok()??.value().to_vec())
+    }
+
     fn checkpoint_flush(&mut self, slot: u64, roll: &[u8]) -> anyhow::Result<()> {
         let mut txn = self.db.begin_write()?;
         // Immediate: accounts + checkpoint land durably together, so a crash can't split them.
@@ -142,6 +194,9 @@ impl AccountStore for DiskStore {
                 accounts.insert(key.as_ref(), encode(&account, acct_slot).as_slice())?;
             }
             let mut meta = txn.open_table(META)?;
+            for (key, value) in self.meta_staged.drain() {
+                meta.insert(key.as_str(), value.as_slice())?;
+            }
             // slot(8 LE) ++ roll; written even on an empty buffer, so a no-write chunk still advances the slot.
             let mut value = slot.to_le_bytes().to_vec();
             value.extend_from_slice(roll);
@@ -201,6 +256,29 @@ fn decode(bytes: &[u8]) -> Option<(AccountSharedData, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A crash between staging meta and committing the checkpoint must not leave meta from a later
+    // slot than the checkpoint claims: that silently double-counts a chunk on resume.
+    #[test]
+    fn staged_meta_lands_only_with_the_checkpoint() {
+        let path = std::env::temp_dir().join("slate_diskstore_staged_meta.redb");
+        let _ = std::fs::remove_file(&path);
+        let mut store = DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+
+        store.stage_meta("capitalization", &7u64.to_le_bytes());
+        assert!(
+            store.get_meta("capitalization").is_none(),
+            "staged meta must not be durable before the checkpoint commits"
+        );
+
+        store.checkpoint_flush(100, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            store.get_meta("capitalization"),
+            Some(7u64.to_le_bytes().to_vec())
+        );
+        assert_eq!(store.read_checkpoint().unwrap().0, 100);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn diskstore_round_trips_an_account() {
