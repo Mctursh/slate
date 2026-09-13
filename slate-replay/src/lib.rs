@@ -1139,10 +1139,8 @@ mod tests {
     fn crossing_an_epoch_rolls_the_clock_epoch_fields() {
         use solana_account::ReadableAccount;
         let read = |b: &ReplayBank| {
-            bincode::deserialize::<Clock>(
-                b.get_account_shared_data(&Clock::id()).unwrap().0.data(),
-            )
-            .unwrap()
+            bincode::deserialize::<Clock>(b.get_account_shared_data(&Clock::id()).unwrap().0.data())
+                .unwrap()
         };
         let mut bank = ReplayBank::default();
 
@@ -1177,7 +1175,11 @@ mod tests {
         bank.finalize_slot_bankhash(&[(key, None, account(400))], 0, &Hash::default());
         assert_eq!(bank.capitalization(), 1_400);
 
-        bank.finalize_slot_bankhash(&[(key, Some(account(400)), account(150))], 0, &Hash::default());
+        bank.finalize_slot_bankhash(
+            &[(key, Some(account(400)), account(150))],
+            0,
+            &Hash::default(),
+        );
         assert_eq!(bank.capitalization(), 1_150);
     }
 

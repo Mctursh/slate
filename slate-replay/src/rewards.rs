@@ -858,11 +858,7 @@ mod boundary_tests {
         i
     }
 
-    fn inputs(
-        feature_set: FeatureSet,
-        capitalization: u64,
-        bank: &mut ReplayBank,
-    ) -> RewardInputs {
+    fn inputs(feature_set: FeatureSet, capitalization: u64, bank: &mut ReplayBank) -> RewardInputs {
         bank.set_capitalization(capitalization);
         RewardInputs {
             feature_set,
@@ -905,7 +901,10 @@ mod boundary_tests {
         ];
         let bytes = encode_pending_partitions(&partitions);
         assert_eq!(decode_pending_partitions(&bytes).unwrap(), partitions);
-        assert!(decode_pending_partitions(&[0; 8]).is_none(), "version is checked");
+        assert!(
+            decode_pending_partitions(&[0; 8]).is_none(),
+            "version is checked"
+        );
     }
 
     #[test]
@@ -966,7 +965,11 @@ mod boundary_tests {
     #[test]
     fn distributing_every_partition_closes_the_window() {
         let (mut bank, _, _) = bank_with_one_delegation();
-        let i = inputs(FeatureSet::all_enabled(), 603_724_512_541_705_391, &mut bank);
+        let i = inputs(
+            FeatureSet::all_enabled(),
+            603_724_512_541_705_391,
+            &mut bank,
+        );
         let out =
             process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000);
 
