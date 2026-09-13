@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_hash::Hash;
+use solana_inflation::Inflation;
 use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
@@ -33,7 +34,7 @@ fn read_pubkey(bytes: &[u8], at: usize) -> Pubkey {
 }
 
 // The archiver trims each storage to current_len, so a real file ends on a record boundary; the doesn't-fit and 10-MiB checks guard a truncated/corrupt download, not the normal stop.
-fn parse_append_vec(bytes: &[u8]) -> Vec<(Pubkey, AccountSharedData)> {
+pub fn parse_append_vec(bytes: &[u8]) -> Vec<(Pubkey, AccountSharedData)> {
     let mut accounts = Vec::new();
     let mut offset = 0usize;
     // Checked arithmetic: `bytes` is an untrusted download, so a corrupt record ends the walk instead of overflowing.
@@ -124,11 +125,14 @@ pub fn stream_into_store<R: Read>(
     store: &mut dyn AccountStore,
     footprint: Option<&HashSet<Pubkey>>,
     keep_owned_by: Option<&Pubkey>,
+    stake_keys: Option<&mut HashSet<Pubkey>>,
 ) -> Result<(usize, HashMap<Pubkey, (AccountSharedData, u64)>)> {
     let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
     let mut archive = tar::Archive::new(decoder);
     let mut writes = 0usize;
     let mut owned: HashMap<Pubkey, (AccountSharedData, u64)> = HashMap::new();
+    // A boundary needs every stake account, not just the ones the range's blocks touch.
+    let mut stake_keys = stake_keys;
 
     for entry in archive.entries().context("read tar entries")? {
         let mut entry = entry.context("tar entry")?;
@@ -140,9 +144,20 @@ pub fn stream_into_store<R: Read>(
         entry.read_to_end(&mut bytes).context("read account file")?;
         for (pubkey, account) in parse_append_vec(&bytes) {
             let is_owned = keep_owned_by.is_some_and(|owner| account.owner() == owner);
-            let keep = is_owned || footprint.is_none_or(|f| f.contains(&pubkey));
+            // A crossing needs every stake AND vote account: a validator that never votes inside the
+            // window is absent from the footprint, and every delegation behind it would be dropped.
+            let crossing = stake_keys.is_some();
+            let is_stake = crossing && *account.owner() == solana_sdk_ids::stake::id();
+            let is_vote = crossing && *account.owner() == solana_sdk_ids::vote::id();
+            let keep =
+                is_owned || is_stake || is_vote || footprint.is_none_or(|f| f.contains(&pubkey));
             if !keep {
                 continue;
+            }
+            if let Some(keys) = stake_keys.as_deref_mut()
+                && is_stake
+            {
+                keys.insert(pubkey);
             }
             match store.get(&pubkey) {
                 Some((_, prev)) if prev >= slot => {}
@@ -187,19 +202,27 @@ pub fn seed_bank_from_snapshot<R: Read>(
     Ok(bank)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ManifestHashes {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ManifestFields {
     pub slot: u64,
     // bank_hash(slot): the keystone verification target for a computed bank hash.
     pub bank_hash: Hash,
     pub parent_slot: u64,
     // bank_hash(slot-1); equals the snapshot's newest SlotHashes entry, an independent cross-check the parse found the right fields.
     pub parent_hash: Hash,
+    pub capitalization: u64,
+    pub slots_per_year: f64,
+    pub epoch: u64,
+    pub block_height: u64,
+    // Read, never defaulted: mainnet runs foundation 0.0 / term 0.0 where Inflation::default() is
+    // 0.05 / 7.0, and validator(year) = total(year) - foundation(year), so the default underpays by 5%.
+    // None on format drift; the bank-hash path doesn't need it, the reward math must require it.
+    pub inflation: Option<Inflation>,
 }
 
 // The manifest bincode drifts across versions, so we never decode it; the bank fields also sit behind variable-length blockhash_queue/ancestors. Instead we anchor on parent_slot (= slot-1) and forward-parse the fixed scalar layout, requiring it to land on slot (a coincidental byte match won't).
 // bank_hash/parent_hash are the two 32B fields just before parent_slot; only the manifest front is read, never the ~1 GiB stakes tail.
-pub fn read_manifest_hashes<R: Read>(reader: R, snapshot_slot: u64) -> Result<ManifestHashes> {
+pub fn read_manifest_fields<R: Read>(reader: R, snapshot_slot: u64) -> Result<ManifestFields> {
     let parent_slot = snapshot_slot
         .checked_sub(1)
         .context("snapshot at slot 0 has no parent bank hash")?;
@@ -224,25 +247,36 @@ pub fn read_manifest_hashes<R: Read>(reader: R, snapshot_slot: u64) -> Result<Ma
             .take(8 * 1024 * 1024)
             .read_to_end(&mut front)
             .context("read manifest front")?;
-        return parse_manifest_hashes(&front, snapshot_slot, parent_slot);
+        return parse_manifest_fields(&front, snapshot_slot, parent_slot);
     }
     anyhow::bail!("manifest {manifest_path} not found in snapshot")
 }
 
-fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<ManifestHashes> {
+fn parse_manifest_fields(front: &[u8], slot: u64, parent_slot: u64) -> Result<ManifestFields> {
     let ps_le = parent_slot.to_le_bytes();
-    let mut result: Option<ManifestHashes> = None;
+    let mut result: Option<ManifestFields> = None;
     for o in 64..front.len().saturating_sub(8) {
-        if front[o..o + 8] != ps_le || forward_parse_slot(front, o) != Some(slot) {
+        if front[o..o + 8] != ps_le {
             continue;
         }
-        let hashes = ManifestHashes {
+        let Some(scalars) = forward_parse_scalars(front, o) else {
+            continue;
+        };
+        if scalars.slot != slot {
+            continue;
+        }
+        let fields = ManifestFields {
             slot,
             bank_hash: Hash::new_from_array(front[o - 64..o - 32].try_into().unwrap()),
             parent_slot,
             parent_hash: Hash::new_from_array(front[o - 32..o].try_into().unwrap()),
+            capitalization: scalars.capitalization,
+            slots_per_year: scalars.slots_per_year,
+            epoch: scalars.epoch,
+            block_height: scalars.block_height,
+            inflation: scalars.inflation,
         };
-        if result.replace(hashes).is_some() {
+        if result.replace(fields).is_some() {
             anyhow::bail!(
                 "ambiguous bank fields in manifest (two candidates landed on slot {slot})"
             );
@@ -251,11 +285,146 @@ fn parse_manifest_hashes(front: &[u8], slot: u64, parent_slot: u64) -> Result<Ma
     result.context("bank fields not found in manifest front (snapshot format drift?)")
 }
 
-// Walk the SerializableVersionedBank scalars from parent_slot to slot; landing on the right slot confirms `o` is parent_slot, not a coincidental byte match.
-fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
+// agave loads its StakesCache from the manifest rather than scanning accounts (Stakes::new iterates
+// stakes.stake_delegations), so this is the authoritative delegation key set at the snapshot slot.
+pub fn read_manifest_stakes_cache<R: Read>(
+    reader: R,
+    snapshot_slot: u64,
+) -> Result<(HashSet<Pubkey>, HashMap<Pubkey, Pubkey>)> {
+    let parent_slot = snapshot_slot.checked_sub(1).context("slot 0")?;
+    let decoder = zstd::Decoder::new(reader).context("open zstd")?;
+    let mut archive = tar::Archive::new(decoder);
+    let manifest_path = format!("snapshots/{snapshot_slot}/{snapshot_slot}");
+    for entry in archive.entries().context("tar")? {
+        let mut entry = entry.context("entry")?;
+        if entry.path().context("path")?.to_str() != Some(manifest_path.as_str()) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        (&mut entry)
+            .take(768 * 1024 * 1024)
+            .read_to_end(&mut buf)
+            .context("read")?;
+        return parse_stakes_cache(&buf, snapshot_slot, parent_slot);
+    }
+    anyhow::bail!("manifest not found")
+}
+
+pub fn read_manifest_stake_delegations<R: Read>(
+    reader: R,
+    snapshot_slot: u64,
+) -> Result<HashSet<Pubkey>> {
+    let parent_slot = snapshot_slot
+        .checked_sub(1)
+        .context("snapshot at slot 0 has no parent")?;
+    let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
+    let mut archive = tar::Archive::new(decoder);
+    let manifest_path = format!("snapshots/{snapshot_slot}/{snapshot_slot}");
+
+    for entry in archive.entries().context("read tar entries")? {
+        let mut entry = entry.context("tar entry")?;
+        if entry.path().context("entry path")?.to_str() != Some(manifest_path.as_str()) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        (&mut entry)
+            .take(768 * 1024 * 1024)
+            .read_to_end(&mut buf)
+            .context("read manifest")?;
+        return parse_stakes_cache(&buf, snapshot_slot, parent_slot)
+            .map(|(_, d)| d.into_keys().collect());
+    }
+    anyhow::bail!("manifest {manifest_path} not found")
+}
+
+fn parse_stakes_cache(
+    b: &[u8],
+    slot: u64,
+    parent_slot: u64,
+) -> Result<(HashSet<Pubkey>, HashMap<Pubkey, Pubkey>)> {
+    let ps = parent_slot.to_le_bytes();
+    let anchor = (64..b.len().saturating_sub(8))
+        .find(|&o| b[o..o + 8] == ps && forward_parse_scalars(b, o).is_some_and(|s| s.slot == slot))
+        .context("bank fields not found")?;
+    let slot_pos = slot_position(b, anchor).context("slot position")?;
+
+    let read_u64 = |p: usize| -> Option<u64> {
+        b.get(p..p + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    };
+    let mut p = slot_pos + SLOT_TO_INFLATION + 48;
+
+    let votes = read_u64(p).context("vote_accounts len")?;
+    anyhow::ensure!(votes < 1_000_000, "implausible vote count {votes}");
+    p += 8;
+    let mut vote_keys = HashSet::with_capacity(votes as usize);
+    for _ in 0..votes {
+        vote_keys.insert(Pubkey::try_from(b.get(p..p + 32).context("vote key")?)?);
+        p += 32 + 8 + 8;
+        let data_len = read_u64(p).context("vote data len")? as usize;
+        anyhow::ensure!(
+            data_len < 10 * 1024 * 1024,
+            "implausible vote data {data_len}"
+        );
+        p += 8 + data_len + 32 + 1 + 8;
+    }
+
+    let count = read_u64(p).context("stake_delegations len")?;
+    anyhow::ensure!(count < 10_000_000, "implausible delegation count {count}");
+    p += 8;
+    let mut delegations = HashMap::with_capacity(count as usize);
+    for _ in 0..count {
+        let key = Pubkey::try_from(b.get(p..p + 32).context("delegation key")?)?;
+        let voter = Pubkey::try_from(b.get(p + 32..p + 64).context("voter")?)?;
+        delegations.insert(key, voter);
+        p += 32 + 64;
+    }
+    Ok((vote_keys, delegations))
+}
+
+fn slot_position(b: &[u8], o: usize) -> Option<usize> {
     let read_u64 = |p: usize| {
         b.get(p..p + 8)
             .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    };
+    let mut p = o + 8;
+    let hard_forks = read_u64(p)?;
+    p += 8 + (hard_forks as usize).checked_mul(16)?;
+    p = p.checked_add(8 * 5)?;
+    match b.get(p)? {
+        0 => p += 1,
+        1 => p += 1 + 8,
+        _ => return None,
+    }
+    p.checked_add(8 + 16 + 8 + 8 + 8)
+}
+
+struct Scalars {
+    slot: u64,
+    epoch: u64,
+    block_height: u64,
+    capitalization: u64,
+    slots_per_year: f64,
+    inflation: Option<Inflation>,
+}
+
+// Bytes from `slot` to `inflation`, in declaration order: epoch(8) block_height(8) collector_id(32)
+// collector_fees(8) fee_calculator(8) fee_rate_governor(41) collected_rent(8) rent_collector epoch_schedule.
+const EPOCH_SCHEDULE_LEN: usize = 8 + 8 + 1 + 8 + 8;
+const RENT_LEN: usize = 8 + 8 + 1;
+const RENT_COLLECTOR_LEN: usize = 8 + EPOCH_SCHEDULE_LEN + 8 + RENT_LEN;
+const SLOT_TO_INFLATION: usize =
+    8 + 8 + 32 + 8 + 8 + 41 + 8 + RENT_COLLECTOR_LEN + EPOCH_SCHEDULE_LEN;
+
+// Walk the SerializableVersionedBank scalars from parent_slot to slot; landing on the right slot confirms `o` is parent_slot, not a coincidental byte match. Inflation sits past slot behind fixed-size structs, so it is range-checked rather than trusted.
+fn forward_parse_scalars(b: &[u8], o: usize) -> Option<Scalars> {
+    let read_u64 = |p: usize| {
+        b.get(p..p + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    };
+    let read_f64 = |p: usize| {
+        b.get(p..p + 8)
+            .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
     };
     let mut p = o + 8; // past parent_slot
     let hard_forks = read_u64(p)?; // Vec<(Slot, usize)> length
@@ -263,16 +432,60 @@ fn forward_parse_slot(b: &[u8], o: usize) -> Option<u64> {
         return None; // wildly implausible ⇒ not the real field
     }
     p += 8 + (hard_forks as usize).checked_mul(16)?; // len prefix + entries
-    // transaction_count, tick_height, signature_count, capitalization, max_tick_height
+    // transaction_count, tick_height, signature_count, [capitalization], max_tick_height
+    let capitalization = read_u64(p.checked_add(8 * 3)?)?;
     p = p.checked_add(8 * 5)?;
     match b.get(p)? {
         0 => p += 1,     // hashes_per_tick: None
         1 => p += 1 + 8, // Some(u64)
         _ => return None,
     }
-    // ticks_per_slot(8) + ns_per_slot(u128=16) + genesis_creation_time(8) + slots_per_year(8) + accounts_data_len(8)
+    // ticks_per_slot(8) + ns_per_slot(u128=16) + genesis_creation_time(8) + [slots_per_year] + accounts_data_len(8)
+    let slots_per_year = read_f64(p.checked_add(8 + 16 + 8)?)?;
     p = p.checked_add(8 + 16 + 8 + 8 + 8)?;
-    read_u64(p) // slot
+    let slot = read_u64(p)?;
+    let epoch = read_u64(p.checked_add(8)?)?;
+    let block_height = read_u64(p.checked_add(16)?)?;
+
+    let i = p.checked_add(SLOT_TO_INFLATION)?;
+    let inflation = (|| {
+        // Inflation has a private 6th f64 after foundation_term (48 bytes on the wire), so no struct literal.
+        let mut curve = Inflation::default();
+        curve.initial = read_f64(i)?;
+        curve.terminal = read_f64(i + 8)?;
+        curve.taper = read_f64(i + 16)?;
+        curve.foundation = read_f64(i + 24)?;
+        curve.foundation_term = read_f64(i + 32)?;
+        plausible_inflation(&curve).then_some(curve)
+    })();
+
+    Some(Scalars {
+        slot,
+        epoch,
+        block_height,
+        capitalization,
+        slots_per_year,
+        inflation,
+    })
+}
+
+// A wrong offset gives NaN or absurd rates, not a plausible curve.
+fn plausible_inflation(i: &Inflation) -> bool {
+    let all = [
+        i.initial,
+        i.terminal,
+        i.taper,
+        i.foundation,
+        i.foundation_term,
+    ];
+    all.iter().all(|v| v.is_finite() && *v >= 0.0)
+        && i.initial > 0.0
+        && i.initial <= 1.0
+        && i.terminal <= i.initial
+        && i.taper > 0.0
+        && i.taper <= 1.0
+        && i.foundation <= 1.0
+        && i.foundation_term <= 100.0
 }
 
 // accounts_lt_hash trailer when present: 1-byte Option tag (0x01) + 1024 LE u16 lanes (2048B).
@@ -363,7 +576,7 @@ mod tests {
 
         let map = load_accounts(SNAPSHOT, None, None).unwrap();
         let mut store = MemStore::default();
-        stream_into_store(SNAPSHOT, &mut store, None, None).unwrap();
+        stream_into_store(SNAPSHOT, &mut store, None, None, None).unwrap();
 
         // Every live account load_accounts kept is byte-identical in the streamed store.
         for (pk, (account, slot)) in &map {
@@ -389,7 +602,8 @@ mod tests {
         assert!(!reference.is_empty());
 
         let mut store = MemStore::default();
-        let (_writes, owned) = stream_into_store(SNAPSHOT, &mut store, None, Some(&owner)).unwrap();
+        let (_writes, owned) =
+            stream_into_store(SNAPSHOT, &mut store, None, Some(&owner), None).unwrap();
 
         // The baseline collected during the seed matches load_accounts' owner-scoped set.
         assert_eq!(owned.len(), reference.len());
@@ -404,7 +618,7 @@ mod tests {
     #[test]
     fn reads_bank_hashes_from_the_manifest() {
         // The embedded snapshot is at slot 200.
-        let mh = read_manifest_hashes(SNAPSHOT, 200).expect("read manifest hashes");
+        let mh = read_manifest_fields(SNAPSHOT, 200).expect("read manifest hashes");
         assert_eq!(mh.slot, 200);
         assert_eq!(mh.parent_slot, 199);
         assert_ne!(
@@ -422,7 +636,7 @@ mod tests {
     #[test]
     fn manifest_parent_hash_matches_the_snapshot_slothashes() {
         // Two independent reads must agree: the manifest's parent_hash and the newest SlotHashes entry (both are bank_hash(slot-1)).
-        let mh = read_manifest_hashes(SNAPSHOT, 200).expect("read manifest hashes");
+        let mh = read_manifest_fields(SNAPSHOT, 200).expect("read manifest hashes");
         let accounts = load_accounts(SNAPSHOT, None, None).unwrap();
         let slot_hashes_id: Pubkey = "SysvarS1otHashes111111111111111111111111111"
             .parse()
@@ -452,11 +666,75 @@ mod tests {
         let path = "/Users/mctursh/slate-data/\
                     snapshot-349047024-Cv8fHRuDLaRVhB8YTXGMxbMpZBC1BDGpN5MN99GFGqUv.tar.zst";
         let f = File::open(path).expect("open the mainnet snapshot");
-        let mh = read_manifest_hashes(f, 349047024).expect("read manifest hashes");
+        let mh = read_manifest_fields(f, 349047024).expect("read manifest hashes");
         let expected: Hash = "Cv87aY5YPjpDpWfEzbikfxyhthNmfYSJ1rZdbJfQ8gm6"
             .parse()
             .unwrap();
         assert_eq!(mh.bank_hash, expected, "mainnet bank_hash(s_snap)");
         assert_eq!(mh.parent_slot, 349047023);
+    }
+}
+
+#[cfg(test)]
+mod manifest_field_tests {
+    use super::*;
+
+    // Ground truth against the real epoch-807 snapshot: inflation sits ~220 bytes past the validated
+    // `slot` anchor, so this is what proves that offset arithmetic. Expected values are mainnet's
+    // genesis curve, cross-checked against getInflationGovernor.
+    #[test]
+    #[ignore = "needs the local mainnet snapshot at /Users/mctursh/slate-data"]
+    fn reads_the_reward_scalars_from_the_mainnet_manifest() {
+        let path = "/Users/mctursh/slate-data/\
+                    snapshot-349047024-Cv8fHRuDLaRVhB8YTXGMxbMpZBC1BDGpN5MN99GFGqUv.tar.zst";
+        let slot = 349_047_024;
+        let m = read_manifest_fields(File::open(path).unwrap(), slot).unwrap();
+
+        assert_eq!(m.slot, slot);
+        assert!(
+            m.capitalization > 500_000_000 * 1_000_000_000,
+            "mainnet supply is well over 500M SOL, got {} lamports",
+            m.capitalization
+        );
+        assert!(
+            m.slots_per_year > 60_000_000.0 && m.slots_per_year < 90_000_000.0,
+            "400ms slots put a year near 78.9M slots, got {}",
+            m.slots_per_year
+        );
+
+        // Independent confirmation the offset chain landed right.
+        assert_eq!(
+            m.epoch,
+            slot / 432_000,
+            "manifest epoch disagrees with the slot"
+        );
+
+        // The slot-to-height gap is the count of slots ever skipped, so it only grows: live mainnet
+        // showed 21,956,549 skipped by slot 445,721,748, and this earlier slot must be under that.
+        const GAP_AT_445M: u64 = 445_721_748 - 423_765_199;
+        assert!(
+            m.block_height < slot && m.block_height > slot - GAP_AT_445M,
+            "block_height {} out of bounds for slot {slot} (gap must be under {GAP_AT_445M})",
+            m.block_height
+        );
+        let inf = m
+            .inflation
+            .expect("inflation curve parsed and passed the range check");
+        assert_eq!(inf.initial, 0.08);
+        assert_eq!(inf.terminal, 0.015);
+        assert_eq!(inf.taper, 0.15);
+        assert_eq!(
+            inf.foundation, 0.0,
+            "mainnet foundation is 0.0; Inflation::default() would be 0.05 and underpay by 5%"
+        );
+        assert_eq!(inf.foundation_term, 0.0);
+
+        // Illustrative: agave derives the year via slot_in_year_for_inflation(), not a plain division.
+        let year = slot as f64 / m.slots_per_year;
+        assert_eq!(
+            inf.validator(year),
+            inf.total(year),
+            "with foundation 0.0 the validator rate is the whole curve"
+        );
     }
 }

@@ -3908,6 +3908,12 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "siphasher"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
+
+[[package]]
+name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
@@ -3994,9 +4000,12 @@ dependencies = [
  "solana-compute-budget",
  "solana-compute-budget-instruction",
  "solana-ed25519-program",
+ "solana-epoch-rewards",
+ "solana-epoch-rewards-hasher",
  "solana-epoch-schedule",
  "solana-fee-structure",
  "solana-hash 3.1.0",
+ "solana-inflation",
  "solana-instruction",
  "solana-instruction-error",
  "solana-lattice-hash 2.2.20",
@@ -4009,6 +4018,7 @@ dependencies = [
  "solana-sdk-ids",
  "solana-signature",
  "solana-slot-hashes",
+ "solana-stake-interface",
  "solana-stake-program",
  "solana-svm",
  "solana-svm-callback",
@@ -4622,6 +4632,17 @@ dependencies = [
  "solana-sdk-ids",
  "solana-sdk-macro",
  "solana-sysvar-id",
+]
+
+[[package]]
+name = "solana-epoch-rewards-hasher"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ee8beac9bff4db9225e57d532d169b0be5e447f1e6601a2f50f27a01bf5518f"
+dependencies = [
+ "siphasher 0.3.11",
+ "solana-address 2.7.0",
+ "solana-hash 4.5.0",
 ]
 
 [[package]]
@@ -7121,7 +7142,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
- "siphasher",
+ "siphasher 1.0.3",
  "solana-pubkey 4.3.0",
  "thiserror 2.0.18",
  "tonic",

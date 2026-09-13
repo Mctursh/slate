@@ -195,6 +195,7 @@ pub mod cpi {
             slot: SLOT,
             parent_slot: SLOT - 1,
             blockhash: solana_hash::Hash::default(),
+            block_height: 0,
             previous_blockhash: solana_hash::Hash::default(),
             block_time: BLOCK_TIME,
             transactions: vec![crate::block::BlockTx {

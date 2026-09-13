@@ -7,9 +7,9 @@ use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 use crate::{
-    RangeReplay, ReplayBank, Replayer, WriteRecord,
+    RangeReplay, ReplayBank, Replayer, SLOTS_PER_EPOCH, WriteRecord,
     block::{self, Block},
-    boundary, build_feature_set, compat, persist, register_builtins, snapshot,
+    boundary, build_feature_set, compat, epoch_of, persist, register_builtins, rewards, snapshot,
     source::{BlockSource, CachingBlockSource},
     store::{AccountStore, DiskStore, MemStore},
 };
@@ -42,7 +42,10 @@ pub async fn backfill(
     chunk_slots: usize,
     verify_end: Option<Box<dyn Read>>,
     resume: bool,
+    reward_inputs: Option<rewards::ManifestRewardInputs>,
 ) -> Result<BackfillReport> {
+    let crosses_epoch = epoch_of(from) != epoch_of(to);
+    ensure_single_epoch(from, to, reward_inputs.is_some())?;
     let chunk_slots = chunk_slots.max(1);
     let source: Arc<dyn BlockSource> = match block_cache {
         None => source,
@@ -108,11 +111,14 @@ pub async fn backfill(
             }
             AccountStoreChoice::Disk { path, cache_bytes } => {
                 let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
+                // A crossing needs every stake account, not just the ones the range's blocks touch.
+                let mut collected = HashSet::new();
                 let (written, owned) = snapshot::stream_into_store(
                     snapshot,
                     &mut disk,
                     Some(&footprint),
                     Some(program),
+                    crosses_epoch.then_some(&mut collected),
                 )?;
                 eprintln!(
                     "seeded {written} accounts into disk store {}",
@@ -144,10 +150,41 @@ pub async fn backfill(
     let replay_slots: Vec<u64> = slots.into_iter().filter(|&s| s > resume_from).collect();
     let mut covered_hi = resume_from;
     let result = if let Some(&first_slot) = replay_slots.first() {
-        let epoch = first_slot / 432_000;
+        let epoch = epoch_of(first_slot);
         let feature_set = build_feature_set(&bank, first_slot);
         // The bank needs its own copy: the SVM reaches the precompile callbacks through the bank, not the replayer.
         bank.set_feature_set(feature_set.clone());
+        if let Some(manifest) = &reward_inputs {
+            bank.set_reward_inputs(rewards::RewardInputs::new(feature_set.clone(), manifest));
+            // Zero = checkpoint written before the seeding below, not a real supply.
+            let restored_cap = resume
+                .then(|| bank.load_capitalization())
+                .flatten()
+                .filter(|cap| *cap > 0);
+            match restored_cap {
+                Some(cap) => eprintln!("capitalization restored from the checkpoint: {cap}"),
+                None => bank.set_capitalization(manifest.capitalization),
+            }
+            // agave's own cache, not a scan: scanning accounts yields a superset, which inflates the
+            // stake-history fold and the reward partition count.
+            // A resume restores the accumulated set; a fresh run starts from agave's cache.
+            if resume {
+                let n = bank.load_pending_partitions();
+                if n > 0 {
+                    eprintln!("pending reward partitions restored from the checkpoint: {n}");
+                }
+            }
+            let restored = if resume { bank.load_stake_keys() } else { 0 };
+            if restored == 0 {
+                bank.set_stake_keys(manifest.stake_delegations.clone());
+                eprintln!(
+                    "stake delegations from the manifest cache: {}",
+                    manifest.stake_delegations.len()
+                );
+            } else {
+                eprintln!("stake delegations restored from the checkpoint: {restored}");
+            }
+        }
         let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
         register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
         // Compat: re-supply native builtins agave deleted post core-BPF migration (e.g. Stake), gated per feature so it's a no-op once active.
@@ -199,8 +236,13 @@ pub async fn backfill(
             None => Box::new(MemStore::default()),
             Some((path, cache_bytes)) => Box::new(DiskStore::create(path, *cache_bytes)?),
         };
-        let (loaded, _) =
-            snapshot::stream_into_store(end_snapshot, &mut *end_store, Some(&footprint), None)?;
+        let (loaded, _) = snapshot::stream_into_store(
+            end_snapshot,
+            &mut *end_store,
+            Some(&footprint),
+            None,
+            None,
+        )?;
         eprintln!("loaded {loaded} end-snapshot accounts for the boundary diff");
         Some(boundary::boundary_diff(
             bank.store(),
@@ -215,6 +257,19 @@ pub async fn backfill(
         replay: result,
         boundary,
     })
+}
+
+// `from` is the seed slot and is never replayed, but the first replayed block's parent sits at or below it, so a from/to split across epochs does mean a crossing gets replayed.
+fn ensure_single_epoch(from: u64, to: u64, have_reward_inputs: bool) -> Result<()> {
+    let (lo, hi) = (epoch_of(from), epoch_of(to));
+    if lo != hi && !have_reward_inputs {
+        let boundary = (lo + 1) * SLOTS_PER_EPOCH;
+        anyhow::bail!(
+            "range {from}..={to} crosses an epoch boundary at slot {boundary} (epoch {lo} -> {hi}); \
+             epoch-boundary replay is not implemented yet, split the range at {boundary}"
+        );
+    }
+    Ok(())
 }
 
 // Run the source's blocking fetch on the blocking pool so the previous chunk's persist doesn't stall behind the network.
@@ -235,6 +290,53 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_signature::Signature;
     use solana_transaction::versioned::VersionedTransaction;
+
+    // Epoch 808 starts at 349_056_000.
+    const E807_LAST: u64 = 349_056_000 - 1;
+    const E808_FIRST: u64 = 349_056_000;
+
+    #[test]
+    fn a_range_inside_one_epoch_is_allowed() {
+        assert!(ensure_single_epoch(349_047_024, 349_055_000, false).is_ok());
+    }
+
+    #[test]
+    fn a_range_ending_on_the_last_slot_of_an_epoch_is_allowed() {
+        assert!(ensure_single_epoch(349_047_024, E807_LAST, false).is_ok());
+    }
+
+    #[test]
+    fn a_range_starting_on_the_first_slot_of_an_epoch_is_allowed() {
+        assert!(ensure_single_epoch(E808_FIRST, E808_FIRST + 5_000, false).is_ok());
+    }
+
+    #[test]
+    fn a_crossing_is_allowed_once_reward_inputs_are_supplied() {
+        assert!(ensure_single_epoch(E807_LAST, E808_FIRST, true).is_ok());
+    }
+
+    #[test]
+    fn a_range_crossing_a_boundary_is_refused() {
+        let err = ensure_single_epoch(E807_LAST, E808_FIRST, false)
+            .expect_err("one slot either side of 349_056_000 is a crossing")
+            .to_string();
+        assert!(
+            err.contains("at slot 349056000"),
+            "error names the boundary: {err}"
+        );
+        assert!(
+            err.contains("807") && err.contains("808"),
+            "names both epochs: {err}"
+        );
+    }
+
+    #[test]
+    fn a_multi_epoch_range_names_the_first_boundary() {
+        let err = ensure_single_epoch(349_047_024, E808_FIRST + SLOTS_PER_EPOCH, false)
+            .expect_err("spans 807 -> 809")
+            .to_string();
+        assert!(err.contains("at slot 349056000"), "{err}");
+    }
 
     // The real test-validator snapshot the loader was developed against (slot 200).
     const SNAPSHOT: &[u8] = include_bytes!("test_snapshot.tar.zst");
@@ -277,6 +379,7 @@ mod tests {
                     slot,
                     parent_slot: slot - 1,
                     blockhash: Hash::default(),
+                    block_height: 0,
                     previous_blockhash: Hash::default(),
                     block_time: 1_700_000_000,
                     transactions: vec![BlockTx {
@@ -320,6 +423,7 @@ mod tests {
             2000,
             None,
             false,
+            None,
         )
         .await
         .expect("backfill");
@@ -399,6 +503,7 @@ mod tests {
             2000,
             Some(Box::new(SNAPSHOT)),
             false,
+            None,
         )
         .await
         .expect("backfill");
@@ -450,6 +555,7 @@ mod tests {
                     slot,
                     parent_slot: slot - 1,
                     blockhash: Hash::default(),
+                    block_height: 0,
                     previous_blockhash: Hash::default(),
                     block_time: 1_700_000_000,
                     transactions: vec![BlockTx {
@@ -503,6 +609,7 @@ mod tests {
             1,
             None,
             false,
+            None,
         )
         .await
         .expect("fresh run");
@@ -522,6 +629,7 @@ mod tests {
             1,
             None,
             true,
+            None,
         )
         .await
         .expect("resume run");

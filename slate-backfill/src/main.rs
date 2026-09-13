@@ -6,7 +6,8 @@ use slate_common::config::Config;
 use slate_replay::{
     backfill::{AccountStoreChoice, backfill},
     block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
-    snapshot::{read_manifest_hashes, read_manifest_lt_hash},
+    rewards::ManifestRewardInputs,
+    snapshot::{read_manifest_fields, read_manifest_lt_hash, read_manifest_stakes_cache},
     source::{BlockSource, RpcBlockSource},
 };
 use slate_store::ClickHouseClient;
@@ -107,8 +108,10 @@ fn main() -> anyhow::Result<()> {
     check_clickhouse(&cfg.clickhouse.url)?;
 
     // A fresh run reads its seed and roll bootstrap from the snapshot; --resume takes the roll state from the store's checkpoint, so no snapshot.
+    // A resume does not seed, but the manifest still carries the epoch-reward inputs, so read it
+    // when a path is given.
     let snapshot_path = if args.resume {
-        None
+        args.snapshot.as_ref()
     } else {
         let path = args
             .snapshot
@@ -125,10 +128,11 @@ fn main() -> anyhow::Result<()> {
         println!("preflight ok: RPC, program, config, ClickHouse, and snapshot all check out");
     }
 
+    let mut reward_inputs = None;
     let bootstrap = match snapshot_path {
         None => None,
         Some(path) => {
-            let manifest = read_manifest_hashes(
+            let manifest = read_manifest_fields(
                 File::open(path).with_context(|| format!("opening snapshot {path}"))?,
                 args.from,
             )
@@ -139,6 +143,23 @@ fn main() -> anyhow::Result<()> {
             )
             .context("reading the snapshot manifest lattice hash")?
             .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
+            // Only complete inputs are useful: without the curve the reward totals would be wrong,
+            // so a crossing is refused rather than approximated.
+            let stakes_cache = read_manifest_stakes_cache(
+                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
+                args.from,
+            )
+            .context("reading the manifest stakes cache")?;
+            reward_inputs = match manifest.inflation {
+                Some(inflation) => Some(ManifestRewardInputs {
+                    inflation,
+                    capitalization: manifest.capitalization,
+                    slots_per_year: manifest.slots_per_year,
+                    stake_delegations: stakes_cache.1.keys().copied().collect(),
+                    vote_accounts: stakes_cache.0.clone(),
+                }),
+                None => None,
+            };
             Some((lt_hash, manifest.bank_hash))
         }
     };
@@ -191,7 +212,8 @@ fn main() -> anyhow::Result<()> {
             args.chunk_slots,
             verify_end,
             args.resume,
-        )
+            reward_inputs,
+    )
         .await?;
         match &result.replay.halt {
             None => println!(
