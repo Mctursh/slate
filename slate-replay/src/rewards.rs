@@ -165,14 +165,14 @@ pub fn calculate_epoch_rewards(
         let Some(vote_state) = vote_state_for(&delegation.voter_pubkey) else {
             continue;
         };
-        match calculate_points(
+        if let Ok(p) = calculate_points(
+            // match calculate_points(
             &state,
             &vote_state,
             &stake_history,
             new_rate_activation_epoch,
         ) {
-            Ok(p) => points += p,
-            Err(_) => {}
+            points += p;
         }
     }
 
