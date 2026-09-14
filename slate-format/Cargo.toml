@@ -1,0 +1,9 @@
+[package]
+name = "slate-format"
+version = "0.2.0"
+edition = "2024"
+
+# Byte layouts only, so no solana dependencies. See slate-hash for why a shared crate
+# that takes typed solana values isn't actually shared.
+[dependencies]
+slate-hash = { path = "../slate-hash" }

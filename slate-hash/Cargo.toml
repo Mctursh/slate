@@ -1,0 +1,11 @@
+[package]
+name = "slate-hash"
+version = "0.2.0"
+edition = "2024"
+
+# No solana dependencies: `Pubkey` at two majors are different types that don't
+# interoperate, so a crate taking them is version-locked, not shared. This takes bytes.
+[dependencies]
+blake3 = "1"
+sha2 = "0.10"
+bs58 = "0.5"

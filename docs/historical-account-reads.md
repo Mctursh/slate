@@ -165,10 +165,25 @@ the argument for keeping all three:
   Raydium upgrade was followed by seven transactions that failed on chain and succeeded
   in the replay, because the upgraded program was made available immediately.
 
-Current scope, stated plainly: one verified window, inside epoch 808. Builtin
-registration and precompile verification still assume that epoch's feature set, so
-earlier ranges are not yet covered. Extending the range is engineering, not open
-research, but it is not done.
+Current scope, stated plainly. The largest verified window is 50,079 slots inside epoch
+808. Epoch boundaries are replayed as well, verified at the 807 → 808 crossing: pending
+features activate, the inflation pool and vote commission match mainnet to the lamport,
+and all 228 stake-reward partitions pay out on the blocks that carried them.
+
+Reaching further back needs a different agave than reaching forward does, because a given
+version doesn't know features that activate after it was cut and has already deleted code
+earlier epochs need. The range is therefore sliced into eras, one worker per agave version,
+each pinned to its own lockfile and toolchain so a later era can't disturb an earlier one's
+proof. Two eras cover epoch 807 to the present.
+
+What is not done: four epochs in 807–978 rewrite accounts at their boundary and have no
+implementation (823 Stake to core BPF, 943 Rent sysvar, 949 vote state v4, 971 SPL Token to
+p-token), and the SVM's program-runtime environment is still built once from a range's
+first slot rather than following a mid-range activation. Verification is also honest about
+its own limits: an era spans roughly 74 million slots, replaying all of them is not on the
+table, so coverage is built at the points where behaviour actually changes rather than
+claimed across the whole range. Extending this is engineering, not open research, but it is
+not done.
 
 ## Security considerations
 

@@ -781,67 +781,36 @@ pub fn distribute_due_partition(bank: &mut ReplayBank, block_height: u64, slot: 
 // Checkpoint encoding for the pending partitions. Explicit bytes rather than bincode of a
 // version-specific type: the checkpoint is read by whichever binary resumes, which may not be the
 // one that wrote it. version(4) ++ partitions(4) ++ per partition [count(4) ++ count * 112 bytes].
-const STAKE_REWARD_BYTES: usize = 112;
-const PENDING_PARTITIONS_VERSION: u32 = 1;
-
-pub fn encode_pending_partitions(partitions: &[Vec<StakeReward>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + partitions.len() * 4);
-    out.extend_from_slice(&PENDING_PARTITIONS_VERSION.to_le_bytes());
-    out.extend_from_slice(&(partitions.len() as u32).to_le_bytes());
-    for partition in partitions {
-        out.extend_from_slice(&(partition.len() as u32).to_le_bytes());
-        for r in partition {
-            out.extend_from_slice(r.stake_pubkey.as_ref());
-            out.extend_from_slice(&r.lamports.to_le_bytes());
-            out.extend_from_slice(r.stake.delegation.voter_pubkey.as_ref());
-            out.extend_from_slice(&r.stake.delegation.stake.to_le_bytes());
-            out.extend_from_slice(&r.stake.delegation.activation_epoch.to_le_bytes());
-            out.extend_from_slice(&r.stake.delegation.deactivation_epoch.to_le_bytes());
-            out.extend_from_slice(&r.stake.delegation.warmup_cooldown_rate.to_le_bytes());
-            out.extend_from_slice(&r.stake.credits_observed.to_le_bytes());
-        }
+// StakeReward is built from this era's solana-stake-interface types, so the checkpoint
+// stores the fields flat.
+pub fn to_reward_record(r: &StakeReward) -> slate_format::StakeRewardRecord {
+    slate_format::StakeRewardRecord {
+        stake_pubkey: r.stake_pubkey.to_bytes(),
+        lamports: r.lamports,
+        voter_pubkey: r.stake.delegation.voter_pubkey.to_bytes(),
+        stake: r.stake.delegation.stake,
+        activation_epoch: r.stake.delegation.activation_epoch,
+        deactivation_epoch: r.stake.delegation.deactivation_epoch,
+        warmup_cooldown_rate: r.stake.delegation.warmup_cooldown_rate,
+        credits_observed: r.stake.credits_observed,
     }
-    out
 }
 
-pub fn decode_pending_partitions(bytes: &[u8]) -> Option<Vec<Vec<StakeReward>>> {
-    let u32_at = |b: &[u8], o: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
-    };
-    let u64_at = |b: &[u8], o: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?))
-    };
-    if u32_at(bytes, 0)? != PENDING_PARTITIONS_VERSION {
-        return None;
+pub fn from_reward_record(r: &slate_format::StakeRewardRecord) -> StakeReward {
+    StakeReward {
+        stake_pubkey: Pubkey::new_from_array(r.stake_pubkey),
+        lamports: r.lamports,
+        stake: Stake {
+            delegation: solana_stake_interface::state::Delegation {
+                voter_pubkey: Pubkey::new_from_array(r.voter_pubkey),
+                stake: r.stake,
+                activation_epoch: r.activation_epoch,
+                deactivation_epoch: r.deactivation_epoch,
+                warmup_cooldown_rate: r.warmup_cooldown_rate,
+            },
+            credits_observed: r.credits_observed,
+        },
     }
-    let count = u32_at(bytes, 4)? as usize;
-    let mut p = 8;
-    let mut partitions = Vec::with_capacity(count);
-    for _ in 0..count {
-        let n = u32_at(bytes, p)? as usize;
-        p += 4;
-        let mut rewards = Vec::with_capacity(n);
-        for _ in 0..n {
-            let f = bytes.get(p..p + STAKE_REWARD_BYTES)?;
-            rewards.push(StakeReward {
-                stake_pubkey: Pubkey::try_from(&f[0..32]).ok()?,
-                lamports: u64_at(f, 32)?,
-                stake: Stake {
-                    delegation: solana_stake_interface::state::Delegation {
-                        voter_pubkey: Pubkey::try_from(&f[40..72]).ok()?,
-                        stake: u64_at(f, 72)?,
-                        activation_epoch: u64_at(f, 80)?,
-                        deactivation_epoch: u64_at(f, 88)?,
-                        warmup_cooldown_rate: f64::from_le_bytes(f[96..104].try_into().ok()?),
-                    },
-                    credits_observed: u64_at(f, 104)?,
-                },
-            });
-            p += STAKE_REWARD_BYTES;
-        }
-        partitions.push(rewards);
-    }
-    Some(partitions)
 }
 
 /// agave REWARD_CALCULATION_NUM_BLOCKS: one block between calculation and the first payout.
@@ -899,12 +868,24 @@ mod boundary_tests {
             vec![],
             vec![reward(3, 30)],
         ];
-        let bytes = encode_pending_partitions(&partitions);
-        assert_eq!(decode_pending_partitions(&bytes).unwrap(), partitions);
-        assert!(
-            decode_pending_partitions(&[0; 8]).is_none(),
-            "version is checked"
-        );
+        // Through the real byte layout, so a field dropped on either side shows up.
+        let checkpoint = slate_format::Checkpoint {
+            slot: 349_056_100,
+            capitalization: 1,
+            roll: None,
+            stake_keys: vec![],
+            pending_partitions: partitions
+                .iter()
+                .map(|p| p.iter().map(to_reward_record).collect())
+                .collect(),
+        };
+        let back: Vec<Vec<StakeReward>> = slate_format::Checkpoint::decode(&checkpoint.encode())
+            .unwrap()
+            .pending_partitions
+            .iter()
+            .map(|p| p.iter().map(from_reward_record).collect())
+            .collect();
+        assert_eq!(back, partitions);
     }
 
     #[test]

@@ -1,75 +1,36 @@
-// Bank-hash computation for the lattice-hash regime (accounts_lt_hash active epoch 804+, accounts_delta_hash removed epoch 807+); mirrors agave v2.2.20.
+// Typed adapter over slate-hash: converts this era's solana types to bytes. The
+// computation lives in slate-hash so every era shares one implementation.
 
-use sha2::{Digest, Sha256};
+use slate_hash::LtHash;
 use solana_account::{AccountSharedData, ReadableAccount};
 use solana_hash::Hash;
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 // One slot's changes: (pubkey, pre-value, post-value); None pre-value = created this slot.
 pub type SlotChange = (Pubkey, Option<AccountSharedData>, AccountSharedData);
 
-// Lattice element, mirrors agave hash_account_helper (RentEpochInAccountHash::Excluded): blake3 XOF over lamports(LE)||data||executable||owner||pubkey, NO rent_epoch. Dead account = identity.
 pub fn lt_hash_account(pubkey: &Pubkey, account: &impl ReadableAccount) -> LtHash {
-    if account.lamports() == 0 {
-        return LtHash::identity();
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&account.lamports().to_le_bytes());
-    hasher.update(account.data());
-    hasher.update(&[account.executable() as u8]);
-    hasher.update(account.owner().as_ref());
-    hasher.update(pubkey.as_ref());
-    LtHash::with(&hasher)
+    slate_hash::lt_hash_account(
+        &pubkey.to_bytes(),
+        account.lamports(),
+        account.data(),
+        account.executable(),
+        &account.owner().to_bytes(),
+    )
 }
 
-// 1024 lanes as LE u16 (2048 bytes); matches agave bytemuck::must_cast_slice on LE targets.
-fn lt_hash_bytes(lt: &LtHash) -> [u8; 2048] {
-    let mut bytes = [0u8; 2048];
-    for (lane, chunk) in lt.0.iter().zip(bytes.chunks_exact_mut(2)) {
-        chunk.copy_from_slice(&lane.to_le_bytes());
-    }
-    bytes
-}
-
-// Roll state for a checkpoint: 2048 LE lattice bytes ++ 32 hash bytes (the snapshot-trailer layout).
-pub(crate) fn serialize_roll_state(lt: &LtHash, bank_hash: &Hash) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2048 + 32);
-    out.extend_from_slice(&lt_hash_bytes(lt));
-    out.extend_from_slice(bank_hash.as_ref());
-    out
-}
-
-// Inverse of serialize_roll_state; None on a wrong length.
-pub(crate) fn deserialize_roll_state(bytes: &[u8]) -> Option<(LtHash, Hash)> {
-    if bytes.len() != 2048 + 32 {
-        return None;
-    }
-    let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(bytes[..2048].chunks_exact(2)) {
-        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-    let bank_hash = Hash::new_from_array(bytes[2048..2080].try_into().ok()?);
-    Some((LtHash(lanes), bank_hash))
-}
-
-// Lattice-regime bank hash: SHA256(SHA256(parent||sig_count_LE||blockhash)||lt_hash[2048]). No accounts-delta (SIMD-0223), no epoch-accounts-hash (SIMD-0215).
 pub fn bank_hash(
     parent_bank_hash: &Hash,
     signature_count: u64,
     last_blockhash: &Hash,
     accounts_lt_hash: &LtHash,
 ) -> Hash {
-    let inner = Sha256::new()
-        .chain_update(parent_bank_hash.as_ref())
-        .chain_update(signature_count.to_le_bytes())
-        .chain_update(last_blockhash.as_ref())
-        .finalize();
-    let full = Sha256::new()
-        .chain_update(inner)
-        .chain_update(lt_hash_bytes(accounts_lt_hash))
-        .finalize();
-    Hash::new_from_array(full.into())
+    Hash::new_from_array(slate_hash::bank_hash(
+        &parent_bank_hash.to_bytes(),
+        signature_count,
+        &last_blockhash.to_bytes(),
+        accounts_lt_hash,
+    ))
 }
 
 // Rolls the lattice forward per slot (mix out old, in new) and computes each bank hash, parent for the next slot and the SlotHashes entry.
@@ -114,75 +75,43 @@ impl BankHashRoller {
 mod tests {
     use super::*;
 
-    // agave lt_hash.rs::test_checksum_display: identity checksum has a fixed base58 form.
+    // The extraction proof: slate-hash owns its LtHash, so nothing but this test stops
+    // the two drifting apart. solana-lattice-hash is a dev-dependency for exactly this.
     #[test]
-    fn identity_checksum_matches_agave() {
-        assert_eq!(
-            LtHash::identity().checksum().to_string(),
-            "DoL6fvKuTpTQCyUh83NxQw2ewKzWYtq9gsTKp1eQiGC2"
-        );
-    }
+    fn slate_hash_agrees_with_agave_lattice_hash() {
+        use solana_lattice_hash::lt_hash::LtHash as AgaveLtHash;
 
-    // agave lt_hash.rs::test_hello_world: checks XOF byte-order (LE u16 lanes) against agave's vector.
-    #[test]
-    fn with_matches_agave_hello_vector() {
-        let mut h = blake3::Hasher::new();
-        h.update(b"hello");
-        let lt = LtHash::with(&h);
-        // First XOF bytes are `ea 8f 16 3d b3 86 ...`, i.e. LE u16 lanes:
-        assert_eq!(lt.0[0], 0x8fea);
-        assert_eq!(lt.0[1], 0x3d16);
-        assert_eq!(lt.0[2], 0x86b3);
-        let expected: [u8; 32] = [
-            79, 156, 26, 184, 156, 205, 94, 208, 182, 235, 33, 147, 111, 153, 229, 152, 207, 133,
-            75, 109, 182, 198, 119, 61, 11, 81, 41, 70, 24, 87, 100, 85,
-        ];
-        assert_eq!(lt.checksum().0, expected);
-    }
+        let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let a1 = test_account(100, &[1, 2, 3]);
+        let a2 = test_account(7_777, &[]);
 
-    #[test]
-    fn roll_state_round_trips() {
-        let mut lanes = [0u16; 1024];
-        for (i, l) in lanes.iter_mut().enumerate() {
-            *l = (i as u16).wrapping_mul(7).wrapping_add(1);
-        }
-        let lt = LtHash(lanes);
-        let hash = Hash::new_from_array([3u8; 32]);
-        let (lt2, hash2) = deserialize_roll_state(&serialize_roll_state(&lt, &hash)).unwrap();
-        assert_eq!(lt.0, lt2.0);
-        assert_eq!(hash, hash2);
-    }
+        let agave_element = |k: &Pubkey, a: &AccountSharedData| {
+            let mut h = blake3::Hasher::new();
+            h.update(&a.lamports().to_le_bytes());
+            h.update(a.data());
+            h.update(&[a.executable() as u8]);
+            h.update(a.owner().as_ref());
+            h.update(k.as_ref());
+            AgaveLtHash::with(&h)
+        };
 
-    // The bank-hash combine is two nested SHA-256s over the four inputs.
-    #[test]
-    fn bank_hash_is_two_nested_sha256() {
-        let parent = Hash::new_from_array([1u8; 32]);
-        let blockhash = Hash::new_from_array([2u8; 32]);
-        let lt = LtHash::identity();
-        let got = bank_hash(&parent, 7, &blockhash, &lt);
+        // Per-account elements agree lane for lane.
+        assert_eq!(lt_hash_account(&k1, &a1).0, agave_element(&k1, &a1).0);
 
-        let inner = Sha256::new()
-            .chain_update([1u8; 32])
-            .chain_update(7u64.to_le_bytes())
-            .chain_update([2u8; 32])
-            .finalize();
-        let expected = Sha256::new()
-            .chain_update(inner)
-            .chain_update([0u8; 2048]) // identity lattice = all zeros
-            .finalize();
-        assert_eq!(got, Hash::new_from_array(expected.into()));
-    }
+        // And so does an accumulator built by the same mix_in/mix_out sequence.
+        let mut agave = AgaveLtHash::identity();
+        agave.mix_in(&agave_element(&k1, &a1));
+        agave.mix_in(&agave_element(&k2, &a2));
+        agave.mix_out(&agave_element(&k1, &a1));
 
-    // Mix in then out returns to start, the homomorphism the roll-forward relies on.
-    #[test]
-    fn mix_in_then_out_is_identity() {
-        let mut acc = LtHash::identity();
-        let mut h = blake3::Hasher::new();
-        h.update(b"some account element");
-        let element = LtHash::with(&h);
-        acc.mix_in(&element);
-        acc.mix_out(&element);
-        assert_eq!(acc.0, LtHash::identity().0);
+        let mut ours = LtHash::identity();
+        ours.mix_in(&lt_hash_account(&k1, &a1));
+        ours.mix_in(&lt_hash_account(&k2, &a2));
+        ours.mix_out(&lt_hash_account(&k1, &a1));
+
+        assert_eq!(ours.0, agave.0);
+        assert_eq!(ours.checksum().0, agave.checksum().0);
+        assert_eq!(ours.checksum().to_string(), agave.checksum().to_string());
     }
 
     fn test_account(lamports: u64, data: &[u8]) -> AccountSharedData {

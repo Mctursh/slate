@@ -13,16 +13,10 @@ pub trait AccountStore: Send + Sync {
     fn scan(&self, visit: &mut dyn FnMut(Pubkey, &AccountSharedData));
     // Commit buffered writes; no-op for write-through stores.
     fn flush(&mut self);
-    // Atomically flush buffered accounts + a resume checkpoint (slot + roll bytes) in one durable commit; no-op if the store can't resume.
-    fn checkpoint_flush(&mut self, slot: u64, roll: &[u8]) -> anyhow::Result<()>;
-    fn read_checkpoint(&self) -> Option<(u64, Vec<u8>)>;
-    // Small side-blobs (stake keys, capitalization) so a resume doesn't have to rebuild derived
-    // state. Staged, not written: they must land in the SAME commit as the checkpoint, or a crash
-    // in between leaves meta from a later slot than the checkpoint claims.
-    fn stage_meta(&mut self, _key: &str, _value: &[u8]) {}
-    fn get_meta(&self, _key: &str) -> Option<Vec<u8>> {
-        None
-    }
+    // Flush buffered accounts + the resume checkpoint in one durable commit; no-op if the
+    // store can't resume. Blob is opaque: the store owns durability, slate-format the layout.
+    fn checkpoint_flush(&mut self, checkpoint: &[u8]) -> anyhow::Result<()>;
+    fn read_checkpoint(&self) -> Option<Vec<u8>>;
 }
 
 // In-RAM HashMap; for tests and ranges small enough to fit.
@@ -52,11 +46,11 @@ impl AccountStore for MemStore {
 
     fn flush(&mut self) {}
 
-    fn checkpoint_flush(&mut self, _slot: u64, _roll: &[u8]) -> anyhow::Result<()> {
+    fn checkpoint_flush(&mut self, _checkpoint: &[u8]) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn read_checkpoint(&self) -> Option<(u64, Vec<u8>)> {
+    fn read_checkpoint(&self) -> Option<Vec<u8>> {
         None
     }
 }
@@ -74,7 +68,6 @@ pub struct DiskStore {
     buffered_bytes: usize,
     // Set after seeding: put() stops auto-flushing and flush() no-ops, so checkpoint_flush is the only committer and the redb never holds writes past the last checkpoint (what makes --resume sound).
     checkpoint_mode: bool,
-    meta_staged: HashMap<String, Vec<u8>>,
 }
 
 impl DiskStore {
@@ -88,7 +81,6 @@ impl DiskStore {
             buffer: HashMap::new(),
             buffered_bytes: 0,
             checkpoint_mode: false,
-            meta_staged: HashMap::new(),
         })
     }
 
@@ -114,9 +106,11 @@ impl AccountStore for DiskStore {
     }
 
     fn put(&mut self, key: Pubkey, account: AccountSharedData, slot: u64) {
-        let added = 57 + account.data().len();
+        let added = slate_format::ACCOUNT_HEAD_BYTES + account.data().len();
         if let Some((old, _)) = self.buffer.insert(key, (account, slot)) {
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(57 + old.data().len());
+            self.buffered_bytes = self
+                .buffered_bytes
+                .saturating_sub(slate_format::ACCOUNT_HEAD_BYTES + old.data().len());
         }
         self.buffered_bytes += added;
         // No mid-slot auto-flush in checkpoint mode; it would put the redb ahead of the last checkpoint.
@@ -174,17 +168,7 @@ impl AccountStore for DiskStore {
         self.buffered_bytes = 0;
     }
 
-    fn stage_meta(&mut self, key: &str, value: &[u8]) {
-        self.meta_staged.insert(key.to_owned(), value.to_vec());
-    }
-
-    fn get_meta(&self, key: &str) -> Option<Vec<u8>> {
-        let txn = self.db.begin_read().ok()?;
-        let table = txn.open_table(META).ok()?;
-        Some(table.get(key).ok()??.value().to_vec())
-    }
-
-    fn checkpoint_flush(&mut self, slot: u64, roll: &[u8]) -> anyhow::Result<()> {
+    fn checkpoint_flush(&mut self, checkpoint: &[u8]) -> anyhow::Result<()> {
         let mut txn = self.db.begin_write()?;
         // Immediate: accounts + checkpoint land durably together, so a crash can't split them.
         txn.set_durability(Durability::Immediate);
@@ -193,92 +177,48 @@ impl AccountStore for DiskStore {
             for (key, (account, acct_slot)) in self.buffer.drain() {
                 accounts.insert(key.as_ref(), encode(&account, acct_slot).as_slice())?;
             }
-            let mut meta = txn.open_table(META)?;
-            for (key, value) in self.meta_staged.drain() {
-                meta.insert(key.as_str(), value.as_slice())?;
-            }
-            // slot(8 LE) ++ roll; written even on an empty buffer, so a no-write chunk still advances the slot.
-            let mut value = slot.to_le_bytes().to_vec();
-            value.extend_from_slice(roll);
-            meta.insert("checkpoint", value.as_slice())?;
+            // Written even on an empty buffer, so a no-write chunk still advances the slot.
+            txn.open_table(META)?.insert("checkpoint", checkpoint)?;
         }
         txn.commit()?;
         self.buffered_bytes = 0;
         Ok(())
     }
 
-    fn read_checkpoint(&self) -> Option<(u64, Vec<u8>)> {
+    fn read_checkpoint(&self) -> Option<Vec<u8>> {
         let txn = self.db.begin_read().ok()?;
         let table = txn.open_table(META).ok()?; // no META table yet = never checkpointed
-        let value = table.get("checkpoint").ok()??;
-        let bytes = value.value();
-        if bytes.len() < 8 {
-            return None;
-        }
-        let slot = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-        Some((slot, bytes[8..].to_vec()))
+        Some(table.get("checkpoint").ok()??.value().to_vec())
     }
 }
 
-// slot(8) | lamports(8) | rent_epoch(8) | executable(1) | owner(32) | data(rest): 57-byte head + data.
+// Typed adapter; the layout is a cross-era contract and lives in slate-format.
 fn encode(account: &AccountSharedData, slot: u64) -> Vec<u8> {
-    let data = account.data();
-    let mut buf = Vec::with_capacity(57 + data.len());
-    buf.extend_from_slice(&slot.to_le_bytes());
-    buf.extend_from_slice(&account.lamports().to_le_bytes());
-    buf.extend_from_slice(&account.rent_epoch().to_le_bytes());
-    buf.push(account.executable() as u8);
-    buf.extend_from_slice(account.owner().as_ref());
-    buf.extend_from_slice(data);
-    buf
+    slate_format::encode_account(
+        slot,
+        account.lamports(),
+        account.rent_epoch(),
+        account.executable(),
+        &account.owner().to_bytes(),
+        account.data(),
+    )
 }
 
 fn decode(bytes: &[u8]) -> Option<(AccountSharedData, u64)> {
-    if bytes.len() < 57 {
-        return None;
-    }
-    let slot = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let lamports = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let rent_epoch = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-    let executable = bytes[24] != 0;
-    let owner = Pubkey::try_from(&bytes[25..57]).ok()?;
-    let data = bytes[57..].to_vec();
+    let r = slate_format::decode_account(bytes).ok()?;
     let account = AccountSharedData::from(Account {
-        lamports,
-        data,
-        owner,
-        executable,
-        rent_epoch,
+        lamports: r.lamports,
+        data: r.data.to_vec(),
+        owner: Pubkey::new_from_array(r.owner),
+        executable: r.executable,
+        rent_epoch: r.rent_epoch,
     });
-    Some((account, slot))
+    Some((account, r.slot))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // A crash between staging meta and committing the checkpoint must not leave meta from a later
-    // slot than the checkpoint claims: that silently double-counts a chunk on resume.
-    #[test]
-    fn staged_meta_lands_only_with_the_checkpoint() {
-        let path = std::env::temp_dir().join("slate_diskstore_staged_meta.redb");
-        let _ = std::fs::remove_file(&path);
-        let mut store = DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
-
-        store.stage_meta("capitalization", &7u64.to_le_bytes());
-        assert!(
-            store.get_meta("capitalization").is_none(),
-            "staged meta must not be durable before the checkpoint commits"
-        );
-
-        store.checkpoint_flush(100, &[1, 2, 3]).unwrap();
-        assert_eq!(
-            store.get_meta("capitalization"),
-            Some(7u64.to_le_bytes().to_vec())
-        );
-        assert_eq!(store.read_checkpoint().unwrap().0, 100);
-        let _ = std::fs::remove_file(&path);
-    }
 
     #[test]
     fn diskstore_round_trips_an_account() {
@@ -318,7 +258,8 @@ mod tests {
     fn checkpoint_survives_reopen() {
         let path = std::env::temp_dir().join("slate_diskstore_checkpoint.redb");
         let _ = std::fs::remove_file(&path);
-        let roll = vec![7u8; 40]; // opaque here; real roll serialization lives in bankhash
+        // Opaque bytes here: the store stores what it's given, slate-format owns the layout.
+        let checkpoint = vec![7u8; 40];
 
         let key = Pubkey::new_from_array([5u8; 32]);
         let account = AccountSharedData::from(Account {
@@ -333,13 +274,12 @@ mod tests {
             let mut store = DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
             store.set_checkpoint_mode(true);
             store.put(key, account, 4242);
-            store.checkpoint_flush(4242, &roll).unwrap();
+            store.checkpoint_flush(&checkpoint).unwrap();
         } // drop closes the db, standing in for a process exit
 
         let store = DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
-        let (slot, got_roll) = store.read_checkpoint().expect("checkpoint survived reopen");
-        assert_eq!(slot, 4242);
-        assert_eq!(got_roll, roll);
+        let got = store.read_checkpoint().expect("checkpoint survived reopen");
+        assert_eq!(got, checkpoint);
         let (acct, s) = store.get(&key).expect("account present after reopen");
         assert_eq!(s, 4242);
         assert_eq!(acct.lamports(), 9_000);

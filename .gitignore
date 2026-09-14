@@ -1,4 +1,5 @@
-/target
+# Unanchored: each era worker is its own workspace with its own target/ dir.
+target/
 /dev-snapshot
 /dev
 /slate.toml

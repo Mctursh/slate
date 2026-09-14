@@ -1,9 +1,9 @@
 use std::{collections::HashSet, io::Read, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
+use slate_hash::LtHash;
 use slate_store::ClickHouseClient;
 use solana_hash::Hash;
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 use crate::{
@@ -80,24 +80,19 @@ pub async fn backfill(
     };
 
     // Fresh run: seed the bank from the snapshot and roll from the manifest hashes. Resume: reopen the store and roll from its checkpoint. Third value is the slot to resume after (S_snap for a fresh run).
-    let (mut bank, baseline, resume_from) = if resume {
+    let (mut bank, baseline, resume_from, restored) = if resume {
         let AccountStoreChoice::Disk { path, cache_bytes } = account_store else {
             anyhow::bail!("--resume requires --store disk");
         };
         let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
-        let (slot, roll) = disk
-            .read_checkpoint()
-            .context("--resume: the store has no checkpoint to resume from")?;
         disk.set_checkpoint_mode(true);
         let mut bank = ReplayBank::with_store(Box::new(disk));
-        // Empty roll = the original run had the bank-hash roll off; keep it off.
-        if !roll.is_empty() {
-            let (lt_hash, bank_hash) = crate::bankhash::deserialize_roll_state(&roll)
-                .context("--resume: checkpoint roll state is corrupt")?;
-            bank.bootstrap_bankhash(lt_hash, bank_hash);
-        }
-        eprintln!("resuming after checkpoint at slot {slot}");
-        (bank, Vec::new(), slot)
+        let restored = bank
+            .restore_checkpoint()
+            .context("--resume: reading the store's checkpoint")?
+            .context("--resume: the store has no checkpoint to resume from")?;
+        eprintln!("resuming after checkpoint at slot {}", restored.slot);
+        (bank, Vec::new(), restored.slot, Some(restored))
     } else {
         let (mut bank, baseline) = match account_store {
             AccountStoreChoice::Memory => {
@@ -133,7 +128,7 @@ pub async fn backfill(
         if let Some((lt_hash, bank_hash)) = bootstrap {
             bank.bootstrap_bankhash(lt_hash, bank_hash);
         }
-        (bank, baseline, s_snap)
+        (bank, baseline, s_snap, None)
     };
 
     // Fresh run: checkpoint at s_snap right after seeding, so a crash before chunk 1's checkpoint still resumes (skips the ~expensive re-seed) instead of finding no checkpoint.
@@ -156,33 +151,35 @@ pub async fn backfill(
         bank.set_feature_set(feature_set.clone());
         if let Some(manifest) = &reward_inputs {
             bank.set_reward_inputs(rewards::RewardInputs::new(feature_set.clone(), manifest));
-            // Zero = checkpoint written before the seeding below, not a real supply.
-            let restored_cap = resume
-                .then(|| bank.load_capitalization())
-                .flatten()
-                .filter(|cap| *cap > 0);
-            match restored_cap {
+            // restore_checkpoint already loaded these; fall back to the manifest for
+            // whatever the checkpoint didn't carry.
+            match restored
+                .as_ref()
+                .map(|r| r.capitalization)
+                .filter(|c| *c > 0)
+            {
                 Some(cap) => eprintln!("capitalization restored from the checkpoint: {cap}"),
                 None => bank.set_capitalization(manifest.capitalization),
+            }
+            if let Some(n) = restored
+                .as_ref()
+                .map(|r| r.pending_partitions)
+                .filter(|n| *n > 0)
+            {
+                eprintln!("pending reward partitions restored from the checkpoint: {n}");
             }
             // agave's own cache, not a scan: scanning accounts yields a superset, which inflates the
             // stake-history fold and the reward partition count.
             // A resume restores the accumulated set; a fresh run starts from agave's cache.
-            if resume {
-                let n = bank.load_pending_partitions();
-                if n > 0 {
-                    eprintln!("pending reward partitions restored from the checkpoint: {n}");
+            match restored.as_ref().map(|r| r.stake_keys).filter(|n| *n > 0) {
+                Some(n) => eprintln!("stake delegations restored from the checkpoint: {n}"),
+                None => {
+                    bank.set_stake_keys(manifest.stake_delegations.clone());
+                    eprintln!(
+                        "stake delegations from the manifest cache: {}",
+                        manifest.stake_delegations.len()
+                    );
                 }
-            }
-            let restored = if resume { bank.load_stake_keys() } else { 0 };
-            if restored == 0 {
-                bank.set_stake_keys(manifest.stake_delegations.clone());
-                eprintln!(
-                    "stake delegations from the manifest cache: {}",
-                    manifest.stake_delegations.len()
-                );
-            } else {
-                eprintln!("stake delegations restored from the checkpoint: {restored}");
             }
         }
         let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);

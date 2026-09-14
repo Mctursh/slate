@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 slate-replay = { path = "../slate-replay" }
-slate-store = { path = "../slate-store" }
-slate-common = { path = "../slate-common" }
+slate-store = { path = "../../../slate-store" }
+slate-common = { path = "../../../slate-common" }
 solana-pubkey = "4.0.0"
 anyhow = "1"
 clap = { workspace = true }

@@ -19,6 +19,7 @@ use std::{
 
 use agave_feature_set::FeatureSet;
 use agave_syscalls::create_program_runtime_environment_v1;
+use slate_hash::LtHash;
 use solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount};
 use solana_clock::Clock;
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
@@ -26,7 +27,6 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
 use solana_instruction_error::InstructionError;
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_precompile_error::PrecompileError;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
@@ -68,6 +68,16 @@ impl ForkGraph for SlateForkGraph {
             std::cmp::Ordering::Greater => BlockRelation::Descendant,
         }
     }
+}
+
+// What a resume found in the checkpoint; the caller decides what still has to come
+// from the snapshot manifest.
+pub struct RestoredCheckpoint {
+    pub slot: u64,
+    // Zero = the checkpoint predates seeding, not a real supply.
+    pub capitalization: u64,
+    pub stake_keys: usize,
+    pub pending_partitions: usize,
 }
 
 // Slate's stand-in for the validator's Bank: the account source the SVM reads and writes during replay.
@@ -232,62 +242,58 @@ impl ReplayBank {
         self.bankhash_roller.as_ref().map(|r| r.bank_hash())
     }
 
-    // Durably checkpoint at `slot`: flush accounts + roll state in one atomic commit, so --resume can continue from here. A no-op roll (tests) serializes to empty.
+    // Durably checkpoint at `slot`: accounts + everything a resume needs, in one atomic commit.
     pub fn checkpoint(&mut self, slot: u64) -> anyhow::Result<()> {
-        let roll = self
-            .bankhash_roller
-            .as_ref()
-            .map(|r| crate::bankhash::serialize_roll_state(r.lt_hash(), &r.bank_hash()))
-            .unwrap_or_default();
-        // Persist the stake key set too: it is accumulated across the whole replay, so a resume
-        // cannot reconstruct it and would silently fold a different delegation set.
-        if !self.stake_keys.is_empty() {
-            let mut blob = Vec::with_capacity(self.stake_keys.len() * 32);
-            for key in &self.stake_keys {
-                blob.extend_from_slice(key.as_ref());
-            }
-            self.store.stage_meta("stake_keys", &blob);
-        }
-        self.store
-            .stage_meta("capitalization", &self.capitalization.to_le_bytes());
-        // Calculated at a boundary and consumed over the following blocks: a resume landing inside
-        // that window would otherwise pay out nothing.
-        if !self.pending_partitions.is_empty() {
-            self.store.stage_meta(
-                "pending_partitions",
-                &rewards::encode_pending_partitions(&self.pending_partitions),
-            );
-        }
-        self.store.checkpoint_flush(slot, &roll)
+        let checkpoint = slate_format::Checkpoint {
+            slot,
+            capitalization: self.capitalization,
+            roll: self
+                .bankhash_roller
+                .as_ref()
+                .map(|r| slate_format::RollState {
+                    lt_hash: r.lt_hash().clone(),
+                    bank_hash: r.bank_hash().to_bytes(),
+                }),
+            stake_keys: self.stake_keys.iter().map(Pubkey::to_bytes).collect(),
+            pending_partitions: self
+                .pending_partitions
+                .iter()
+                .map(|p| p.iter().map(rewards::to_reward_record).collect())
+                .collect(),
+        };
+        self.store.checkpoint_flush(&checkpoint.encode())
     }
 
-    pub fn load_capitalization(&mut self) -> Option<u64> {
-        let blob = self.store.get_meta("capitalization")?;
-        let value = u64::from_le_bytes(blob.get(..8)?.try_into().ok()?);
-        self.capitalization = value;
-        Some(value)
-    }
+    /// `Ok(None)` = no checkpoint. One that exists but can't be read is an error, not a
+    /// silent fall back to manifest defaults, which is a resume that diverges quietly.
+    pub fn restore_checkpoint(&mut self) -> anyhow::Result<Option<RestoredCheckpoint>> {
+        let Some(blob) = self.store.read_checkpoint() else {
+            return Ok(None);
+        };
+        let checkpoint = slate_format::Checkpoint::decode(&blob)?;
 
-    pub fn load_pending_partitions(&mut self) -> usize {
-        let Some(blob) = self.store.get_meta("pending_partitions") else {
-            return 0;
-        };
-        let Some(partitions) = rewards::decode_pending_partitions(&blob) else {
-            return 0;
-        };
-        self.pending_partitions = partitions;
-        self.pending_partitions.len()
-    }
-
-    pub fn load_stake_keys(&mut self) -> usize {
-        let Some(blob) = self.store.get_meta("stake_keys") else {
-            return 0;
-        };
-        self.stake_keys = blob
-            .chunks_exact(32)
-            .filter_map(|c| Pubkey::try_from(c).ok())
+        self.capitalization = checkpoint.capitalization;
+        self.stake_keys = checkpoint
+            .stake_keys
+            .iter()
+            .map(|k| Pubkey::new_from_array(*k))
             .collect();
-        self.stake_keys.len()
+        self.pending_partitions = checkpoint
+            .pending_partitions
+            .iter()
+            .map(|p| p.iter().map(rewards::from_reward_record).collect())
+            .collect();
+        // Absent = the original run had the bank-hash roll off; keep it off.
+        if let Some(roll) = checkpoint.roll {
+            self.bootstrap_bankhash(roll.lt_hash, Hash::new_from_array(roll.bank_hash));
+        }
+
+        Ok(Some(RestoredCheckpoint {
+            slot: checkpoint.slot,
+            capitalization: checkpoint.capitalization,
+            stake_keys: self.stake_keys.len(),
+            pending_partitions: self.pending_partitions.len(),
+        }))
     }
 
     // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
@@ -1181,6 +1187,70 @@ mod tests {
             &Hash::default(),
         );
         assert_eq!(bank.capitalization(), 1_150);
+    }
+
+    // One value, so a resume can only see a slot and capitalization written together.
+    // The bug: committed separately, a crash between the two resumed with a supply that
+    // already counted the chunk about to be replayed.
+    #[test]
+    fn a_checkpoint_restores_the_capitalization_of_its_own_slot() {
+        let path = std::env::temp_dir().join("slate_checkpoint_is_one_value.redb");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+            disk.set_checkpoint_mode(true);
+            let mut bank = ReplayBank::with_store(Box::new(disk));
+            bank.set_capitalization(1_000);
+            bank.set_stake_keys(HashSet::from([Pubkey::new_from_array([4; 32])]));
+            bank.checkpoint(100).unwrap();
+            // Carry on past it; this work never gets a checkpoint of its own.
+            bank.set_capitalization(2_000);
+        } // drop closes the db, standing in for a crash
+
+        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let mut bank = ReplayBank::with_store(Box::new(disk));
+        let restored = bank
+            .restore_checkpoint()
+            .unwrap()
+            .expect("the checkpoint is there");
+
+        assert_eq!(restored.slot, 100);
+        assert_eq!(
+            restored.capitalization, 1_000,
+            "not the uncheckpointed 2_000"
+        );
+        assert_eq!(bank.capitalization(), 1_000);
+        assert_eq!(restored.stake_keys, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Must stop the resume, not fall back to defaults and diverge later.
+    #[test]
+    fn an_unreadable_checkpoint_is_an_error_not_a_silent_default() {
+        let path = std::env::temp_dir().join("slate_checkpoint_unreadable.redb");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+            disk.set_checkpoint_mode(true);
+            disk.checkpoint_flush(b"written by some other build")
+                .unwrap();
+        }
+
+        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let mut bank = ReplayBank::with_store(Box::new(disk));
+        assert!(bank.restore_checkpoint().is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // No checkpoint at all is not an error: it's a fresh run.
+    #[test]
+    fn no_checkpoint_restores_nothing() {
+        let mut bank = ReplayBank::default();
+        assert!(bank.restore_checkpoint().unwrap().is_none());
     }
 
     #[test]
