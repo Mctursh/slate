@@ -182,7 +182,7 @@ pub async fn backfill(
                 }
             }
         }
-        let replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
+        let mut replayer = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
         register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
         // Compat: re-supply native builtins agave deleted post core-BPF migration (e.g. Stake), gated per feature so it's a no-op once active.
         compat::register_removed_builtins(&mut bank, &replayer.processor, replayer.feature_set());

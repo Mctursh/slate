@@ -30,7 +30,10 @@ use solana_instruction_error::InstructionError;
 use solana_precompile_error::PrecompileError;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
-    loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
+    loaded_programs::{
+        BlockRelation, ForkGraph, ProgramCacheEntry, ProgramRuntimeEnvironment,
+        ProgramRuntimeEnvironments,
+    },
 };
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
@@ -680,6 +683,18 @@ pub struct Replayer {
     svm_feature_set: SVMFeatureSet,
 }
 
+fn program_runtime_v1(svm_feature_set: &SVMFeatureSet) -> ProgramRuntimeEnvironment {
+    Arc::new(
+        create_program_runtime_environment_v1(
+            svm_feature_set,
+            &SVMTransactionExecutionBudget::default(),
+            false,
+            false,
+        )
+        .expect("build v1 program runtime environment"),
+    )
+}
+
 impl Replayer {
     // The exact per-slot feature set, used to gate compat shims (e.g. re-supplied removed builtins).
     pub fn feature_set(&self) -> &FeatureSet {
@@ -696,16 +711,11 @@ impl Replayer {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
         // SVM env takes the derived SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
         let svm_feature_set = feature_set.runtime_features();
-        let budget = SVMTransactionExecutionBudget::default();
-        let loader = Arc::new(
-            create_program_runtime_environment_v1(&svm_feature_set, &budget, false, false)
-                .expect("build v1 program runtime environment"),
-        );
         let processor = TransactionBatchProcessor::new(
             slot,
             epoch,
             Arc::downgrade(&fork_graph),
-            Some(loader),
+            Some(program_runtime_v1(&svm_feature_set)),
             None,
         );
         Self {
@@ -714,6 +724,21 @@ impl Replayer {
             feature_set,
             svm_feature_set,
         }
+    }
+
+    // Follow a feature set that changed at an epoch crossing. agave's own mechanism: the new
+    // environment is staged as `upcoming` for that epoch, so earlier epochs keep the old one and
+    // programs compiled against it stop matching on extraction and get recompiled.
+    pub fn enter_epoch(&mut self, epoch: u64, feature_set: FeatureSet) {
+        self.svm_feature_set = feature_set.runtime_features();
+        self.feature_set = feature_set;
+        let environments = ProgramRuntimeEnvironments {
+            program_runtime_v1: program_runtime_v1(&self.svm_feature_set),
+            program_runtime_v2: self.processor.environments.program_runtime_v2.clone(),
+        };
+        let mut prep = self.processor.epoch_boundary_preparation.write().unwrap();
+        prep.upcoming_epoch = epoch;
+        prep.upcoming_environments = Some(environments);
     }
 
     // Per-batch runtime settings; epoch_total_stake defaults to 0, fine for anything that doesn't touch stake.
@@ -829,13 +854,21 @@ impl Replayer {
     }
 
     // Replay every tx in block in order, committing successes so the next tx sees them; stops at the first tx that can't replay or diverges. bank must be seeded with builtins registered.
-    pub fn replay_block(&self, bank: &mut ReplayBank, block: &Block, epoch: u64) -> BlockReplay {
-        self.replay_block_with(&self.processor, bank, block, epoch)
+    pub fn replay_block(
+        &mut self,
+        bank: &mut ReplayBank,
+        block: &Block,
+        epoch: u64,
+    ) -> BlockReplay {
+        // Own the per-slot processor, as replay_range does: replay_block_with needs &mut self,
+        // which rules out holding a borrow of self.processor across the call.
+        let processor = self.processor.new_from(block.slot, epoch);
+        self.replay_block_with(&processor, bank, block, epoch)
     }
 
     // Replay block against an explicit processor (see execute_with).
     fn replay_block_with(
-        &self,
+        &mut self,
         processor: &TransactionBatchProcessor<SlateForkGraph>,
         bank: &mut ReplayBank,
         block: &Block,
@@ -847,19 +880,23 @@ impl Replayer {
             bank.begin_slot();
         }
         // First BLOCK of the epoch, not the boundary slot, which can be skipped.
-        if epoch_of(block.slot) != epoch_of(block.parent_slot)
-            && let Some(inputs) = bank.reward_inputs.clone()
-        {
-            let outcome = rewards::process_epoch_boundary(
-                bank,
-                &inputs,
-                epoch,
-                block.slot,
-                block.previous_blockhash,
-                block.block_height,
-            );
-            bank.set_feature_set(build_feature_set(bank, block.slot));
-            bank.pending_partitions = outcome.partitions;
+        if epoch_of(block.slot) != epoch_of(block.parent_slot) {
+            if let Some(inputs) = bank.reward_inputs.clone() {
+                let outcome = rewards::process_epoch_boundary(
+                    bank,
+                    &inputs,
+                    epoch,
+                    block.slot,
+                    block.previous_blockhash,
+                    block.block_height,
+                );
+                bank.pending_partitions = outcome.partitions;
+            }
+            // Read after the rewards pass, which is what activates this epoch's features.
+            // Both the bank's gating and the SVM's program-runtime environment follow it.
+            let feature_set = build_feature_set(bank, block.slot);
+            self.enter_epoch(epoch, feature_set.clone());
+            bank.set_feature_set(feature_set);
         }
         rewards::distribute_due_partition(bank, block.block_height, block.slot);
         bank.configure_sysvars(block.slot, block.block_time);
@@ -910,11 +947,12 @@ impl Replayer {
                 && executed.was_successful()
                 && !executed.programs_modified_by_tx.is_empty()
             {
-                processor
-                    .global_program_cache
-                    .write()
-                    .unwrap()
-                    .merge(&processor.environments, &executed.programs_modified_by_tx);
+                // Per-epoch: across a boundary processor.environments is still the previous
+                // epoch's, and a mis-tagged entry fails the ptr_eq check on extraction.
+                processor.global_program_cache.write().unwrap().merge(
+                    &processor.get_environments_for_epoch(epoch),
+                    &executed.programs_modified_by_tx,
+                );
             }
             commit_writes(bank, &tx, &result, block.slot);
         }
@@ -941,7 +979,7 @@ impl Replayer {
     }
 
     // Replay a contiguous range in slot order against one bank that rolls forward; each block gets a fresh per-slot processor (new_from) sharing the program cache. Intra-epoch only, crossing an epoch needs machinery not built yet.
-    pub fn replay_range(&self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
+    pub fn replay_range(&mut self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
         // Self-verify against consensus: a vote carries the voted slot's bank hash, so later votes confirm earlier computed hashes. computed/confirmed pair them up (bounded to the ~30-slot vote lag); a mismatch means we diverged from a stake supermajority, halt.
         let first_slot = blocks.first().map_or(0, |b| b.slot);
         let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
@@ -1251,6 +1289,141 @@ mod tests {
     fn no_checkpoint_restores_nothing() {
         let mut bank = ReplayBank::default();
         assert!(bank.restore_checkpoint().unwrap().is_none());
+    }
+
+    // The strong one: crossing into an epoch must produce the SAME environment as building a
+    // replayer fresh at that epoch. new_with_feature_set is the path the 807->808 and
+    // 50,079-slot mainnet proofs ran through, so equivalence carries that evidence over to the
+    // crossing path. BuiltinProgram's PartialEq compares the VM config and the syscall registry,
+    // which is exactly what a feature change moves.
+    #[test]
+    fn crossing_produces_the_same_environment_as_building_fresh() {
+        use agave_feature_set::{
+            enable_poseidon_syscall, enable_sbpf_v2_deployment_and_execution as sbpf_v2,
+        };
+
+        let epoch = 825u64;
+        let first_slot = epoch * 432_000;
+        let mut feature_set = FeatureSet::default();
+        let mut crossed =
+            Replayer::new_with_feature_set(first_slot - 1, epoch - 1, feature_set.clone());
+
+        // One gate that moves the VM config, one that moves the syscall registry.
+        feature_set.activate(&sbpf_v2::id(), first_slot);
+        feature_set.activate(&enable_poseidon_syscall::id(), first_slot);
+        crossed.enter_epoch(epoch, feature_set.clone());
+
+        let fresh = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
+
+        assert!(
+            crossed
+                .processor
+                .get_environments_for_epoch(epoch)
+                .program_runtime_v1
+                == fresh
+                    .processor
+                    .get_environments_for_epoch(epoch)
+                    .program_runtime_v1,
+            "VM config and syscall registry must match a fresh build"
+        );
+    }
+
+    // The crossing must roll the SVM environment, not just the bank's gating. Without it a
+    // range's tail executes against the environment its first slot was built with.
+    #[test]
+    fn crossing_an_epoch_rolls_the_svm_environment() {
+        use agave_feature_set::enable_sbpf_v2_deployment_and_execution as sbpf_v2;
+
+        let epoch = 825u64;
+        let first_slot = epoch * 432_000;
+        let mut bank = ReplayBank::default();
+        // Already activated on chain at the crossing; build_feature_set reads it back.
+        bank.insert(
+            sbpf_v2::id(),
+            feature_account(Some(first_slot), 0),
+            first_slot,
+        );
+
+        let mut replayer = Replayer::new_with_feature_set(first_slot, epoch, FeatureSet::default());
+        assert!(
+            !replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let before = replayer.processor.get_environments_for_epoch(epoch);
+
+        let block = block::Block {
+            slot: first_slot,
+            parent_slot: first_slot - 1, // previous epoch, so this is the crossing
+            blockhash: Hash::default(),
+            block_height: 0,
+            previous_blockhash: Hash::default(),
+            block_time: 1_700_000_000,
+            transactions: vec![],
+            fee_reward: None,
+        };
+        assert!(
+            replayer
+                .replay_block(&mut bank, &block, epoch)
+                .is_complete()
+        );
+
+        assert!(
+            replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution,
+            "the crossing must pick up the feature"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &before.program_runtime_v1,
+                &replayer
+                    .processor
+                    .get_environments_for_epoch(epoch)
+                    .program_runtime_v1
+            ),
+            "and rebuild the program runtime environment for it"
+        );
+    }
+
+    // The SVM environment has to follow a feature set that changed at a crossing, and only for
+    // the new epoch: the previous one keeps the environment its slots actually executed against.
+    #[test]
+    fn entering_an_epoch_swaps_the_program_runtime_environment() {
+        use agave_feature_set::enable_sbpf_v2_deployment_and_execution as sbpf_v2;
+
+        let mut feature_set = FeatureSet::default();
+        let mut replayer = Replayer::new_with_feature_set(0, 10, feature_set.clone());
+        assert!(
+            !replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let before = replayer.processor.get_environments_for_epoch(11);
+
+        feature_set.activate(&sbpf_v2::id(), 11 * 432_000);
+        replayer.enter_epoch(11, feature_set);
+
+        assert!(
+            replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let after = replayer.processor.get_environments_for_epoch(11);
+        assert!(
+            !Arc::ptr_eq(&before.program_runtime_v1, &after.program_runtime_v1),
+            "epoch 11 must get the rebuilt environment"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &replayer
+                    .processor
+                    .get_environments_for_epoch(10)
+                    .program_runtime_v1,
+                &before.program_runtime_v1
+            ),
+            "epoch 10 must keep the environment its slots ran against"
+        );
     }
 
     #[test]
@@ -2041,7 +2214,10 @@ mod tests {
             .global_program_cache
             .write()
             .unwrap()
-            .merge(&replayer.processor.environments, &modified);
+            .merge(
+                &replayer.processor.get_environments_for_epoch(epoch),
+                &modified,
+            );
 
         let after = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
         assert!(
@@ -2124,7 +2300,7 @@ mod tests {
         let s = fixture::cpi::SLOT;
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
-        let replayer = Replayer::new(s, epoch);
+        let mut replayer = Replayer::new(s, epoch);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let block = fixture::cpi::block();
@@ -2172,7 +2348,7 @@ mod tests {
         let slot = 201; // just after the snapshot's slot (200)
         let epoch = slot / 432_000;
         let mut bank = snapshot::seed_bank_from_snapshot(SNAPSHOT, None).unwrap();
-        let replayer = Replayer::new(slot, epoch);
+        let mut replayer = Replayer::new(slot, epoch);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let transfer = |from: &Pubkey, to: &Pubkey, lamports: u64| -> VersionedTransaction {
@@ -2833,7 +3009,7 @@ mod tests {
             }),
             base_slot,
         );
-        let replayer = Replayer::new(base_slot, base_slot / 432_000);
+        let mut replayer = Replayer::new(base_slot, base_slot / 432_000);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         // Block N: src -> mid; block N+1: mid -> dst, which only reconciles if block N's write to mid rolled forward.
