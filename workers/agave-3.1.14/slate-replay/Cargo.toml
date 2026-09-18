@@ -50,6 +50,12 @@ solana-epoch-rewards = "3.1.0"
 solana-epoch-rewards-hasher = "3.1.0"
 solana-inflation = "3.1.1"
 solana-stake-interface = { version = "2.0.2", features = ["bincode"] }
+# UpgradeableLoaderState + get_program_data_address, for the epoch-823 core-BPF migration
+# whose config agave 3.1.14 dropped once the migration landed upstream.
+solana-loader-v3-interface = { version = "6.1.1", features = ["bincode"] }
+# deploy_program, to put the migrated program in the cache at the migration slot so it
+# inherits agave's delay-visibility (effective_slot = deployment_slot + 1).
+solana-bpf-loader-program = "3.1.14"
 solana-hash = "3.1.0"
 # Decode validator votes: a TowerSync/VoteStateUpdate carries the bank hash of the
 # slot it votes on, so votes in later blocks let the replay self-verify each slot

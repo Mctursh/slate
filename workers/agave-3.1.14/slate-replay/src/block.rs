@@ -381,6 +381,13 @@ pub fn footprint_fixed(set: &mut HashSet<Pubkey>) {
     set.insert(solana_sdk_ids::sysvar::stake_history::id());
     set.insert(solana_sdk_ids::sysvar::epoch_rewards::id());
     set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
+    // Core-BPF migration buffers: read only at the activating boundary, never by a
+    // transaction, so nothing else would pull them into the seed set.
+    set.extend(
+        crate::compat::core_bpf::MIGRATION_SOURCE_BUFFERS
+            .iter()
+            .copied(),
+    );
 }
 
 // Full seed footprint in one shot (block keys ∪ the fixed set); for tests and non-streaming callers.
@@ -434,6 +441,18 @@ pub fn programdata_addresses(footprint: &HashSet<Pubkey>) -> HashSet<Pubkey> {
 
 #[cfg(test)]
 mod tests {
+
+    // The 823 run halted here: no transaction touches a migration buffer, and it is not
+    // stake/vote/program-owned, so the snapshot seeder dropped it and the migration found
+    // nothing to read.
+    #[test]
+    fn the_fixed_set_carries_the_core_bpf_migration_buffers() {
+        let mut set = HashSet::new();
+        footprint_fixed(&mut set);
+        for b in crate::compat::core_bpf::MIGRATION_SOURCE_BUFFERS {
+            assert!(set.contains(b), "migration buffer {b} must be seeded");
+        }
+    }
     use super::*;
 
     // A real mainnet getBlock (slot 437680849), trimmed to the first 3 txs.
