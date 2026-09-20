@@ -19,6 +19,7 @@ use std::{
 
 use agave_feature_set::FeatureSet;
 use agave_syscalls::create_program_runtime_environment_v1;
+use slate_hash::LtHash;
 use solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount};
 use solana_clock::Clock;
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
@@ -26,11 +27,13 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
 use solana_hash::Hash;
 use solana_instruction_error::InstructionError;
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_precompile_error::PrecompileError;
 use solana_program_runtime::{
     execution_budget::SVMTransactionExecutionBudget,
-    loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
+    loaded_programs::{
+        BlockRelation, ForkGraph, ProgramCacheEntry, ProgramRuntimeEnvironment,
+        ProgramRuntimeEnvironments,
+    },
 };
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
@@ -68,6 +71,16 @@ impl ForkGraph for SlateForkGraph {
             std::cmp::Ordering::Greater => BlockRelation::Descendant,
         }
     }
+}
+
+// What a resume found in the checkpoint; the caller decides what still has to come
+// from the snapshot manifest.
+pub struct RestoredCheckpoint {
+    pub slot: u64,
+    // Zero = the checkpoint predates seeding, not a real supply.
+    pub capitalization: u64,
+    pub stake_keys: usize,
+    pub pending_partitions: usize,
 }
 
 // Slate's stand-in for the validator's Bank: the account source the SVM reads and writes during replay.
@@ -232,62 +245,58 @@ impl ReplayBank {
         self.bankhash_roller.as_ref().map(|r| r.bank_hash())
     }
 
-    // Durably checkpoint at `slot`: flush accounts + roll state in one atomic commit, so --resume can continue from here. A no-op roll (tests) serializes to empty.
+    // Durably checkpoint at `slot`: accounts + everything a resume needs, in one atomic commit.
     pub fn checkpoint(&mut self, slot: u64) -> anyhow::Result<()> {
-        let roll = self
-            .bankhash_roller
-            .as_ref()
-            .map(|r| crate::bankhash::serialize_roll_state(r.lt_hash(), &r.bank_hash()))
-            .unwrap_or_default();
-        // Persist the stake key set too: it is accumulated across the whole replay, so a resume
-        // cannot reconstruct it and would silently fold a different delegation set.
-        if !self.stake_keys.is_empty() {
-            let mut blob = Vec::with_capacity(self.stake_keys.len() * 32);
-            for key in &self.stake_keys {
-                blob.extend_from_slice(key.as_ref());
-            }
-            self.store.stage_meta("stake_keys", &blob);
-        }
-        self.store
-            .stage_meta("capitalization", &self.capitalization.to_le_bytes());
-        // Calculated at a boundary and consumed over the following blocks: a resume landing inside
-        // that window would otherwise pay out nothing.
-        if !self.pending_partitions.is_empty() {
-            self.store.stage_meta(
-                "pending_partitions",
-                &rewards::encode_pending_partitions(&self.pending_partitions),
-            );
-        }
-        self.store.checkpoint_flush(slot, &roll)
+        let checkpoint = slate_format::Checkpoint {
+            slot,
+            capitalization: self.capitalization,
+            roll: self
+                .bankhash_roller
+                .as_ref()
+                .map(|r| slate_format::RollState {
+                    lt_hash: r.lt_hash().clone(),
+                    bank_hash: r.bank_hash().to_bytes(),
+                }),
+            stake_keys: self.stake_keys.iter().map(Pubkey::to_bytes).collect(),
+            pending_partitions: self
+                .pending_partitions
+                .iter()
+                .map(|p| p.iter().map(rewards::to_reward_record).collect())
+                .collect(),
+        };
+        self.store.checkpoint_flush(&checkpoint.encode())
     }
 
-    pub fn load_capitalization(&mut self) -> Option<u64> {
-        let blob = self.store.get_meta("capitalization")?;
-        let value = u64::from_le_bytes(blob.get(..8)?.try_into().ok()?);
-        self.capitalization = value;
-        Some(value)
-    }
+    /// `Ok(None)` = no checkpoint. One that exists but can't be read is an error, not a
+    /// silent fall back to manifest defaults, which is a resume that diverges quietly.
+    pub fn restore_checkpoint(&mut self) -> anyhow::Result<Option<RestoredCheckpoint>> {
+        let Some(blob) = self.store.read_checkpoint() else {
+            return Ok(None);
+        };
+        let checkpoint = slate_format::Checkpoint::decode(&blob)?;
 
-    pub fn load_pending_partitions(&mut self) -> usize {
-        let Some(blob) = self.store.get_meta("pending_partitions") else {
-            return 0;
-        };
-        let Some(partitions) = rewards::decode_pending_partitions(&blob) else {
-            return 0;
-        };
-        self.pending_partitions = partitions;
-        self.pending_partitions.len()
-    }
-
-    pub fn load_stake_keys(&mut self) -> usize {
-        let Some(blob) = self.store.get_meta("stake_keys") else {
-            return 0;
-        };
-        self.stake_keys = blob
-            .chunks_exact(32)
-            .filter_map(|c| Pubkey::try_from(c).ok())
+        self.capitalization = checkpoint.capitalization;
+        self.stake_keys = checkpoint
+            .stake_keys
+            .iter()
+            .map(|k| Pubkey::new_from_array(*k))
             .collect();
-        self.stake_keys.len()
+        self.pending_partitions = checkpoint
+            .pending_partitions
+            .iter()
+            .map(|p| p.iter().map(rewards::from_reward_record).collect())
+            .collect();
+        // Absent = the original run had the bank-hash roll off; keep it off.
+        if let Some(roll) = checkpoint.roll {
+            self.bootstrap_bankhash(roll.lt_hash, Hash::new_from_array(roll.bank_hash));
+        }
+
+        Ok(Some(RestoredCheckpoint {
+            slot: checkpoint.slot,
+            capitalization: checkpoint.capitalization,
+            stake_keys: self.stake_keys.len(),
+            pending_partitions: self.pending_partitions.len(),
+        }))
     }
 
     // Roll the lattice over this slot's changes and compute its bank hash; None (no-op) if the roll isn't active.
@@ -674,6 +683,18 @@ pub struct Replayer {
     svm_feature_set: SVMFeatureSet,
 }
 
+fn program_runtime_v1(svm_feature_set: &SVMFeatureSet) -> ProgramRuntimeEnvironment {
+    Arc::new(
+        create_program_runtime_environment_v1(
+            svm_feature_set,
+            &SVMTransactionExecutionBudget::default(),
+            false,
+            false,
+        )
+        .expect("build v1 program runtime environment"),
+    )
+}
+
 impl Replayer {
     // The exact per-slot feature set, used to gate compat shims (e.g. re-supplied removed builtins).
     pub fn feature_set(&self) -> &FeatureSet {
@@ -690,16 +711,11 @@ impl Replayer {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
         // SVM env takes the derived SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
         let svm_feature_set = feature_set.runtime_features();
-        let budget = SVMTransactionExecutionBudget::default();
-        let loader = Arc::new(
-            create_program_runtime_environment_v1(&svm_feature_set, &budget, false, false)
-                .expect("build v1 program runtime environment"),
-        );
         let processor = TransactionBatchProcessor::new(
             slot,
             epoch,
             Arc::downgrade(&fork_graph),
-            Some(loader),
+            Some(program_runtime_v1(&svm_feature_set)),
             None,
         );
         Self {
@@ -708,6 +724,21 @@ impl Replayer {
             feature_set,
             svm_feature_set,
         }
+    }
+
+    // Follow a feature set that changed at an epoch crossing. agave's own mechanism: the new
+    // environment is staged as `upcoming` for that epoch, so earlier epochs keep the old one and
+    // programs compiled against it stop matching on extraction and get recompiled.
+    pub fn enter_epoch(&mut self, epoch: u64, feature_set: FeatureSet) {
+        self.svm_feature_set = feature_set.runtime_features();
+        self.feature_set = feature_set;
+        let environments = ProgramRuntimeEnvironments {
+            program_runtime_v1: program_runtime_v1(&self.svm_feature_set),
+            program_runtime_v2: self.processor.environments.program_runtime_v2.clone(),
+        };
+        let mut prep = self.processor.epoch_boundary_preparation.write().unwrap();
+        prep.upcoming_epoch = epoch;
+        prep.upcoming_environments = Some(environments);
     }
 
     // Per-batch runtime settings; epoch_total_stake defaults to 0, fine for anything that doesn't touch stake.
@@ -823,13 +854,21 @@ impl Replayer {
     }
 
     // Replay every tx in block in order, committing successes so the next tx sees them; stops at the first tx that can't replay or diverges. bank must be seeded with builtins registered.
-    pub fn replay_block(&self, bank: &mut ReplayBank, block: &Block, epoch: u64) -> BlockReplay {
-        self.replay_block_with(&self.processor, bank, block, epoch)
+    pub fn replay_block(
+        &mut self,
+        bank: &mut ReplayBank,
+        block: &Block,
+        epoch: u64,
+    ) -> BlockReplay {
+        // Own the per-slot processor, as replay_range does: replay_block_with needs &mut self,
+        // which rules out holding a borrow of self.processor across the call.
+        let processor = self.processor.new_from(block.slot, epoch);
+        self.replay_block_with(&processor, bank, block, epoch)
     }
 
     // Replay block against an explicit processor (see execute_with).
     fn replay_block_with(
-        &self,
+        &mut self,
         processor: &TransactionBatchProcessor<SlateForkGraph>,
         bank: &mut ReplayBank,
         block: &Block,
@@ -841,19 +880,23 @@ impl Replayer {
             bank.begin_slot();
         }
         // First BLOCK of the epoch, not the boundary slot, which can be skipped.
-        if epoch_of(block.slot) != epoch_of(block.parent_slot)
-            && let Some(inputs) = bank.reward_inputs.clone()
-        {
-            let outcome = rewards::process_epoch_boundary(
-                bank,
-                &inputs,
-                epoch,
-                block.slot,
-                block.previous_blockhash,
-                block.block_height,
-            );
-            bank.set_feature_set(build_feature_set(bank, block.slot));
-            bank.pending_partitions = outcome.partitions;
+        if epoch_of(block.slot) != epoch_of(block.parent_slot) {
+            if let Some(inputs) = bank.reward_inputs.clone() {
+                let outcome = rewards::process_epoch_boundary(
+                    bank,
+                    &inputs,
+                    epoch,
+                    block.slot,
+                    block.previous_blockhash,
+                    block.block_height,
+                );
+                bank.pending_partitions = outcome.partitions;
+            }
+            // Read after the rewards pass, which is what activates this epoch's features.
+            // Both the bank's gating and the SVM's program-runtime environment follow it.
+            let feature_set = build_feature_set(bank, block.slot);
+            self.enter_epoch(epoch, feature_set.clone());
+            bank.set_feature_set(feature_set);
         }
         rewards::distribute_due_partition(bank, block.block_height, block.slot);
         bank.configure_sysvars(block.slot, block.block_time);
@@ -904,11 +947,12 @@ impl Replayer {
                 && executed.was_successful()
                 && !executed.programs_modified_by_tx.is_empty()
             {
-                processor
-                    .global_program_cache
-                    .write()
-                    .unwrap()
-                    .merge(&processor.environments, &executed.programs_modified_by_tx);
+                // Per-epoch: across a boundary processor.environments is still the previous
+                // epoch's, and a mis-tagged entry fails the ptr_eq check on extraction.
+                processor.global_program_cache.write().unwrap().merge(
+                    &processor.get_environments_for_epoch(epoch),
+                    &executed.programs_modified_by_tx,
+                );
             }
             commit_writes(bank, &tx, &result, block.slot);
         }
@@ -935,7 +979,7 @@ impl Replayer {
     }
 
     // Replay a contiguous range in slot order against one bank that rolls forward; each block gets a fresh per-slot processor (new_from) sharing the program cache. Intra-epoch only, crossing an epoch needs machinery not built yet.
-    pub fn replay_range(&self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
+    pub fn replay_range(&mut self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
         // Self-verify against consensus: a vote carries the voted slot's bank hash, so later votes confirm earlier computed hashes. computed/confirmed pair them up (bounded to the ~30-slot vote lag); a mismatch means we diverged from a stake supermajority, halt.
         let first_slot = blocks.first().map_or(0, |b| b.slot);
         let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
@@ -1181,6 +1225,205 @@ mod tests {
             &Hash::default(),
         );
         assert_eq!(bank.capitalization(), 1_150);
+    }
+
+    // One value, so a resume can only see a slot and capitalization written together.
+    // The bug: committed separately, a crash between the two resumed with a supply that
+    // already counted the chunk about to be replayed.
+    #[test]
+    fn a_checkpoint_restores_the_capitalization_of_its_own_slot() {
+        let path = std::env::temp_dir().join("slate_checkpoint_is_one_value.redb");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+            disk.set_checkpoint_mode(true);
+            let mut bank = ReplayBank::with_store(Box::new(disk));
+            bank.set_capitalization(1_000);
+            bank.set_stake_keys(HashSet::from([Pubkey::new_from_array([4; 32])]));
+            bank.checkpoint(100).unwrap();
+            // Carry on past it; this work never gets a checkpoint of its own.
+            bank.set_capitalization(2_000);
+        } // drop closes the db, standing in for a crash
+
+        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let mut bank = ReplayBank::with_store(Box::new(disk));
+        let restored = bank
+            .restore_checkpoint()
+            .unwrap()
+            .expect("the checkpoint is there");
+
+        assert_eq!(restored.slot, 100);
+        assert_eq!(
+            restored.capitalization, 1_000,
+            "not the uncheckpointed 2_000"
+        );
+        assert_eq!(bank.capitalization(), 1_000);
+        assert_eq!(restored.stake_keys, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Must stop the resume, not fall back to defaults and diverge later.
+    #[test]
+    fn an_unreadable_checkpoint_is_an_error_not_a_silent_default() {
+        let path = std::env::temp_dir().join("slate_checkpoint_unreadable.redb");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+            disk.set_checkpoint_mode(true);
+            disk.checkpoint_flush(b"written by some other build")
+                .unwrap();
+        }
+
+        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let mut bank = ReplayBank::with_store(Box::new(disk));
+        assert!(bank.restore_checkpoint().is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // No checkpoint at all is not an error: it's a fresh run.
+    #[test]
+    fn no_checkpoint_restores_nothing() {
+        let mut bank = ReplayBank::default();
+        assert!(bank.restore_checkpoint().unwrap().is_none());
+    }
+
+    // The strong one: crossing into an epoch must produce the SAME environment as building a
+    // replayer fresh at that epoch. new_with_feature_set is the path the 807->808 and
+    // 50,079-slot mainnet proofs ran through, so equivalence carries that evidence over to the
+    // crossing path. BuiltinProgram's PartialEq compares the VM config and the syscall registry,
+    // which is exactly what a feature change moves.
+    #[test]
+    fn crossing_produces_the_same_environment_as_building_fresh() {
+        use agave_feature_set::{
+            enable_poseidon_syscall, enable_sbpf_v2_deployment_and_execution as sbpf_v2,
+        };
+
+        let epoch = 825u64;
+        let first_slot = epoch * 432_000;
+        let mut feature_set = FeatureSet::default();
+        let mut crossed =
+            Replayer::new_with_feature_set(first_slot - 1, epoch - 1, feature_set.clone());
+
+        // One gate that moves the VM config, one that moves the syscall registry.
+        feature_set.activate(&sbpf_v2::id(), first_slot);
+        feature_set.activate(&enable_poseidon_syscall::id(), first_slot);
+        crossed.enter_epoch(epoch, feature_set.clone());
+
+        let fresh = Replayer::new_with_feature_set(first_slot, epoch, feature_set);
+
+        assert!(
+            crossed
+                .processor
+                .get_environments_for_epoch(epoch)
+                .program_runtime_v1
+                == fresh
+                    .processor
+                    .get_environments_for_epoch(epoch)
+                    .program_runtime_v1,
+            "VM config and syscall registry must match a fresh build"
+        );
+    }
+
+    // The crossing must roll the SVM environment, not just the bank's gating. Without it a
+    // range's tail executes against the environment its first slot was built with.
+    #[test]
+    fn crossing_an_epoch_rolls_the_svm_environment() {
+        use agave_feature_set::enable_sbpf_v2_deployment_and_execution as sbpf_v2;
+
+        let epoch = 825u64;
+        let first_slot = epoch * 432_000;
+        let mut bank = ReplayBank::default();
+        // Already activated on chain at the crossing; build_feature_set reads it back.
+        bank.insert(
+            sbpf_v2::id(),
+            feature_account(Some(first_slot), 0),
+            first_slot,
+        );
+
+        let mut replayer = Replayer::new_with_feature_set(first_slot, epoch, FeatureSet::default());
+        assert!(
+            !replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let before = replayer.processor.get_environments_for_epoch(epoch);
+
+        let block = block::Block {
+            slot: first_slot,
+            parent_slot: first_slot - 1, // previous epoch, so this is the crossing
+            blockhash: Hash::default(),
+            block_height: 0,
+            previous_blockhash: Hash::default(),
+            block_time: 1_700_000_000,
+            transactions: vec![],
+            fee_reward: None,
+        };
+        assert!(
+            replayer
+                .replay_block(&mut bank, &block, epoch)
+                .is_complete()
+        );
+
+        assert!(
+            replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution,
+            "the crossing must pick up the feature"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &before.program_runtime_v1,
+                &replayer
+                    .processor
+                    .get_environments_for_epoch(epoch)
+                    .program_runtime_v1
+            ),
+            "and rebuild the program runtime environment for it"
+        );
+    }
+
+    // The SVM environment has to follow a feature set that changed at a crossing, and only for
+    // the new epoch: the previous one keeps the environment its slots actually executed against.
+    #[test]
+    fn entering_an_epoch_swaps_the_program_runtime_environment() {
+        use agave_feature_set::enable_sbpf_v2_deployment_and_execution as sbpf_v2;
+
+        let mut feature_set = FeatureSet::default();
+        let mut replayer = Replayer::new_with_feature_set(0, 10, feature_set.clone());
+        assert!(
+            !replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let before = replayer.processor.get_environments_for_epoch(11);
+
+        feature_set.activate(&sbpf_v2::id(), 11 * 432_000);
+        replayer.enter_epoch(11, feature_set);
+
+        assert!(
+            replayer
+                .svm_feature_set
+                .enable_sbpf_v2_deployment_and_execution
+        );
+        let after = replayer.processor.get_environments_for_epoch(11);
+        assert!(
+            !Arc::ptr_eq(&before.program_runtime_v1, &after.program_runtime_v1),
+            "epoch 11 must get the rebuilt environment"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &replayer
+                    .processor
+                    .get_environments_for_epoch(10)
+                    .program_runtime_v1,
+                &before.program_runtime_v1
+            ),
+            "epoch 10 must keep the environment its slots ran against"
+        );
     }
 
     #[test]
@@ -1971,7 +2214,10 @@ mod tests {
             .global_program_cache
             .write()
             .unwrap()
-            .merge(&replayer.processor.environments, &modified);
+            .merge(
+                &replayer.processor.get_environments_for_epoch(epoch),
+                &modified,
+            );
 
         let after = replayer.execute(&bank, &tx, fixture::cpi::FEE, epoch, Hash::default());
         assert!(
@@ -2054,7 +2300,7 @@ mod tests {
         let s = fixture::cpi::SLOT;
         let epoch = s / 432_000;
         let mut bank = fixture::cpi::seed_bank();
-        let replayer = Replayer::new(s, epoch);
+        let mut replayer = Replayer::new(s, epoch);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let block = fixture::cpi::block();
@@ -2102,7 +2348,7 @@ mod tests {
         let slot = 201; // just after the snapshot's slot (200)
         let epoch = slot / 432_000;
         let mut bank = snapshot::seed_bank_from_snapshot(SNAPSHOT, None).unwrap();
-        let replayer = Replayer::new(slot, epoch);
+        let mut replayer = Replayer::new(slot, epoch);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         let transfer = |from: &Pubkey, to: &Pubkey, lamports: u64| -> VersionedTransaction {
@@ -2763,7 +3009,7 @@ mod tests {
             }),
             base_slot,
         );
-        let replayer = Replayer::new(base_slot, base_slot / 432_000);
+        let mut replayer = Replayer::new(base_slot, base_slot / 432_000);
         register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
 
         // Block N: src -> mid; block N+1: mid -> dst, which only reconciles if block N's write to mid rolled forward.

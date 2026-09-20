@@ -6,10 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use slate_hash::LtHash;
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_hash::Hash;
 use solana_inflation::Inflation;
-use solana_lattice_hash::lt_hash::LtHash;
 use solana_pubkey::Pubkey;
 
 use crate::{ReplayBank, store::AccountStore};
@@ -531,12 +531,9 @@ fn parse_lt_hash_trailer(tail: &[u8]) -> Option<LtHash> {
     if tail.len() < LT_HASH_TRAILER || tail[tail.len() - LT_HASH_TRAILER] != 1 {
         return None;
     }
-    let bytes = &tail[tail.len() - 2048..];
-    let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(bytes.chunks_exact(2)) {
-        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-    Some(LtHash(lanes))
+    Some(LtHash::from_bytes(
+        tail[tail.len() - LtHash::NUM_BYTES..].try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]

@@ -1,0 +1,5 @@
+# The compiler that built this era's proof. Per worker, not repo-wide: a later era may
+# need a newer Rust than an older era still builds on.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

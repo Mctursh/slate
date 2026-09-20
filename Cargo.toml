@@ -5,7 +5,13 @@ edition = "2024"
 
 [workspace]
 resolver = "3"
-members = [ "slate-rpc", "slate-ingest", "slate-common", "slate-store" , "slate-replay", "slate-backfill"]
+# The shared layer (slate-hash, slate-format, slate-store, slate-common) and the live
+# pipeline (slate-ingest, slate-rpc), which tracks whatever agave mainnet runs now.
+members = [ "slate-rpc", "slate-ingest", "slate-common", "slate-store" , "slate-hash", "slate-format"]
+# Each era's replay worker is its own workspace with its own lockfile and toolchain, so
+# a release here can never re-resolve a frozen era's dependency graph. See
+# workers/era-807/Cargo.toml.
+exclude = ["workers"]
 
 [workspace.dependencies]
 clickhouse = { version = "0.14", features = ["inserter"] }

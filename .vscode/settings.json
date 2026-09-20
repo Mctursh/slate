@@ -1,0 +1,8 @@
+{
+  // Each era worker is its own Cargo workspace, excluded from the root one, so
+  // rust-analyzer has to be told about them or it ignores that subtree entirely.
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "workers/agave-3.1.14/Cargo.toml"
+  ]
+}

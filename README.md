@@ -16,7 +16,9 @@ v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale.
 
 Backfill has replayed a full snapshot-to-snapshot mainnet window, 50,079 slots, verified two independent ways: every slot's bank hash checked against the consensus hash carried in that block's own vote transactions, and the end state diffed byte-for-byte against the official snapshot at the end of the range, 8,412,739 accounts with zero mismatches.
 
-That run is epoch 808, the only range verified so far. Builtin registration and precompile verification key off the per-slot feature set the replay builds from the on-chain feature accounts, so a range elsewhere in history gets the programs that actually existed at those slots, as long as it stays inside one epoch (see [Roadmap](#roadmap)). Fidelity has a tail still being closed, so the replay records coverage up to the last verified slot and never guesses.
+Epoch boundaries are replayed too. The 807 → 808 crossing reproduces mainnet's bank hash at the boundary slot, with the inflation pool, the vote commission, and all 228 stake-reward partitions matching to the lamport, and the `EpochRewards` sysvar tracking agave's own values through to the slot it deactivates on.
+
+Builtin registration and precompile verification key off the feature set the replay builds from the on-chain feature accounts, so a range elsewhere in history gets the programs that actually existed at those slots. Two limits are worth knowing: the SVM's program-runtime environment is still built once from a range's first slot, and four epochs in the 807–978 range rewrite accounts at the boundary in ways not yet implemented (see [Roadmap](#roadmap) and [workers/README.md](workers/README.md)). Fidelity has a tail still being closed, so the replay records coverage up to the last verified slot and never guesses.
 
 ## How it works
 
@@ -133,7 +135,11 @@ Backfill writes to the same ClickHouse as live capture. Have it running with the
 
 **Run it.**
 
+The backfill CLI lives in its era's worker, so run it from there (see
+[workers/README.md](workers/README.md) for which era covers which epochs):
+
 ```sh
+cd workers/agave-3.1.14
 cargo run -p slate-backfill --release -- \
   snapshot-<from>.tar.zst \
   --from <start_slot> --to <end_slot> \
@@ -150,6 +156,7 @@ cargo run -p slate-backfill --release -- \
 **Long runs.** A run checkpoints its accounts and bank-hash roll state together every `--chunk-slots` (default 2000). If it stops, for any reason, `--resume` continues from the last checkpoint instead of re-seeding from the snapshot:
 
 ```sh
+cd workers/agave-3.1.14
 cargo run -p slate-backfill --release -- --resume \
   --from <start_slot> --to <end_slot> \
   --program <pubkey> \
@@ -199,11 +206,20 @@ REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate --
 | Crate | Purpose |
 | --- | --- |
 | `slate-ingest` | Live capture, baseline bootstrap, and the validation harness. |
-| `slate-replay` | SVM replay engine: seed from a snapshot, replay blocks, self-verify each slot's bank hash. |
-| `slate-backfill` | Backfill CLI: drives the replay over a slot range and persists the history. |
 | `slate-store` | ClickHouse access: as-of reads, coverage, fidelity. |
 | `slate-rpc` | JSON-RPC server. |
 | `slate-common` | Config. |
+| `slate-hash` | Lattice hash and bank hash. Byte API, no solana deps, shared by every era. |
+| `slate-format` | On-disk byte layouts: account record and resume checkpoint, both versioned. |
+
+Historical replay lives under `workers/`, one **era** per agave version, each its own Cargo
+workspace with its own lockfile and toolchain so that adding an era can't disturb an
+existing one's proof. See [workers/README.md](workers/README.md).
+
+| Crate (per worker) | Purpose |
+| --- | --- |
+| `slate-replay` | SVM replay engine: seed from a snapshot, replay blocks, self-verify each slot's bank hash. |
+| `slate-backfill` | Backfill CLI: drives the replay over a slot range and persists the history. |
 
 DDL for the ClickHouse tables is in `slate-common/ddl/`.
 
@@ -221,16 +237,18 @@ for f in slate-common/ddl/*.sql; do
 done
 ```
 
-Then run the tests serially, since they share that database:
+Then run the tests serially, since they share that database. Each era worker is a separate
+workspace, so it gets its own run:
 
 ```sh
 cargo test --workspace -- --test-threads=1
+(cd workers/agave-3.1.14 && cargo test --workspace -- --test-threads=1)
 ```
 
 ## Roadmap
 
 - **Backfill fidelity.** Close the remaining tail of historical transactions the replay can't yet reproduce, a class at a time.
-- **Multi-epoch backfill.** Span successive snapshot windows to reconstruct a whole epoch and beyond. A range has to stay inside one epoch for now: the feature set is built once from the range's first slot, and features activate on epoch boundaries, so a range that crosses one would replay its tail against the previous epoch's set.
+- **Multi-epoch backfill.** Crossing an epoch boundary works and is verified at 807 → 808: pending features activate, inflation rewards are calculated and paid out over their partitions, and the bank's feature set is rebuilt at the crossing. Two things remain before long multi-epoch ranges. The SVM's program-runtime environment (syscall set, compute-budget parser) is still built once from the range's first slot, so it doesn't follow a feature that activates mid-range. And four epochs in 807–978 rewrite accounts at the boundary and aren't implemented yet: 823 (Stake to core BPF), 943 (Rent sysvar), 949 (vote state v4), 971 (SPL Token to p-token).
 - **Gap repair.** Heal recorded coverage holes from incremental snapshots while they're still in retention.
 - **Durable source.** Ingest from a replayable stream (Triton's Fumarole, Helius's LaserStream, and the like), so a reconnect rewinds and most gaps heal on their own.
 - **asOfTime.** Query by timestamp, not just slot.
