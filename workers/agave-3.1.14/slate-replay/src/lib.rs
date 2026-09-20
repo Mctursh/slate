@@ -560,28 +560,29 @@ impl ReplayBank {
         self.rent().minimum_balance(data_len)
     }
 
-    pub fn set_sysvar_at(&mut self, id: Pubkey, data: Vec<u8>, slot: u64) {
-        let lamports = self.minimum_balance(data.len());
-        let account = AccountSharedData::from(Account {
+    // agave floors this balance and inherits rent_epoch; assigning would drain an over-funded sysvar.
+    fn sysvar_account(&self, id: &Pubkey, data: Vec<u8>) -> AccountSharedData {
+        let min = self.minimum_balance(data.len());
+        let (lamports, rent_epoch) = match self.store.get(id) {
+            Some((old, _)) => (min.max(old.lamports()), old.rent_epoch()),
+            None => (min, 0),
+        };
+        AccountSharedData::from(Account {
             lamports,
             data,
             owner: solana_sdk_ids::sysvar::id(),
             executable: false,
-            rent_epoch: 0,
-        });
+            rent_epoch,
+        })
+    }
+
+    pub fn set_sysvar_at(&mut self, id: Pubkey, data: Vec<u8>, slot: u64) {
+        let account = self.sysvar_account(&id, data);
         self.insert(id, account, slot);
     }
 
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
-        // Sysvar accounts are rent-exempt for their exact size; a wrong balance would fail the oracle's balance check and halt the replay.
-        let lamports = self.minimum_balance(data.len());
-        let account = AccountSharedData::from(Account {
-            lamports,
-            data,
-            owner: solana_sdk_ids::sysvar::id(),
-            executable: false,
-            rent_epoch: 0,
-        });
+        let account = self.sysvar_account(&id, data);
         self.insert(id, account, 0);
     }
 }
@@ -3282,5 +3283,55 @@ mod tests {
                 "{id} has no feature gate, deactivating an unrelated feature must not disable it"
             );
         }
+    }
+
+    #[test]
+    fn rewriting_an_over_funded_sysvar_keeps_its_balance_and_rent_epoch() {
+        use solana_account::ReadableAccount;
+        let mut bank = ReplayBank::default();
+        let id = Clock::id();
+        let data = bincode::serialize(&Clock::default()).unwrap();
+        let min = bank.minimum_balance(data.len());
+
+        bank.insert(
+            id,
+            AccountSharedData::from(Account {
+                lamports: min + 12_345,
+                data: data.clone(),
+                owner: solana_sdk_ids::sysvar::id(),
+                executable: false,
+                rent_epoch: 777,
+            }),
+            5,
+        );
+        bank.set_sysvar_at(id, data.clone(), 6);
+
+        let (got, _) = bank.get_account_shared_data(&id).unwrap();
+        assert_eq!(got.lamports(), min + 12_345);
+        assert_eq!(got.rent_epoch(), 777);
+    }
+
+    #[test]
+    fn a_sysvar_below_the_minimum_is_raised_to_it() {
+        use solana_account::ReadableAccount;
+        let mut bank = ReplayBank::default();
+        let id = Clock::id();
+        let data = bincode::serialize(&Clock::default()).unwrap();
+        let min = bank.minimum_balance(data.len());
+
+        bank.insert(
+            id,
+            AccountSharedData::from(Account {
+                lamports: 1,
+                data: data.clone(),
+                owner: solana_sdk_ids::sysvar::id(),
+                executable: false,
+                rent_epoch: 0,
+            }),
+            5,
+        );
+        bank.set_sysvar_at(id, data.clone(), 6);
+
+        assert_eq!(bank.get_account_shared_data(&id).unwrap().0.lamports(), min);
     }
 }
