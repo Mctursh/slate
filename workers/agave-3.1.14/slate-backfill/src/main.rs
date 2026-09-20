@@ -107,11 +107,13 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&args.config)?;
     check_clickhouse(&cfg.clickhouse.url)?;
 
-    // A fresh run reads its seed and roll bootstrap from the snapshot; --resume takes the roll state from the store's checkpoint, so no snapshot.
-    // A resume does not seed, but the manifest still carries the epoch-reward inputs, so read it
-    // when a path is given.
     let snapshot_path = if args.resume {
-        args.snapshot.as_ref()
+        // Resume still seeds: the footprint top-up reads it, and without it slots under-seed.
+        Some(
+            args.snapshot
+                .as_ref()
+                .context("<snapshot> is required for --resume")?,
+        )
     } else {
         let path = args
             .snapshot
@@ -122,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     };
     if args.resume {
         println!(
-            "preflight ok: RPC, program, config, and ClickHouse check out (resume: no snapshot)"
+            "preflight ok: RPC, program, config, and ClickHouse check out (resume)"
         );
     } else {
         println!("preflight ok: RPC, program, config, ClickHouse, and snapshot all check out");

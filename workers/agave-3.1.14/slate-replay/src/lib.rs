@@ -134,6 +134,11 @@ pub struct WriteRecord {
 }
 
 impl ReplayBank {
+    // Unlike get_account_shared_data, counts zero-lamport tombstones.
+    pub fn contains(&self, key: &Pubkey) -> bool {
+        self.store.contains(key)
+    }
+
     pub fn with_store(store: Box<dyn AccountStore>) -> Self {
         Self {
             store,
@@ -319,6 +324,26 @@ impl ReplayBank {
         self.bankhash_roller
             .as_mut()
             .map(|r| r.roll_slot(changes, signature_count, blockhash))
+    }
+
+    // Mid-slot value: freeze folds the slot's deltas in later, but rewards read it before that.
+    pub fn capitalization_now(&self) -> u64 {
+        use solana_account::ReadableAccount;
+        let Some(dirty) = self.slot_dirty.as_ref() else {
+            return self.capitalization;
+        };
+        let delta: i128 = dirty
+            .iter()
+            .filter_map(|(key, old)| {
+                let (new, _) = self.store.get(key)?;
+                Some(
+                    i128::from(new.lamports())
+                        - old.as_ref().map_or(0, |a| i128::from(a.lamports())),
+                )
+            })
+            .sum();
+        u64::try_from(i128::from(self.capitalization) + delta)
+            .expect("capitalization stays within u64")
     }
 
     pub fn set_capitalization(&mut self, capitalization: u64) {
@@ -522,28 +547,42 @@ impl ReplayBank {
         );
     }
 
-    pub fn set_sysvar_at(&mut self, id: Pubkey, data: Vec<u8>, slot: u64) {
-        let lamports = Rent::default().minimum_balance(data.len());
-        let account = AccountSharedData::from(Account {
+    // The on-chain Rent, not Rent::default(): mainnet's differs from the default from epoch 943
+    // (deprecate_rent_exemption_threshold), and again at 1028/1033, so a default-derived balance
+    // would be lamports mainnet never wrote.
+    pub fn rent(&self) -> Rent {
+        self.get_account_shared_data(&Rent::id())
+            .and_then(|(account, _)| bincode::deserialize::<Rent>(account.data()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn minimum_balance(&self, data_len: usize) -> u64 {
+        self.rent().minimum_balance(data_len)
+    }
+
+    // agave floors this balance and inherits rent_epoch; assigning would drain an over-funded sysvar.
+    fn sysvar_account(&self, id: &Pubkey, data: Vec<u8>) -> AccountSharedData {
+        let min = self.minimum_balance(data.len());
+        let (lamports, rent_epoch) = match self.store.get(id) {
+            Some((old, _)) => (min.max(old.lamports()), old.rent_epoch()),
+            None => (min, 0),
+        };
+        AccountSharedData::from(Account {
             lamports,
             data,
             owner: solana_sdk_ids::sysvar::id(),
             executable: false,
-            rent_epoch: 0,
-        });
+            rent_epoch,
+        })
+    }
+
+    pub fn set_sysvar_at(&mut self, id: Pubkey, data: Vec<u8>, slot: u64) {
+        let account = self.sysvar_account(&id, data);
         self.insert(id, account, slot);
     }
 
     fn set_sysvar_account(&mut self, id: Pubkey, data: Vec<u8>) {
-        // Sysvar accounts are rent-exempt for their exact size; a wrong balance would fail the oracle's balance check and halt the replay.
-        let lamports = Rent::default().minimum_balance(data.len());
-        let account = AccountSharedData::from(Account {
-            lamports,
-            data,
-            owner: solana_sdk_ids::sysvar::id(),
-            executable: false,
-            rent_epoch: 0,
-        });
+        let account = self.sysvar_account(&id, data);
         self.insert(id, account, 0);
     }
 }
@@ -742,7 +781,12 @@ impl Replayer {
     }
 
     // Per-batch runtime settings; epoch_total_stake defaults to 0, fine for anything that doesn't touch stake.
-    pub fn environment(&self, blockhash: Hash, epoch: u64) -> TransactionProcessingEnvironment {
+    pub fn environment(
+        &self,
+        blockhash: Hash,
+        epoch: u64,
+        rent: Rent,
+    ) -> TransactionProcessingEnvironment {
         TransactionProcessingEnvironment {
             blockhash,
             // non-zero so fees aren't disabled; the exact fee comes from the per-tx check results.
@@ -754,7 +798,7 @@ impl Replayer {
             program_runtime_environments_for_deployment: self
                 .processor
                 .get_environments_for_epoch(epoch),
-            rent: Rent::default(),
+            rent,
             ..Default::default()
         }
     }
@@ -807,7 +851,7 @@ impl Replayer {
         blockhash: Hash,
     ) -> TransactionProcessingResult {
         // Environment blockhash is the block's, not the tx's recent_blockhash, a durable nonce advances from the block's previousBlockhash; non-nonce txs don't observe it.
-        let env = self.environment(blockhash, epoch);
+        let env = self.environment(blockhash, epoch, bank.rent());
         // Parse the tx's own compute-budget instructions for its real CU limit (not a default), so it exhausts/fails exactly as on chain.
         let check_result = match process_compute_budget_instructions(
             SVMMessage::program_instructions_iter(tx),
@@ -874,6 +918,44 @@ impl Replayer {
         block: &Block,
         epoch: u64,
     ) -> BlockReplay {
+        if let Ok(t) = std::env::var("SLATE_DUMP_FOOTPRINT")
+            && t == block.slot.to_string()
+            && let Ok(out) = std::env::var("SLATE_FOOTPRINT_OUT")
+        {
+            use solana_account::ReadableAccount;
+            use std::io::Write as _;
+            let mut set: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+            crate::block::extend_footprint(&mut set, std::slice::from_ref(block));
+            crate::block::footprint_fixed(&mut set);
+            // agave builds EpochStakes from the stakes cache, so rewards need these seeded.
+            if std::env::var("SLATE_FOOTPRINT_STAKES").is_ok() {
+                for (stake_pk, d) in bank.stake_delegations() {
+                    set.insert(stake_pk);
+                    set.insert(d.voter_pubkey);
+                }
+            }
+            set.extend(crate::block::programdata_addresses(&set));
+            set.insert(solana_sdk_ids::sysvar::slot_hashes::id());
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&out).expect("footprint out"));
+            let mut n = 0usize;
+            for pk in &set {
+                if let Some((a, _)) = bank.get_account_shared_data(pk) {
+                    let hex: String = a.data().iter().map(|b| format!("{b:02x}")).collect();
+                    writeln!(
+                        f,
+                        "{pk} lam={} own={} exec={} dlen={} data={hex}",
+                        a.lamports(),
+                        a.owner(),
+                        a.executable() as u8,
+                        a.data().len()
+                    )
+                    .unwrap();
+                    n += 1;
+                }
+            }
+            f.flush().unwrap();
+            eprintln!("FOOTPRINT slot {} wrote {n} of {} keys -> {out}", block.slot, set.len());
+        }
         // With the roll active, record slot writes and prepend the parent's bank hash into SlotHashes (like the runtime) so votes read real recent history.
         let rolling = bank.parent_bank_hash().is_some();
         if rolling {
@@ -882,6 +964,20 @@ impl Replayer {
         // First BLOCK of the epoch, not the boundary slot, which can be skipped.
         if epoch_of(block.slot) != epoch_of(block.parent_slot) {
             if let Some(inputs) = bank.reward_inputs.clone() {
+                // agave order: activate, then apply_builtin_program_feature_transitions, then
+                // rewards. The migration burns and funds accounts, so it moves capitalization,
+                // and validator_rewards is computed from capitalization. Running it after the
+                // reward pass leaves every reward a hair low (epoch 823: 284 lamports).
+                let activated_features = activate_pending_features(bank, block.slot);
+                // Gate on the NEWLY activated set, not the feature set.
+                compat::apply_core_bpf_migrations(
+                    bank,
+                    processor,
+                    &self.processor,
+                    &activated_features,
+                    epoch,
+                    block.slot,
+                );
                 let outcome = rewards::process_epoch_boundary(
                     bank,
                     &inputs,
@@ -889,6 +985,7 @@ impl Replayer {
                     block.slot,
                     block.previous_blockhash,
                     block.block_height,
+                    activated_features,
                 );
                 bank.pending_partitions = outcome.partitions;
             }
@@ -1202,6 +1299,44 @@ mod tests {
         assert_eq!(crossed.epoch, 808);
         assert_eq!(crossed.leader_schedule_epoch, 809);
         assert_eq!(crossed.epoch_start_timestamp, 2_000);
+    }
+
+    // The epoch-823 bug: a core-BPF migration burns and funds mid-slot, and validator_rewards is
+    // computed from capitalization before the slot freezes. Reading the frozen value there left
+    // every reward a hair low and broke the boundary bank hash.
+    #[test]
+    fn capitalization_now_includes_writes_made_in_the_open_slot() {
+        let account = |lamports| {
+            AccountSharedData::from(Account {
+                lamports,
+                ..Account::default()
+            })
+        };
+        let mut bank = ReplayBank::default();
+        let (burned, funded) = (Pubkey::new_unique(), Pubkey::new_unique());
+        bank.insert(burned, account(700), 0);
+        bank.set_capitalization(1_700);
+
+        // Mid-slot: 700 burned, 900 funded, a net +200 agave would already have applied.
+        bank.begin_slot();
+        bank.insert(burned, account(0), 1);
+        bank.insert(funded, account(900), 1);
+        assert_eq!(
+            bank.capitalization(),
+            1_700,
+            "the frozen value does not move until the slot ends"
+        );
+        assert_eq!(
+            bank.capitalization_now(),
+            1_900,
+            "but a mid-slot reader must see the burn and the funding"
+        );
+
+        // And folding the slot in at freeze must not double-count them.
+        let changes = bank.take_slot_changes();
+        bank.finalize_slot_bankhash(&changes, 0, &Hash::default());
+        assert_eq!(bank.capitalization(), 1_900);
+        assert_eq!(bank.capitalization_now(), 1_900);
     }
 
     #[test]
@@ -1861,10 +1996,40 @@ mod tests {
         replayer.processor.fill_missing_sysvar_cache_entries(&bank);
     }
 
+    // Rent::default() is 3480 / 2.0. Mainnet diverges from epoch 943
+    // (deprecate_rent_exemption_threshold) and again at 1028/1033, so anything computing a
+    // rent-exempt minimum has to read the bank's sysvar or it writes balances mainnet never had.
+    #[test]
+    // Builds mainnet's post-943 Rent by field; Rent::new_with_lamports_per_byte, which the
+    // deprecation points at, only exists from solana-rent 4.x and this worker pins 3.1.0.
+    #[allow(deprecated)]
+    fn rent_comes_from_the_sysvar_not_the_default() {
+        let mut bank = ReplayBank::default();
+        assert_eq!(
+            bank.rent(),
+            Rent::default(),
+            "absent sysvar falls back to default"
+        );
+
+        let post_943 = Rent {
+            lamports_per_byte_year: 5080,
+            exemption_threshold: 1.0,
+            burn_percent: 50,
+        };
+        bank.set_sysvar_account(Rent::id(), bincode::serialize(&post_943).unwrap());
+
+        assert_eq!(bank.rent(), post_943);
+        assert_ne!(
+            bank.minimum_balance(165),
+            Rent::default().minimum_balance(165),
+            "a post-943 rent must not produce default-derived balances"
+        );
+    }
+
     #[test]
     fn builds_environment() {
         let replayer = Replayer::new(fixture::SLOT, fixture::SLOT / 432_000);
-        let env = replayer.environment(Hash::default(), fixture::SLOT / 432_000);
+        let env = replayer.environment(Hash::default(), fixture::SLOT / 432_000, Rent::default());
         assert_eq!(env.blockhash_lamports_per_signature, 5_000);
         assert_eq!(env.epoch_total_stake, 0);
     }
@@ -3118,5 +3283,55 @@ mod tests {
                 "{id} has no feature gate, deactivating an unrelated feature must not disable it"
             );
         }
+    }
+
+    #[test]
+    fn rewriting_an_over_funded_sysvar_keeps_its_balance_and_rent_epoch() {
+        use solana_account::ReadableAccount;
+        let mut bank = ReplayBank::default();
+        let id = Clock::id();
+        let data = bincode::serialize(&Clock::default()).unwrap();
+        let min = bank.minimum_balance(data.len());
+
+        bank.insert(
+            id,
+            AccountSharedData::from(Account {
+                lamports: min + 12_345,
+                data: data.clone(),
+                owner: solana_sdk_ids::sysvar::id(),
+                executable: false,
+                rent_epoch: 777,
+            }),
+            5,
+        );
+        bank.set_sysvar_at(id, data.clone(), 6);
+
+        let (got, _) = bank.get_account_shared_data(&id).unwrap();
+        assert_eq!(got.lamports(), min + 12_345);
+        assert_eq!(got.rent_epoch(), 777);
+    }
+
+    #[test]
+    fn a_sysvar_below_the_minimum_is_raised_to_it() {
+        use solana_account::ReadableAccount;
+        let mut bank = ReplayBank::default();
+        let id = Clock::id();
+        let data = bincode::serialize(&Clock::default()).unwrap();
+        let min = bank.minimum_balance(data.len());
+
+        bank.insert(
+            id,
+            AccountSharedData::from(Account {
+                lamports: 1,
+                data: data.clone(),
+                owner: solana_sdk_ids::sysvar::id(),
+                executable: false,
+                rent_epoch: 0,
+            }),
+            5,
+        );
+        bank.set_sysvar_at(id, data.clone(), 6);
+
+        assert_eq!(bank.get_account_shared_data(&id).unwrap().0.lamports(), min);
     }
 }

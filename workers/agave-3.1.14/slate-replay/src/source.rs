@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,6 +37,8 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 pub struct CachingBlockSource {
     inner: Arc<dyn BlockSource>,
     db: Database,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl CachingBlockSource {
@@ -45,7 +47,12 @@ impl CachingBlockSource {
         let txn = db.begin_write()?;
         txn.open_table(BLOCKS)?;
         txn.commit()?;
-        Ok(Self { inner, db })
+        Ok(Self {
+            inner,
+            db,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        })
     }
 }
 
@@ -168,10 +175,18 @@ impl BlockSource for CachingBlockSource {
             }
         }
 
+        self.hits.fetch_add(hits.len() as u64, Ordering::Relaxed);
+        self.misses
+            .fetch_add(misses.len() as u64, Ordering::Relaxed);
+
         let fresh = self.inner.fetch(&misses)?;
         if !fresh.is_empty() {
             let mut txn = self.db.begin_write()?;
-            txn.set_durability(Durability::None);
+            // Immediate, not None: redb rolls back to the last DURABLE commit on reopen, so a
+            // cache that only ever commits with None is empty in every later process and its
+            // pages are never freed (the file grew to 98 GB holding nothing). That cost two
+            // full 50k-block refetches before it was spotted.
+            txn.set_durability(Durability::Immediate);
             {
                 let mut table = txn.open_table(BLOCKS)?;
                 for b in &fresh {
@@ -185,6 +200,16 @@ impl BlockSource for CachingBlockSource {
             hits.insert(b.slot, b);
         }
 
+        let (h, m) = (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        );
+        if (h + m).is_multiple_of(10_000) && h + m > 0 {
+            eprintln!(
+                "block cache: {h} hits, {m} misses ({:.0}% hit)",
+                100.0 * h as f64 / (h + m) as f64
+            );
+        }
         Ok(slots.iter().filter_map(|s| hits.remove(s)).collect())
     }
 }
@@ -219,4 +244,63 @@ impl BlockSource for VecBlockSource {
             .filter_map(|s| self.blocks.iter().find(|b| b.slot == *s).cloned())
             .collect())
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    // redb rolls back to the last DURABLE commit on reopen. The cache committed only with
+    // Durability::None and never higher, so every process after the first saw an empty table
+    // and refetched the whole range, while the file grew unboundedly holding nothing.
+    #[test]
+    fn the_cache_survives_a_reopen() {
+        let path = std::env::temp_dir().join("slate_cache_durability.redb");
+        let _ = std::fs::remove_file(&path);
+
+        struct Never;
+        impl BlockSource for Never {
+            fn confirmed_slots(&self, _: u64, _: u64) -> Result<Vec<u64>> {
+                Ok(vec![])
+            }
+            fn fetch(&self, slots: &[u64]) -> Result<Vec<Block>> {
+                assert!(slots.is_empty(), "a warm cache must not refetch {slots:?}");
+                Ok(vec![])
+            }
+        }
+
+        let block = Block {
+            slot: 42,
+            parent_slot: 41,
+            blockhash: Default::default(),
+            block_height: 7,
+            previous_blockhash: Default::default(),
+            block_time: 1_700_000_000,
+            transactions: vec![],
+            fee_reward: None,
+        };
+
+        {
+            struct One(Block);
+            impl BlockSource for One {
+                fn confirmed_slots(&self, _: u64, _: u64) -> Result<Vec<u64>> {
+                    Ok(vec![42])
+                }
+                fn fetch(&self, _: &[u64]) -> Result<Vec<Block>> {
+                    Ok(vec![self.0.clone()])
+                }
+            }
+            let c = CachingBlockSource::new(Arc::new(One(block.clone())), path.clone()).unwrap();
+            assert_eq!(c.fetch(&[42]).unwrap().len(), 1);
+        } // dropped: releases redb's lock so the reopen below can happen
+
+        let warm = CachingBlockSource::new(Arc::new(Never), path.clone()).unwrap();
+        assert_eq!(
+            warm.fetch(&[42]).unwrap().len(),
+            1,
+            "the block must come back from the cache after a reopen"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+    use super::*;
 }

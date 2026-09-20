@@ -145,9 +145,7 @@ pub fn calculate_epoch_rewards(
     let delegations = bank.stake_delegations();
     let stake_history = stake_history_of(bank).unwrap_or_default();
 
-    // agave tries its cached vote accounts first, then falls back to an accounts-db lookup, so a
-    // voter missing from the cache still counts. Gating on the cache alone drops those delegations
-    // from the points sum and scales every reward up.
+    // The manifest's vote set is NOT agave's epoch stakes; gating on it drops rewarded delegations.
     let _ = vote_cache;
     let vote_state_for = |voter: &Pubkey| -> Option<VoteStateV3> {
         let (account, _) = bank.get_account_shared_data(voter)?;
@@ -652,8 +650,10 @@ pub struct BoundaryOutcome {
     pub partitions: Vec<Vec<StakeReward>>,
 }
 
-// agave process_new_epoch. The order is consensus-critical: activations first (later steps read the
-// feature set), then the stake-history entry, then rewards, which read that entry back.
+// agave process_new_epoch. The order is consensus-critical and the caller owns the first two
+// steps: feature activation, then any core-BPF migration the activation triggers (it moves
+// capitalization, which validator_rewards below is computed from), then the stake-history entry,
+// then rewards, which read that entry back.
 pub fn process_epoch_boundary(
     bank: &mut ReplayBank,
     inputs: &RewardInputs,
@@ -661,6 +661,7 @@ pub fn process_epoch_boundary(
     slot: u64,
     parent_blockhash: Hash,
     block_height: u64,
+    activated_features: Vec<Pubkey>,
 ) -> BoundaryOutcome {
     let RewardInputs {
         feature_set,
@@ -669,19 +670,22 @@ pub fn process_epoch_boundary(
         slots_per_year,
         vote_accounts: _,
     } = inputs;
-    // NOT implemented: agave also runs apply_builtin_program_feature_transitions here, which can
-    // add a builtin or migrate one to core BPF. Verified a no-op at 807->808 (no builtin-gating
-    // feature activates at 349_056_000); a boundary where one does would need it.
-    let activated_features = crate::activate_pending_features(bank, slot);
-
     let prev_epoch = epoch.saturating_sub(1);
     roll_stake_history(bank, feature_set, prev_epoch, slot);
 
     // The bank's running value: the manifest's is stale by the fees burned since the seed slot.
+    if std::env::var("SLATE_DUMP_REWARD_INPUTS").is_ok() {
+        eprintln!(
+            "REWARDINPUTS slots_per_year={} inflation={:?} capitalization_now={}",
+            slots_per_year,
+            inflation,
+            bank.capitalization_now()
+        );
+    }
     let inflation_rewards = previous_epoch_inflation_rewards(
         feature_set,
         inflation,
-        bank.capitalization(),
+        bank.capitalization_now(),
         epoch,
         *slots_per_year,
     );
@@ -694,6 +698,22 @@ pub fn process_epoch_boundary(
         prev_epoch,
         new_rate_epoch,
     );
+
+    if let Ok(path) = std::env::var("SLATE_DUMP_REWARDS") {
+        use std::io::Write;
+        if let Ok(f) = std::fs::File::create(&path) {
+            let mut f = std::io::BufWriter::new(f);
+            for r in &calculated.stake_rewards {
+                let _ = writeln!(
+                    f,
+                    "{} reward={} stake={} credits={}",
+                    r.stake_pubkey, r.lamports, r.stake.delegation.stake, r.stake.credits_observed
+                );
+            }
+            let _ = f.flush();
+            eprintln!("wrote {} stake rewards to {path}", calculated.stake_rewards.len());
+        }
+    }
 
     let commission_paid = credit_vote_commission(bank, &calculated.vote_commission, slot);
     let paid_delegations = calculated.stake_rewards.len();
@@ -894,8 +914,9 @@ mod boundary_tests {
         let fs = FeatureSet::all_enabled();
 
         let i = inputs(fs, 603_724_512_541_705_391, &mut bank);
+        let activated = crate::activate_pending_features(&mut bank, 349_056_000);
         let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000);
+            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
 
         assert_eq!(out.paid_delegations, 1);
         assert_eq!(out.num_partitions, 1);
@@ -934,7 +955,8 @@ mod boundary_tests {
         assert!(stake_history_of(&bank).is_none());
 
         let i = inputs(FeatureSet::all_enabled(), 600_000_000_000, &mut bank);
-        process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000);
+        let activated = crate::activate_pending_features(&mut bank, 349_056_000);
+        process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
 
         let history = stake_history_of(&bank).expect("entry written");
         assert!(
@@ -951,8 +973,9 @@ mod boundary_tests {
             603_724_512_541_705_391,
             &mut bank,
         );
+        let activated = crate::activate_pending_features(&mut bank, 349_056_000);
         let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000);
+            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
 
         let start = epoch_rewards_of(&bank).distribution_starting_block_height;
         let index = partition_for_block(start, start, out.num_partitions).unwrap();

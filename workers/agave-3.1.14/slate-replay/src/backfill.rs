@@ -92,6 +92,33 @@ pub async fn backfill(
             .context("--resume: reading the store's checkpoint")?
             .context("--resume: the store has no checkpoint to resume from")?;
         eprintln!("resuming after checkpoint at slot {}", restored.slot);
+
+        // Extending --to must seed the new slots' accounts; a missing one reads as absent.
+        let pending: Vec<u64> = slots.iter().copied().filter(|s| *s > restored.slot).collect();
+        if !pending.is_empty() {
+            let mut fp = HashSet::new();
+            for chunk in pending.chunks(chunk_slots) {
+                let blocks = fetch_chunk(&source, chunk).await?;
+                block::extend_footprint(&mut fp, &blocks);
+            }
+            block::footprint_fixed(&mut fp);
+            let programdata = block::programdata_addresses(&fp);
+            fp.extend(programdata);
+            fp.insert(solana_sdk_ids::sysvar::slot_hashes::id());
+            let missing: HashSet<Pubkey> = fp.into_iter().filter(|k| !bank.contains(k)).collect();
+            if !missing.is_empty() {
+                // No owner filter: it would clobber replay-written values with snapshot state.
+                let accounts = snapshot::load_accounts(snapshot, Some(&missing), None)?;
+                eprintln!(
+                    "resume: {} accounts outside the seeded range, {} seeded from the snapshot",
+                    missing.len(),
+                    accounts.len()
+                );
+                for (pubkey, (account, slot)) in &accounts {
+                    bank.insert(*pubkey, account.clone(), *slot);
+                }
+            }
+        }
         (bank, Vec::new(), restored.slot, Some(restored))
     } else {
         let (mut bank, baseline) = match account_store {

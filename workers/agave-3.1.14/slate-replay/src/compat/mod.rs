@@ -2,6 +2,7 @@
 // binary replays pre-migration slots too. Gated per program on the migration feature
 // that removed it. Add another via a sibling module plus a REMOVED_BUILTINS row.
 
+pub mod core_bpf;
 mod stake;
 
 use agave_feature_set::FeatureSet;
@@ -28,6 +29,30 @@ const REMOVED_BUILTINS: &[RemovedBuiltin] = &[RemovedBuiltin {
     entrypoint: stake::Entrypoint::vm,
     removed_by: agave_feature_set::migrate_stake_program_to_core_bpf::id(),
 }];
+
+// Run any core-BPF migration whose feature activated at this crossing. Keyed on the newly
+// activated set, so it fires exactly once, in the block the feature turns on.
+pub fn apply_core_bpf_migrations(
+    bank: &mut ReplayBank,
+    processor: &TransactionBatchProcessor<SlateForkGraph>,
+    parent: &TransactionBatchProcessor<SlateForkGraph>,
+    activated: &[Pubkey],
+    epoch: u64,
+    slot: u64,
+) {
+    if !activated.contains(&agave_feature_set::migrate_stake_program_to_core_bpf::id()) {
+        return;
+    }
+    match core_bpf::migrate_stake_to_core_bpf(bank, processor, parent, epoch, slot) {
+        Ok(m) => eprintln!(
+            "epoch {epoch}: {} migrated to core BPF, programdata {}, burned {} funded {}",
+            m.program_address, m.program_data_address, m.burned, m.funded
+        ),
+        // Halt rather than continue: a failed migration means every later stake transaction
+        // replays against the wrong program, and the bank hash diverges from here on.
+        Err(e) => panic!("epoch {epoch}: stake core-BPF migration failed: {e:?}"),
+    }
+}
 
 // No-op for any program whose migration is already active (agave's BPF account covers
 // it), which keeps one binary correct across every migration boundary.

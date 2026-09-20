@@ -243,6 +243,37 @@ pub fn fetch_block(rpc_url: &str, slot: u64) -> Result<Block> {
     fetch_block_with(&reqwest::blocking::Client::new(), rpc_url, slot)
 }
 
+const RPC_PROBE_RETRIES: usize = 10;
+
+fn rpc_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?)
+}
+
+// Old Faithful reads the CAR root for these, so they hit fetch_one's transient failures too.
+fn with_rpc_retry<T>(what: &str, f: impl FnMut() -> Result<T>) -> Result<T> {
+    with_rpc_retry_base(what, 500, f)
+}
+
+fn with_rpc_retry_base<T>(what: &str, base_ms: u64, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0usize;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt > RPC_PROBE_RETRIES {
+                    return Err(e.context(format!(
+                        "{what} failed after {RPC_PROBE_RETRIES} retries"
+                    )));
+                }
+                let backoff_ms = (base_ms << (attempt as u32 - 1).min(6)).min(20_000);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            }
+        }
+    }
+}
 // getBlocks lists only the slots that produced a block (the ~5% skipped would error on getBlock); caps at 500k slots, caller doesn't page yet.
 pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<u64>> {
     let request = serde_json::json!({
@@ -251,11 +282,9 @@ pub fn fetch_confirmed_slots(rpc_url: &str, start: u64, end: u64) -> Result<Vec<
         "method": "getBlocks",
         "params": [start, end],
     });
-    let resp: serde_json::Value = reqwest::blocking::Client::new()
-        .post(rpc_url)
-        .json(&request)
-        .send()?
-        .json()?;
+    let resp: serde_json::Value = with_rpc_retry("getBlocks", || {
+        Ok(rpc_client()?.post(rpc_url).json(&request).send()?.json()?)
+    })?;
     match resp.get("result") {
         // Old Faithful serves getBlock but not getBlocks (null result); fall back to the full range, the fetch path skips empties.
         None | Some(serde_json::Value::Null) => Ok((start..=end).collect()),
@@ -304,15 +333,13 @@ pub fn fetch_block_opt(
 
 // Current slot (getSlot); also serves as an RPC reachability probe.
 pub fn current_slot(rpc_url: &str) -> Result<u64> {
-    let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getSlot" });
-    let resp: serde_json::Value = reqwest::blocking::Client::new()
-        .post(rpc_url)
-        .json(&request)
-        .send()?
-        .json()?;
-    resp.get("result")
-        .and_then(|v| v.as_u64())
-        .with_context(|| format!("getSlot returned no slot: {resp}"))
+    with_rpc_retry("getSlot", || {
+        let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getSlot" });
+        let resp: serde_json::Value = rpc_client()?.post(rpc_url).json(&request).send()?.json()?;
+        resp.get("result")
+            .and_then(|v| v.as_u64())
+            .with_context(|| format!("getSlot returned no slot: {resp}"))
+    })
 }
 
 // Hands back the ALT addresses getBlock already resolved, so ALT accounts needn't be seeded; an inconsistent set is caught downstream by the oracle.
@@ -381,6 +408,13 @@ pub fn footprint_fixed(set: &mut HashSet<Pubkey>) {
     set.insert(solana_sdk_ids::sysvar::stake_history::id());
     set.insert(solana_sdk_ids::sysvar::epoch_rewards::id());
     set.insert(solana_sdk_ids::sysvar::last_restart_slot::id());
+    // Core-BPF migration buffers: read only at the activating boundary, never by a
+    // transaction, so nothing else would pull them into the seed set.
+    set.extend(
+        crate::compat::core_bpf::MIGRATION_SOURCE_BUFFERS
+            .iter()
+            .copied(),
+    );
 }
 
 // Full seed footprint in one shot (block keys ∪ the fixed set); for tests and non-streaming callers.
@@ -434,6 +468,18 @@ pub fn programdata_addresses(footprint: &HashSet<Pubkey>) -> HashSet<Pubkey> {
 
 #[cfg(test)]
 mod tests {
+
+    // The 823 run halted here: no transaction touches a migration buffer, and it is not
+    // stake/vote/program-owned, so the snapshot seeder dropped it and the migration found
+    // nothing to read.
+    #[test]
+    fn the_fixed_set_carries_the_core_bpf_migration_buffers() {
+        let mut set = HashSet::new();
+        footprint_fixed(&mut set);
+        for b in crate::compat::core_bpf::MIGRATION_SOURCE_BUFFERS {
+            assert!(set.contains(b), "migration buffer {b} must be seeded");
+        }
+    }
     use super::*;
 
     // A real mainnet getBlock (slot 437680849), trimmed to the first 3 txs.
@@ -752,5 +798,32 @@ mod tests {
             slots.contains(&437_680_849),
             "getBlocks should list the known block, got {slots:?}"
         );
+    }
+
+    #[test]
+    fn an_rpc_probe_retries_a_transient_failure_before_giving_up() {
+        let calls = std::cell::Cell::new(0usize);
+        let got = with_rpc_retry_base("probe", 0, || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                anyhow::bail!("transient");
+            }
+            Ok(42u64)
+        })
+        .unwrap();
+        assert_eq!(got, 42);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn an_rpc_probe_gives_up_after_the_retry_ceiling() {
+        let calls = std::cell::Cell::new(0usize);
+        let err = with_rpc_retry_base("probe", 0, || -> Result<u64> {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("always down")
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), RPC_PROBE_RETRIES + 1);
+        assert!(err.to_string().contains("after 10 retries"), "{err}");
     }
 }
