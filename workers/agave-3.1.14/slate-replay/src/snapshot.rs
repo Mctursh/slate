@@ -84,6 +84,17 @@ pub fn load_accounts<R: Read>(
     footprint: Option<&HashSet<Pubkey>>,
     keep_owned_by: Option<&Pubkey>,
 ) -> Result<HashMap<Pubkey, (AccountSharedData, u64)>> {
+    load_accounts_with_stakes(reader, footprint, keep_owned_by, None)
+}
+
+// `stake_keys` present = a crossing: keep every stake/vote account; an absent one is dropped silently.
+pub fn load_accounts_with_stakes<R: Read>(
+    reader: R,
+    footprint: Option<&HashSet<Pubkey>>,
+    keep_owned_by: Option<&Pubkey>,
+    stake_keys: Option<&mut HashSet<Pubkey>>,
+) -> Result<HashMap<Pubkey, (AccountSharedData, u64)>> {
+    let mut stake_keys = stake_keys;
     let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
     let mut archive = tar::Archive::new(decoder);
     let mut accounts: HashMap<Pubkey, (AccountSharedData, u64)> = HashMap::new();
@@ -97,8 +108,16 @@ pub fn load_accounts<R: Read>(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).context("read account file")?;
         for (pubkey, account) in parse_append_vec(&bytes) {
+            let crossing = stake_keys.is_some();
+            let is_stake = crossing && *account.owner() == solana_sdk_ids::stake::id();
+            let is_vote = crossing && *account.owner() == solana_sdk_ids::vote::id();
+            // A deletion record has a ZEROED owner, so an owner sweep would drop it and resurrect the account.
+            let is_tombstone = crossing && account.lamports() == 0;
             // Filter during parse to bound memory: keep footprint (seed) or program-owned (persist).
-            let keep = footprint.is_none_or(|f| f.contains(&pubkey))
+            let keep = is_stake
+                || is_vote
+                || is_tombstone
+                || footprint.is_none_or(|f| f.contains(&pubkey))
                 || keep_owned_by.is_some_and(|owner| account.owner() == owner);
             if !keep {
                 continue;
@@ -114,6 +133,13 @@ pub fn load_accounts<R: Read>(
 
     // Drop dead (zero-lamport) accounts: on-chain they're purged and read as the default, so seeding the stale AppendVec record would diverge from the chain.
     accounts.retain(|_, (account, _)| account.lamports() > 0);
+    if let Some(keys) = stake_keys.as_deref_mut() {
+        for (pubkey, (account, _)) in accounts.iter() {
+            if *account.owner() == solana_sdk_ids::stake::id() {
+                keys.insert(*pubkey);
+            }
+        }
+    }
     Ok(accounts)
 }
 

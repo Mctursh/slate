@@ -106,16 +106,32 @@ pub async fn backfill(
             fp.extend(programdata);
             fp.insert(solana_sdk_ids::sysvar::slot_hashes::id());
             let missing: HashSet<Pubkey> = fp.into_iter().filter(|k| !bank.contains(k)).collect();
-            if !missing.is_empty() {
+            if !missing.is_empty() || crosses_epoch {
+                // A resume into a crossing needs every stake/vote account: absent ones are dropped silently.
+                let mut collected = HashSet::new();
                 // No owner filter: it would clobber replay-written values with snapshot state.
-                let accounts = snapshot::load_accounts(snapshot, Some(&missing), None)?;
-                eprintln!(
-                    "resume: {} accounts outside the seeded range, {} seeded from the snapshot",
-                    missing.len(),
-                    accounts.len()
-                );
+                let accounts = snapshot::load_accounts_with_stakes(
+                    snapshot,
+                    Some(&missing),
+                    None,
+                    crosses_epoch.then_some(&mut collected),
+                )?;
                 for (pubkey, (account, slot)) in &accounts {
-                    bank.insert(*pubkey, account.clone(), *slot);
+                    if !bank.contains(pubkey) {
+                        bank.insert(*pubkey, account.clone(), *slot);
+                    }
+                }
+                eprintln!(
+                    "resume: {} accounts outside the seeded range seeded from the snapshot{}",
+                    missing.len(),
+                    if crosses_epoch {
+                        format!(", plus {} stake accounts for the crossing", collected.len())
+                    } else {
+                        String::new()
+                    }
+                );
+                if crosses_epoch && !collected.is_empty() {
+                    bank.extend_stake_keys(collected);
                 }
             }
         }

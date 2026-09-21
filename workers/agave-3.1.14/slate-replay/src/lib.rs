@@ -153,6 +153,11 @@ impl ReplayBank {
         self.feature_set = feature_set;
     }
 
+    // Union, never replace: a resume's checkpoint set holds keys created after the snapshot was taken.
+    pub fn extend_stake_keys(&mut self, keys: HashSet<Pubkey>) {
+        self.stake_keys.extend(keys);
+    }
+
     pub fn set_stake_keys(&mut self, keys: HashSet<Pubkey>) {
         self.stake_keys = keys;
     }
