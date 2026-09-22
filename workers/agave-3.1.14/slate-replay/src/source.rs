@@ -210,7 +210,12 @@ impl BlockSource for CachingBlockSource {
                 100.0 * h as f64 / (h + m) as f64
             );
         }
-        Ok(slots.iter().filter_map(|s| hits.remove(s)).collect())
+        let out: Vec<Block> = slots.iter().filter_map(|s| hits.remove(s)).collect();
+        // Covers cached blocks too, so a bad block already on disk is caught on the way out.
+        for pair in out.windows(2) {
+            crate::block::verify_chains_to(&pair[1], &pair[0])?;
+        }
+        Ok(out)
     }
 }
 

@@ -327,7 +327,11 @@ pub fn fetch_block_opt(
     }
     match resp.get("result") {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(result) => Ok(Some(Block::from_getblock(slot, result)?)),
+        Some(result) => {
+            let block = Block::from_getblock(slot, result)?;
+            verify_signatures(&block)?;
+            Ok(Some(block))
+        }
     }
 }
 
@@ -362,6 +366,40 @@ impl AddressLoader for ResolvedAddresses {
 }
 
 // Reserved-key set is the fully-activated one, correct for our post-epoch-808 floor where every reserved key is already live.
+/// Rejected before caching, so transient source corruption self-heals via the caller's retry.
+pub fn verify_signatures(block: &Block) -> Result<()> {
+    let bad = block
+        .transactions
+        .iter()
+        .filter(|t| t.transaction.verify_with_results().iter().any(|ok| !ok))
+        .count();
+    if bad > 0 {
+        anyhow::bail!(
+            "block {} failed integrity verification: {bad} of {} transactions have invalid \
+             signatures; the block source returned data that does not match the block's own \
+             signatures (this is the source, not Slate)",
+            block.slot,
+            block.transactions.len()
+        );
+    }
+    Ok(())
+}
+
+/// Two independently fetched CAR nodes agreeing on the same hash; a re-fetch cannot.
+pub fn verify_chains_to(block: &Block, parent: &Block) -> Result<()> {
+    if block.parent_slot == parent.slot && block.previous_blockhash != parent.blockhash {
+        anyhow::bail!(
+            "block {} does not chain to its parent {}: previousBlockhash {} != parent blockhash \
+             {}; the block source returned an inconsistent pair (this is the source, not Slate)",
+            block.slot,
+            parent.slot,
+            block.previous_blockhash,
+            parent.blockhash
+        );
+    }
+    Ok(())
+}
+
 pub fn sanitize(
     tx: &VersionedTransaction,
     loaded: &LoadedAddresses,
@@ -472,6 +510,66 @@ mod tests {
     // The 823 run halted here: no transaction touches a migration buffer, and it is not
     // stake/vote/program-owned, so the snapshot seeder dropped it and the migration found
     // nothing to read.
+    #[test]
+    fn a_clean_block_passes_signature_verification() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let block = Block::from_getblock(437_680_849, &v["result"]).unwrap();
+        assert!(verify_signatures(&block).is_ok());
+    }
+
+    #[test]
+    fn a_flipped_instruction_byte_fails_signature_verification() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let mut block = Block::from_getblock(437_680_849, &v["result"]).unwrap();
+        let mut flipped = false;
+        for t in block.transactions.iter_mut() {
+            let ixs = match &mut t.transaction.message {
+                solana_message::VersionedMessage::V0(m) => &mut m.instructions,
+                solana_message::VersionedMessage::Legacy(m) => &mut m.instructions,
+            };
+            if let Some(ix) = ixs.iter_mut().find(|ix| !ix.data.is_empty()) {
+                ix.data[0] ^= 0x01;
+                flipped = true;
+                break;
+            }
+        }
+        assert!(flipped, "fixture has no instruction data to corrupt");
+        let err = verify_signatures(&block).unwrap_err().to_string();
+        assert!(err.contains("invalid"), "{err}");
+        assert!(err.contains("not Slate"), "the error must attribute the fault: {err}");
+    }
+
+    #[test]
+    fn a_block_chains_to_its_parent() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let child = Block::from_getblock(437_680_849, &v["result"]).unwrap();
+        let mut parent = child.clone();
+        parent.slot = child.parent_slot;
+        parent.blockhash = child.previous_blockhash;
+        assert!(verify_chains_to(&child, &parent).is_ok());
+    }
+
+    #[test]
+    fn a_broken_chain_is_rejected() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let child = Block::from_getblock(437_680_849, &v["result"]).unwrap();
+        let mut parent = child.clone();
+        parent.slot = child.parent_slot;
+        parent.blockhash = solana_hash::Hash::new_unique();
+        let err = verify_chains_to(&child, &parent).unwrap_err().to_string();
+        assert!(err.contains("does not chain"), "{err}");
+    }
+
+    #[test]
+    fn skipped_slots_do_not_trip_the_chain_check() {
+        let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let child = Block::from_getblock(437_680_849, &v["result"]).unwrap();
+        let mut other = child.clone();
+        other.slot = child.parent_slot - 5;
+        other.blockhash = solana_hash::Hash::new_unique();
+        assert!(verify_chains_to(&child, &other).is_ok());
+    }
+
     #[test]
     fn the_fixed_set_carries_the_core_bpf_migration_buffers() {
         let mut set = HashSet::new();
