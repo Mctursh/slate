@@ -22,6 +22,7 @@ use agave_syscalls::create_program_runtime_environment_v1;
 use slate_hash::LtHash;
 use solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount};
 use solana_clock::Clock;
+use solana_compute_budget::compute_budget::{ComputeBudget, SVMTransactionExecutionCost};
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_epoch_schedule::EpochSchedule;
 use solana_fee_structure::FeeDetails;
@@ -561,6 +562,16 @@ impl ReplayBank {
             .unwrap_or_default()
     }
 
+    // agave's update_rent writes the rent COLLECTOR, so burn_percent comes from genesis (50), not the sysvar, which mainnet left at 100 since slot 328457012.
+    pub fn deprecate_rent_exemption_threshold(&mut self) {
+        let mut rent = self.rent();
+        rent.lamports_per_byte_year =
+            (rent.lamports_per_byte_year as f64 * rent.exemption_threshold) as u64;
+        rent.exemption_threshold = 1.0;
+        rent.burn_percent = Rent::default().burn_percent;
+        self.set_sysvar_account(Rent::id(), bincode::serialize(&rent).unwrap());
+    }
+
     pub fn minimum_balance(&self, data_len: usize) -> u64 {
         self.rent().minimum_balance(data_len)
     }
@@ -727,6 +738,15 @@ pub struct Replayer {
     svm_feature_set: SVMFeatureSet,
 }
 
+// invoke_units drops 1000 -> 946 when SIMD-0339 is active; the processor defaults to 1000 forever unless told.
+fn execution_cost(feature_set: &FeatureSet) -> SVMTransactionExecutionCost {
+    ComputeBudget::new_with_defaults(
+        feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id()),
+        feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id()),
+    )
+    .to_cost()
+}
+
 fn program_runtime_v1(svm_feature_set: &SVMFeatureSet) -> ProgramRuntimeEnvironment {
     Arc::new(
         create_program_runtime_environment_v1(
@@ -755,13 +775,14 @@ impl Replayer {
         let fork_graph = Arc::new(RwLock::new(SlateForkGraph));
         // SVM env takes the derived SVMFeatureSet; the compute-budget parser takes the runtime FeatureSet.
         let svm_feature_set = feature_set.runtime_features();
-        let processor = TransactionBatchProcessor::new(
+        let mut processor = TransactionBatchProcessor::new(
             slot,
             epoch,
             Arc::downgrade(&fork_graph),
             Some(program_runtime_v1(&svm_feature_set)),
             None,
         );
+        processor.set_execution_cost(execution_cost(&feature_set));
         Self {
             _fork_graph: fork_graph,
             processor,
@@ -776,6 +797,8 @@ impl Replayer {
     pub fn enter_epoch(&mut self, epoch: u64, feature_set: FeatureSet) {
         self.svm_feature_set = feature_set.runtime_features();
         self.feature_set = feature_set;
+        self.processor
+            .set_execution_cost(execution_cost(&self.feature_set));
         let environments = ProgramRuntimeEnvironments {
             program_runtime_v1: program_runtime_v1(&self.svm_feature_set),
             program_runtime_v2: self.processor.environments.program_runtime_v2.clone(),
@@ -866,7 +889,8 @@ impl Replayer {
                 let budget = limits.get_compute_budget_and_limits(
                     limits.loaded_accounts_bytes,
                     FeeDetails::new(fee, 0),
-                    true,
+                    self.feature_set
+                        .is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id()),
                 );
                 // Durable-nonce only when recent_blockhash IS the account's stored nonce (compare directly, not via the 150-entry RecentBlockhashes window that's one short of agave's age-150 check and mis-routed normal txs). On the nonce path a failed tx still rolls the nonce forward advanced.
                 let nonce = match tx.get_durable_nonce().copied() {
@@ -974,6 +998,11 @@ impl Replayer {
                 // and validator_rewards is computed from capitalization. Running it after the
                 // reward pass leaves every reward a hair low (epoch 823: 284 lamports).
                 let activated_features = activate_pending_features(bank, block.slot);
+                if activated_features
+                    .contains(&agave_feature_set::deprecate_rent_exemption_threshold::id())
+                {
+                    bank.deprecate_rent_exemption_threshold();
+                }
                 // Gate on the NEWLY activated set, not the feature set.
                 compat::apply_core_bpf_migrations(
                     bank,
@@ -2213,12 +2242,10 @@ mod tests {
             fixture::cpi::FEE,
             "fee"
         );
-        // CU does NOT reconcile here (replay 11_451 vs chain 11_343, ~1%): all_enabled() accounts a CPI cost differently than the exact per-epoch feature set. A CU-accounting gap, not a state error; we guard our number so drift surfaces.
         assert_eq!(
             executed.execution_details.executed_units,
-            11_451,
-            "replay CU (chain was {})",
-            fixture::cpi::COMPUTE_UNITS
+            fixture::cpi::COMPUTE_UNITS,
+            "replay CU"
         );
     }
 

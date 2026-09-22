@@ -40,17 +40,25 @@ pub fn apply_core_bpf_migrations(
     epoch: u64,
     slot: u64,
 ) {
-    if !activated.contains(&agave_feature_set::migrate_stake_program_to_core_bpf::id()) {
-        return;
+    if activated.contains(&agave_feature_set::migrate_stake_program_to_core_bpf::id()) {
+        match core_bpf::migrate_stake_to_core_bpf(bank, processor, parent, epoch, slot) {
+            Ok(m) => eprintln!(
+                "epoch {epoch}: {} migrated to core BPF, programdata {}, burned {} funded {}",
+                m.program_address, m.program_data_address, m.burned, m.funded
+            ),
+            // Halt rather than continue: a failed migration means every later stake transaction
+            // replays against the wrong program, and the bank hash diverges from here on.
+            Err(e) => panic!("epoch {epoch}: stake core-BPF migration failed: {e:?}"),
+        }
     }
-    match core_bpf::migrate_stake_to_core_bpf(bank, processor, parent, epoch, slot) {
-        Ok(m) => eprintln!(
-            "epoch {epoch}: {} migrated to core BPF, programdata {}, burned {} funded {}",
-            m.program_address, m.program_data_address, m.burned, m.funded
-        ),
-        // Halt rather than continue: a failed migration means every later stake transaction
-        // replays against the wrong program, and the bank hash diverges from here on.
-        Err(e) => panic!("epoch {epoch}: stake core-BPF migration failed: {e:?}"),
+    if activated.contains(&agave_feature_set::vote_state_v4::id()) {
+        match core_bpf::upgrade_stake_for_vote_state_v4(bank, processor, epoch, slot) {
+            Ok(m) => eprintln!(
+                "epoch {epoch}: {} upgraded for vote_state_v4, programdata {}, burned {} funded {}",
+                m.program_address, m.program_data_address, m.burned, m.funded
+            ),
+            Err(e) => panic!("epoch {epoch}: stake vote_state_v4 upgrade failed: {e:?}"),
+        }
     }
 }
 
