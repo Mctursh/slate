@@ -18,7 +18,7 @@ use solana_stake_interface::{
     stake_history::StakeHistory,
     state::{Stake, StakeActivationStatus, StakeStateV2},
 };
-use solana_stake_program::solana_vote_interface::state::{VoteStateV3, VoteStateVersions};
+use solana_stake_program::solana_vote_interface::state::VoteStateV3;
 use solana_stake_program::{
     points::{InflationPointCalculationEvent, PointValue, calculate_points},
     rewards::redeem_rewards,
@@ -103,14 +103,18 @@ pub fn previous_epoch_inflation_rewards(
 
 // Owner-only, like agave's VoteAccount::try_from. An is_correct_size_and_initialized check here
 // would reject not-yet-resized 3731-byte V1_14_11 accounts and inflate every reward.
-pub fn vote_state_of(account: &AccountSharedData) -> Option<VoteStateV3> {
+pub fn vote_state_of(voter: &Pubkey, account: &AccountSharedData) -> Option<VoteStateV3> {
     use solana_account::ReadableAccount;
     if account.lamports() == 0 || *account.owner() != solana_sdk_ids::vote::id() {
         return None;
     }
-    bincode::deserialize::<VoteStateVersions>(account.data())
-        .ok()
-        .map(VoteStateVersions::convert_to_v3)
+    // SIMD-0185 rewrote mainnet's vote accounts to V4; V4::deserialize reads every version.
+    let v4 = solana_vote_interface::state::VoteStateV4::deserialize(account.data(), voter).ok()?;
+    Some(VoteStateV3 {
+        commission: (v4.inflation_rewards_commission_bps / 100).min(u8::MAX as u16) as u8,
+        epoch_credits: v4.epoch_credits,
+        ..Default::default()
+    })
 }
 
 pub fn stake_history_of(bank: &ReplayBank) -> Option<StakeHistory> {
@@ -151,7 +155,7 @@ pub fn calculate_epoch_rewards(
             return None;
         }
         let (account, _) = bank.get_account_shared_data(voter)?;
-        vote_state_of(&account)
+        vote_state_of(voter, &account)
     };
 
     let mut points: u128 = 0;
@@ -595,7 +599,7 @@ pub fn credit_vote_commission(
         let Some((mut account, _)) = bank.get_account_shared_data(pubkey) else {
             continue;
         };
-        if vote_state_of(&account).is_none() {
+        if vote_state_of(pubkey, &account).is_none() {
             continue;
         }
         let Some(total) = account.lamports().checked_add(*lamports) else {
@@ -1083,6 +1087,7 @@ pub(crate) mod reward_tests {
         stake_flags::StakeFlags,
         state::{Delegation, Meta, Stake, StakeStateV2},
     };
+    use solana_stake_program::solana_vote_interface::state::VoteStateVersions;
 
     pub(crate) fn stake_account(voter: Pubkey, lamports: u64) -> AccountSharedData {
         let state = StakeStateV2::Stake(
@@ -1213,10 +1218,10 @@ pub(crate) mod reward_tests {
 
     #[test]
     fn vote_state_membership_matches_agaves_rule() {
-        assert!(vote_state_of(&vote_account(10, 5)).is_some());
+        assert!(vote_state_of(&Pubkey::new_unique(), &vote_account(10, 5)).is_some());
         let mut closed = vote_account(10, 5);
         solana_account::WritableAccount::set_lamports(&mut closed, 0);
-        assert!(vote_state_of(&closed).is_none());
+        assert!(vote_state_of(&Pubkey::new_unique(), &closed).is_none());
     }
 }
 

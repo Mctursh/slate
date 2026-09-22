@@ -46,11 +46,11 @@ taking typed solana values is version-locked, not shared. **Everything here take
 
 ## Eras
 
-Measured 2026-09-14 against mainnet (genesis `5eykt4Us...`, tip epoch 1034).
+Re-verified 2026-09-20 against mainnet (genesis `5eykt4Us...`, tip epoch 1038).
 
 | Worker | agave | Floor | Ceiling | Status |
 |--------|-------|-------|---------|--------|
-| `agave-3.1.14` | 3.1.14 | 823 static, **807 shimmed** | 978 | era 1, partially built |
+| `agave-3.1.14` | 3.1.14 | 823 static, **807 shimmed** | 978 | era 1, all 4 structural boundaries verified |
 | *(not built)* | 4.2.1 | 953 | ≥ tip | era 2, covers 979.. |
 
 **Two eras cover 807 → tip.** 4.2.1's floor sits comfortably below 979, so it picks up where
@@ -65,8 +65,9 @@ Measured 2026-09-14 against mainnet (genesis `5eykt4Us...`, tip epoch 1034).
 
 `agave-3.1.14` reaches back to 807 only via two shims it already carries: the vendored native
 Stake program (pre-823 behaviour) and the SIMD-0162 executable-flag check (811). The 807→808
-bit-exact proof is the evidence they work. The shims supply pre-migration *behaviour* —
-**the 823 migration event itself, which writes accounts, is still unimplemented.**
+bit-exact proof is the evidence they work. The shims supply pre-migration *behaviour*; the 823
+migration event that writes the accounts is implemented separately in `compat/core_bpf.rs`, and
+the 822→823 crossing is bit-exact.
 
 ## What "green" means for an era
 
@@ -102,20 +103,40 @@ inputs** on external storage, not in the repo.
     807 808 809 811 818 821 822 823 825 836 841 878 880 884 890
     933 935 936 940 942 943 946 949 950 953 956 971
 
-Four are **structural** — they write accounts at the boundary, and none is implemented:
+Four are **structural** — they write accounts at the boundary. All four are implemented, and
+each one's boundary slot reproduces the bank hash mainnet's own votes committed to:
 
-| epoch | event | note |
-|-------|-------|------|
-| 823 | `migrate_stake_program_to_core_bpf` | hardest; 3.1.14 dropped the config, so Slate must supply it |
-| 943 | `deprecate_rent_exemption_threshold` | rewrites the Rent sysvar |
-| 949 | `vote_state_v4` | rewrites the Stake program account from a buffer |
-| 971 | `replace_spl_token_with_p_token` | rewrites the SPL Token program account |
+| epoch | event | what it writes | boundary bank hash |
+|-------|-------|----------------|--------------------|
+| 823 | `migrate_stake_program_to_core_bpf` | Stake native -> core BPF; 3.1.14 dropped the config, so Slate supplies it | `4xqydB2QXwTF...` |
+| 943 | `deprecate_rent_exemption_threshold` | folds the threshold into the byte rate and rewrites the Rent sysvar | `APwjdDg3GPcX...` |
+| 949 | `vote_state_v4` | upgrades the Stake program from a buffer (SIMD-0185) | `Bzx7vGBzg7da...` |
+| 971 | `replace_spl_token_with_p_token` | SPL Token loader v2 -> loader v3 (p-token) | `33wyH2pTNjsQ...` |
 
-Ordering trap: `relax_programdata_account_check_migration` lands at **956**, between 949 and
-971, and is passed as a flag to both upgrade paths — so the same code must behave differently
-at the two.
+Ordering trap, now exercised at both ends: `relax_programdata_account_check_migration` lands at
+**956**, between 949 and 971, and is passed as a flag to both upgrade paths — so the same code
+behaves differently at the two. At 971 it is active, which is why a system-owned prefunded
+programdata account is tolerated there and its lamports join the burn.
 
-Vote-verified so far: **8,976 of ~74,304,000 slots (0.012%)**, all in the 807→808 window.
+949 also carries a trap of its own. `vote_state_v4` rewrites mainnet's vote accounts to
+`VoteStateV4`, so from 949 onward anything reading vote state with a pre-V4 type silently sees
+nothing. At 971 that dropped 751 of 774 voters and paid 1,898 delegations instead of 1.28
+million, with an intact-looking bank hash right up to the boundary.
+
+### Verified windows
+
+| window | slots verified | note |
+|--------|----------------|------|
+| 807 -> 808 | 21,963 | plus a 50,079-slot run byte-exact vs the real snapshot, 8,412,739/8,412,739 accounts |
+| 822 -> 823 | 317 | the whole 244-partition reward window |
+| 824 -> 825 | 89,953 | largest single window |
+| 942 -> 943 | 30,035 | 29,719 before the boundary, 316 after |
+| 948 -> 949 | 18,991 | 18,671 before, 320 after |
+| 970 -> 971 | 13,397 | 13,081 before, 316 after |
+
+**174,656 of ~74,304,000 slots (0.24%)**, concentrated at the boundaries where behaviour changes
+rather than spread uniformly. That is the point of the definition above, not a shortfall against
+it, but the raw fraction should stay visible.
 
 ## Adding an era
 

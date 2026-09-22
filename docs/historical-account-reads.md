@@ -165,10 +165,13 @@ the argument for keeping all three:
   Raydium upgrade was followed by seven transactions that failed on chain and succeeded
   in the replay, because the upgraded program was made available immediately.
 
-Current scope, stated plainly. The largest verified window is 50,079 slots inside epoch
-808. Epoch boundaries are replayed as well, verified at the 807 → 808 crossing: pending
-features activate, the inflation pool and vote commission match mainnet to the lamport,
-and all 228 stake-reward partitions pay out on the blocks that carried them.
+Current scope, stated plainly. The largest window verified against consensus votes is 89,953
+slots across the 824 → 825 crossing; a separate 50,079-slot run inside epoch 808 is the one
+also diffed byte-for-byte against the official snapshot at its end, 8,412,739 of 8,412,739
+accounts. Epoch boundaries are replayed as well, verified at six crossings (807 → 808,
+822 → 823, 824 → 825, 942 → 943, 948 → 949, 970 → 971): pending features activate, the
+inflation pool and vote commission match mainnet to the lamport, and every stake-reward
+partition pays out on the blocks that carried it. 174,656 slots are verified in total.
 
 Reaching further back needs a different agave than reaching forward does, because a given
 version doesn't know features that activate after it was cut and has already deleted code
@@ -176,14 +179,19 @@ earlier epochs need. The range is therefore sliced into eras, one worker per aga
 each pinned to its own lockfile and toolchain so a later era can't disturb an earlier one's
 proof. Two eras cover epoch 807 to the present.
 
-What is not done: four epochs in 807–978 rewrite accounts at their boundary and have no
-implementation (823 Stake to core BPF, 943 Rent sysvar, 949 vote state v4, 971 SPL Token to
-p-token), and the SVM's program-runtime environment is still built once from a range's
-first slot rather than following a mid-range activation. Verification is also honest about
-its own limits: an era spans roughly 74 million slots, replaying all of them is not on the
-table, so coverage is built at the points where behaviour actually changes rather than
-claimed across the whole range. Extending this is engineering, not open research, but it is
-not done.
+The four epochs in 807–978 that rewrite accounts at their boundary are implemented and
+bit-exact (823 Stake to core BPF, 943 Rent sysvar, 949 vote state v4, 971 SPL Token to
+p-token), and the SVM's program-runtime environment is rebuilt at each epoch crossing from
+the feature set at that crossing.
+
+What is not done: 21 of the 27 feature activations in the range have never had a window
+replayed through them. Four of those are networking-layer and cannot affect account state,
+which leaves 17 unproven. The v2 loader environment is also carried across a crossing rather
+than rebuilt. Verification is also honest about its own limits: an era spans roughly 74 million
+slots, replaying all of them is not on the table, so coverage is built at the points where
+behaviour actually changes rather than claimed across the whole range, and 174,656 verified
+slots is 0.24% of the era by count. Extending this is engineering, not open research, but it
+is not done.
 
 ## Security considerations
 

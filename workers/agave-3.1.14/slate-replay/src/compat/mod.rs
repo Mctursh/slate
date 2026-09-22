@@ -51,6 +51,15 @@ pub fn apply_core_bpf_migrations(
             Err(e) => panic!("epoch {epoch}: stake core-BPF migration failed: {e:?}"),
         }
     }
+    if activated.contains(&agave_feature_set::replace_spl_token_with_p_token::id()) {
+        match core_bpf::migrate_spl_token_to_p_token(bank, processor, epoch, slot) {
+            Ok(m) => eprintln!(
+                "epoch {epoch}: {} replaced with p-token, programdata {}, burned {} funded {}",
+                m.program_address, m.program_data_address, m.burned, m.funded
+            ),
+            Err(e) => panic!("epoch {epoch}: SPL Token -> p-token migration failed: {e:?}"),
+        }
+    }
     if activated.contains(&agave_feature_set::vote_state_v4::id()) {
         match core_bpf::upgrade_stake_for_vote_state_v4(bank, processor, epoch, slot) {
             Ok(m) => eprintln!(
