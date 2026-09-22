@@ -23,7 +23,11 @@ pub const STAKE_SOURCE_BUFFER: Pubkey =
 /// Every account a core-BPF migration reads that no transaction in a range would touch.
 /// The snapshot seeder filters on the range's transaction keys, so without this the buffer
 /// is absent and the migration refuses.
-pub const MIGRATION_SOURCE_BUFFERS: &[Pubkey] = &[STAKE_SOURCE_BUFFER];
+// agave_feature_set::vote_state_v4::stake_program_buffer, the SIMD-0185 upgrade source.
+pub const STAKE_V4_SOURCE_BUFFER: Pubkey =
+    Pubkey::from_str_const("BM11F4hqrpinQs28sEZfzQ2fYddivYs4NEAHF6QMjkJF");
+
+pub const MIGRATION_SOURCE_BUFFERS: &[Pubkey] = &[STAKE_SOURCE_BUFFER, STAKE_V4_SOURCE_BUFFER];
 
 /// solana-builtins 2.3.13 sets `upgrade_authority_address: None` for this migration.
 const STAKE_UPGRADE_AUTHORITY: Option<Pubkey> = None;
@@ -41,6 +45,8 @@ pub enum MigrationError {
     AuthorityMismatch,
     /// The ELF failed to load or verify against the current runtime environment.
     Deploy,
+    /// An upgrade target has no programdata account, so it is not a deployed loader-v3 program.
+    ProgramDataMissing,
 }
 
 /// What the migration wrote, for the caller to log and for tests to assert on.
@@ -162,6 +168,108 @@ pub fn migrate_stake_to_core_bpf(
     bank.insert(program_data_address, new_program_data, slot);
     // Cleared, not removed: a zero-lamport account is dead and hashes to the lattice identity.
     bank.insert(STAKE_SOURCE_BUFFER, AccountSharedData::default(), slot);
+
+    Ok(Migrated {
+        program_address,
+        program_data_address,
+        burned,
+        funded,
+    })
+}
+
+/// Stake program, core BPF -> core BPF, at the first block of epoch 949 (SIMD-0185).
+pub fn upgrade_stake_for_vote_state_v4(
+    bank: &mut ReplayBank,
+    processor: &TransactionBatchProcessor<SlateForkGraph>,
+    epoch: u64,
+    slot: u64,
+) -> Result<Migrated, MigrationError> {
+    let program_address = solana_sdk_ids::stake::id();
+    let program_data_address = get_program_data_address(&program_address);
+    let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
+
+    let (program_account, _) = bank
+        .get_account_shared_data(&program_address)
+        .ok_or(MigrationError::ProgramMissing)?;
+    if program_account.owner() != &loader || !program_account.executable() {
+        return Err(MigrationError::ProgramMissing);
+    }
+    let (program_data_account, _) = bank
+        .get_account_shared_data(&program_data_address)
+        .ok_or(MigrationError::ProgramDataMissing)?;
+    let (buffer_account, _) = bank
+        .get_account_shared_data(&STAKE_V4_SOURCE_BUFFER)
+        .ok_or(MigrationError::BufferMissing)?;
+
+    let programdata_metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+    let upgrade_authority_address = match bincode::deserialize(
+        program_data_account
+            .data()
+            .get(..programdata_metadata_size)
+            .ok_or(MigrationError::ProgramDataMissing)?,
+    ) {
+        Ok(UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address,
+            ..
+        }) => upgrade_authority_address,
+        _ => return Err(MigrationError::ProgramDataMissing),
+    };
+
+    let metadata_size = UpgradeableLoaderState::size_of_buffer_metadata();
+    let buffer_authority = match bincode::deserialize(
+        buffer_account
+            .data()
+            .get(..metadata_size)
+            .ok_or(MigrationError::InvalidBuffer)?,
+    ) {
+        Ok(UpgradeableLoaderState::Buffer { authority_address }) => authority_address,
+        _ => return Err(MigrationError::InvalidBuffer),
+    };
+    // agave only compares when the TARGET carries an authority; None skips the check.
+    if upgrade_authority_address.is_some() && upgrade_authority_address != buffer_authority {
+        return Err(MigrationError::AuthorityMismatch);
+    }
+    let elf = &buffer_account.data()[metadata_size..];
+
+    let space = programdata_metadata_size + elf.len();
+    let mut new_program_data = AccountSharedData::new_data_with_space(
+        bank.minimum_balance(space),
+        &UpgradeableLoaderState::ProgramData {
+            slot,
+            upgrade_authority_address,
+        },
+        space,
+        &loader,
+    )
+    .map_err(|_| MigrationError::InvalidBuffer)?;
+    new_program_data.data_as_mut_slice()[programdata_metadata_size..].copy_from_slice(elf);
+
+    // The program account survives, so only the old programdata and the buffer are burned.
+    let burned = program_data_account.lamports() + buffer_account.lamports();
+    let funded = new_program_data.lamports();
+
+    let account_size = UpgradeableLoaderState::size_of_program() + new_program_data.data().len();
+    let mut batch_cache = ProgramCacheForTxBatch::new(slot);
+    let environments = processor.get_environments_for_epoch(epoch);
+    solana_bpf_loader_program::deploy_program(
+        None,
+        &mut batch_cache,
+        environments.program_runtime_v1.clone(),
+        &program_address,
+        &loader,
+        account_size,
+        elf,
+        slot,
+    )
+    .map_err(|_| MigrationError::Deploy)?;
+    processor
+        .global_program_cache
+        .write()
+        .unwrap()
+        .merge(&environments, &batch_cache.drain_modified_entries());
+
+    bank.insert(program_data_address, new_program_data, slot);
+    bank.insert(STAKE_V4_SOURCE_BUFFER, AccountSharedData::default(), slot);
 
     Ok(Migrated {
         program_address,

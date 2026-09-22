@@ -145,9 +145,11 @@ pub fn calculate_epoch_rewards(
     let delegations = bank.stake_delegations();
     let stake_history = stake_history_of(bank).unwrap_or_default();
 
-    // The manifest's vote set is NOT agave's epoch stakes; gating on it drops rewarded delegations.
-    let _ = vote_cache;
+    // agave redeems only for voters in its epoch-stakes cache; without this a dead delegation's credits_observed gets clobbered to 0.
     let vote_state_for = |voter: &Pubkey| -> Option<VoteStateV3> {
+        if !vote_cache.contains(voter) {
+            return None;
+        }
         let (account, _) = bank.get_account_shared_data(voter)?;
         vote_state_of(&account)
     };
