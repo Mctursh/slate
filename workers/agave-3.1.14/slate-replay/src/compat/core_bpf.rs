@@ -27,7 +27,17 @@ pub const STAKE_SOURCE_BUFFER: Pubkey =
 pub const STAKE_V4_SOURCE_BUFFER: Pubkey =
     Pubkey::from_str_const("BM11F4hqrpinQs28sEZfzQ2fYddivYs4NEAHF6QMjkJF");
 
-pub const MIGRATION_SOURCE_BUFFERS: &[Pubkey] = &[STAKE_SOURCE_BUFFER, STAKE_V4_SOURCE_BUFFER];
+// agave_feature_set::replace_spl_token_with_p_token, the epoch-971 upgrade source and target.
+pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+pub const PTOKEN_SOURCE_BUFFER: Pubkey =
+    Pubkey::from_str_const("ptok6rngomXrDbWf5v5Mkmu5CEbB51hzSCPDoj9DrvF");
+
+pub const MIGRATION_SOURCE_BUFFERS: &[Pubkey] = &[
+    STAKE_SOURCE_BUFFER,
+    STAKE_V4_SOURCE_BUFFER,
+    PTOKEN_SOURCE_BUFFER,
+];
 
 /// solana-builtins 2.3.13 sets `upgrade_authority_address: None` for this migration.
 const STAKE_UPGRADE_AUTHORITY: Option<Pubkey> = None;
@@ -47,6 +57,8 @@ pub enum MigrationError {
     Deploy,
     /// An upgrade target has no programdata account, so it is not a deployed loader-v3 program.
     ProgramDataMissing,
+    /// SPL Token must still be loader-v2 owned and executable before the upgrade.
+    TargetNotLoaderV2,
 }
 
 /// What the migration wrote, for the caller to log and for tests to assert on.
@@ -270,6 +282,111 @@ pub fn upgrade_stake_for_vote_state_v4(
 
     bank.insert(program_data_address, new_program_data, slot);
     bank.insert(STAKE_V4_SOURCE_BUFFER, AccountSharedData::default(), slot);
+
+    Ok(Migrated {
+        program_address,
+        program_data_address,
+        burned,
+        funded,
+    })
+}
+
+/// SPL Token, loader v2 -> loader v3 (p-token), at the first block of epoch 971.
+pub fn migrate_spl_token_to_p_token(
+    bank: &mut ReplayBank,
+    processor: &TransactionBatchProcessor<SlateForkGraph>,
+    epoch: u64,
+    slot: u64,
+) -> Result<Migrated, MigrationError> {
+    let program_address = SPL_TOKEN_PROGRAM_ID;
+    let program_data_address = get_program_data_address(&program_address);
+    let loader_v3 = solana_sdk_ids::bpf_loader_upgradeable::id();
+
+    let (program_account, _) = bank
+        .get_account_shared_data(&program_address)
+        .ok_or(MigrationError::ProgramMissing)?;
+    if program_account.owner() != &solana_sdk_ids::bpf_loader::id() || !program_account.executable()
+    {
+        return Err(MigrationError::TargetNotLoaderV2);
+    }
+
+    // relax_programdata_account_check_migration is active by 971: tolerate a system-owned prefund.
+    let prefunded = match bank.get_account_shared_data(&program_data_address) {
+        Some((account, _)) => {
+            if account.owner() != &solana_sdk_ids::system_program::id() {
+                return Err(MigrationError::ProgramDataExists);
+            }
+            account.lamports()
+        }
+        None => 0,
+    };
+
+    let (buffer_account, _) = bank
+        .get_account_shared_data(&PTOKEN_SOURCE_BUFFER)
+        .ok_or(MigrationError::BufferMissing)?;
+    let metadata_size = UpgradeableLoaderState::size_of_buffer_metadata();
+    match bincode::deserialize(
+        buffer_account
+            .data()
+            .get(..metadata_size)
+            .ok_or(MigrationError::InvalidBuffer)?,
+    ) {
+        Ok(UpgradeableLoaderState::Buffer { .. }) => {}
+        _ => return Err(MigrationError::InvalidBuffer),
+    }
+    let elf = &buffer_account.data()[metadata_size..];
+
+    let mut new_program = AccountSharedData::new_data(
+        bank.minimum_balance(UpgradeableLoaderState::size_of_program()),
+        &UpgradeableLoaderState::Program {
+            programdata_address: program_data_address,
+        },
+        &loader_v3,
+    )
+    .map_err(|_| MigrationError::InvalidBuffer)?;
+    new_program.set_executable(true);
+
+    let programdata_metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+    let space = programdata_metadata_size + elf.len();
+    // Loader-v2 programs have no upgrade authority.
+    let mut new_program_data = AccountSharedData::new_data_with_space(
+        bank.minimum_balance(space),
+        &UpgradeableLoaderState::ProgramData {
+            slot,
+            upgrade_authority_address: None,
+        },
+        space,
+        &loader_v3,
+    )
+    .map_err(|_| MigrationError::InvalidBuffer)?;
+    new_program_data.data_as_mut_slice()[programdata_metadata_size..].copy_from_slice(elf);
+
+    let burned = program_account.lamports() + buffer_account.lamports() + prefunded;
+    let funded = new_program.lamports() + new_program_data.lamports();
+
+    let account_size = UpgradeableLoaderState::size_of_program() + new_program_data.data().len();
+    let mut batch_cache = ProgramCacheForTxBatch::new(slot);
+    let environments = processor.get_environments_for_epoch(epoch);
+    solana_bpf_loader_program::deploy_program(
+        None,
+        &mut batch_cache,
+        environments.program_runtime_v1.clone(),
+        &program_address,
+        &loader_v3,
+        account_size,
+        elf,
+        slot,
+    )
+    .map_err(|_| MigrationError::Deploy)?;
+    processor
+        .global_program_cache
+        .write()
+        .unwrap()
+        .merge(&environments, &batch_cache.drain_modified_entries());
+
+    bank.insert(program_address, new_program, slot);
+    bank.insert(program_data_address, new_program_data, slot);
+    bank.insert(PTOKEN_SOURCE_BUFFER, AccountSharedData::default(), slot);
 
     Ok(Migrated {
         program_address,
@@ -553,6 +670,102 @@ mod tests {
             &solana_sdk_ids::bpf_loader_upgradeable::id(),
             "the activating crossing must migrate"
         );
+    }
+
+    const EPOCH_971: u64 = 971;
+
+    fn loader_v2_program(lamports: u64) -> AccountSharedData {
+        AccountSharedData::from(Account {
+            lamports,
+            data: b"spl-token".to_vec(),
+            owner: solana_sdk_ids::bpf_loader::id(),
+            executable: true,
+            rent_epoch: 0,
+        })
+    }
+
+    fn bank_at_971(elf: &[u8]) -> (ReplayBank, Replayer, u64) {
+        let slot = EPOCH_971 * 432_000;
+        let mut bank = ReplayBank::default();
+        bank.insert(SPL_TOKEN_PROGRAM_ID, loader_v2_program(1_000_000), slot);
+        bank.insert(PTOKEN_SOURCE_BUFFER, buffer(None, elf, 5_000_000), slot);
+        (bank, Replayer::new(slot, EPOCH_971), slot)
+    }
+
+    #[test]
+    fn p_token_replaces_spl_token_and_clears_the_buffer() {
+        let (mut bank, replayer, slot) = bank_at_971(elf());
+        let out =
+            migrate_spl_token_to_p_token(&mut bank, &replayer.processor, EPOCH_971, slot).unwrap();
+        let loader = solana_sdk_ids::bpf_loader_upgradeable::id();
+
+        let (program, _) = bank.get_account_shared_data(&SPL_TOKEN_PROGRAM_ID).unwrap();
+        assert_eq!(*program.owner(), loader, "the program moves to loader v3");
+        assert!(program.executable());
+
+        let (data, _) = bank
+            .get_account_shared_data(&out.program_data_address)
+            .unwrap();
+        let meta = UpgradeableLoaderState::size_of_programdata_metadata();
+        assert_eq!(
+            bincode::deserialize::<UpgradeableLoaderState>(&data.data()[..meta]).unwrap(),
+            UpgradeableLoaderState::ProgramData {
+                slot,
+                upgrade_authority_address: None
+            },
+            "a loader-v2 program has no upgrade authority"
+        );
+
+        assert!(
+            bank.get_account_shared_data(&PTOKEN_SOURCE_BUFFER)
+                .is_none(),
+            "the drained buffer must read as absent"
+        );
+    }
+
+    #[test]
+    fn a_prefunded_system_programdata_is_tolerated_and_burned() {
+        let (mut bank, replayer, slot) = bank_at_971(elf());
+        let pda = get_program_data_address(&SPL_TOKEN_PROGRAM_ID);
+        bank.insert(
+            pda,
+            AccountSharedData::from(Account {
+                lamports: 7_777,
+                data: Vec::new(),
+                owner: solana_sdk_ids::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            }),
+            slot,
+        );
+        let out =
+            migrate_spl_token_to_p_token(&mut bank, &replayer.processor, EPOCH_971, slot).unwrap();
+        assert_eq!(
+            out.burned,
+            1_000_000 + 5_000_000 + 7_777,
+            "the prefunded lamports join the burn"
+        );
+    }
+
+    #[test]
+    fn a_non_system_programdata_is_refused() {
+        let (mut bank, replayer, slot) = bank_at_971(elf());
+        let pda = get_program_data_address(&SPL_TOKEN_PROGRAM_ID);
+        bank.insert(pda, loader_v2_program(42), slot);
+        assert!(matches!(
+            migrate_spl_token_to_p_token(&mut bank, &replayer.processor, EPOCH_971, slot),
+            Err(MigrationError::ProgramDataExists)
+        ));
+    }
+
+    #[test]
+    fn a_target_that_is_not_loader_v2_is_refused() {
+        let (mut bank, replayer, slot) = bank_at_971(elf());
+        bank.insert(SPL_TOKEN_PROGRAM_ID, native_stake(1), slot);
+        assert!(matches!(
+            migrate_spl_token_to_p_token(&mut bank, &replayer.processor, EPOCH_971, slot),
+            Err(MigrationError::TargetNotLoaderV2)
+        ));
     }
 
     #[test]
