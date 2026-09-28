@@ -1,0 +1,4 @@
+# Slot fixtures committed to this repo and replayed by `cargo test`, offline, every commit.
+# A slot listed here whose .slfix file is missing is a hard failure.
+# Add a line only once the fixture is captured and committed.
+# Format: <slot>  <what it guards against>

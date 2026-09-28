@@ -8,3 +8,6 @@ TASKS.md
 # /dev/*.dylib
 # /dev/*.so
 # /dev/test-ledger
+
+# Boundary/slot fixtures are release assets, not git objects (GBs).
+*.slfix

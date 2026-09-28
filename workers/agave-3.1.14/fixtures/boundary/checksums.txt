@@ -1,0 +1,3 @@
+# sha256 of each published boundary fixture, verified before the file is trusted.
+# Regenerate with: shasum -a 256 *.slfix.zst
+# Format: <sha256>  <filename>

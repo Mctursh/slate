@@ -1,5 +1,7 @@
 pub mod backfill;
 pub mod bankhash;
+#[cfg(feature = "boundary-fixtures")]
+pub mod boundary_fixtures;
 pub mod block;
 pub mod boundary;
 pub mod compat;

@@ -3,6 +3,10 @@ name = "slate-replay"
 version = "0.2.0"
 edition = "2024"
 
+[features]
+# Boundary fixtures are release assets, not in git: opt in to download and verify them.
+boundary-fixtures = []
+
 [dependencies]
 # SVM execution engine, 3.1.x line, matches slate-ingest's solana-accounts-db
 # and what mainnet stable runs. Read the API from THIS version, not agave HEAD.

@@ -22,6 +22,7 @@ struct Pending {
     block: Vec<u8>,
     accounts: Vec<([u8; 32], Vec<u8>)>,
     reward_inputs: Option<RewardInputsRecord>,
+    stake_delegations: Vec<[u8; 32]>,
 }
 
 pub struct FixtureCapture {
@@ -98,6 +99,7 @@ impl FixtureCapture {
                 block: encoded_block,
                 accounts,
                 reward_inputs: None,
+                stake_delegations: Vec::new(),
             },
         );
     }
@@ -120,6 +122,7 @@ impl FixtureCapture {
             block: p.block,
             accounts: p.accounts,
             reward_inputs: p.reward_inputs,
+            stake_delegations: p.stake_delegations,
         };
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("slot-{slot}.slfix"));
@@ -134,9 +137,23 @@ impl FixtureCapture {
     }
 }
 
+/// Decode a `.slfix` file and replay it, returning the bank hash it produces.
+pub fn replay_fixture_file(path: impl AsRef<Path>) -> anyhow::Result<(Hash, [u8; 32])> {
+    let bytes = std::fs::read(path.as_ref())?;
+    let f =
+        Fixture::decode(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.as_ref().display()))?;
+    let got = replay_fixture(&f)?;
+    Ok((got, f.expected_bank_hash))
+}
+
 /// Replay a fixture and return the bank hash it produces. No snapshot, no network: the 2 KiB
 /// lt_hash stands in for the account universe the footprint does not carry.
 pub fn replay_fixture(f: &Fixture) -> anyhow::Result<Hash> {
+    replay_fixture_with_bank(f).map(|(h, _)| h)
+}
+
+/// Same, but hands back the bank so a caller can inspect what the slot wrote.
+pub fn replay_fixture_with_bank(f: &Fixture) -> anyhow::Result<(Hash, ReplayBank)> {
     let mut bank = ReplayBank::default();
     for (pubkey, record) in &f.accounts {
         let r = slate_format::decode_account(record)
@@ -162,6 +179,39 @@ pub fn replay_fixture(f: &Fixture) -> anyhow::Result<Hash> {
     let epoch = crate::epoch_of(f.slot);
     let feature_set = crate::build_feature_set(&bank, f.slot);
     bank.set_feature_set(feature_set.clone());
+
+    // A boundary slot only runs its activation, migration and reward pass if these are set.
+    if let Some(r) = &f.reward_inputs {
+        let inflation = {
+            let mut i = solana_inflation::Inflation::default();
+            i.initial = r.inflation_initial;
+            i.terminal = r.inflation_terminal;
+            i.taper = r.inflation_taper;
+            i.foundation = r.inflation_foundation;
+            i.foundation_term = r.inflation_foundation_term;
+            i
+        };
+        // The reward pass ignores RewardInputs.capitalization and reads the bank's live value
+        // (the epoch-823 stale-capitalization fix), so it has to be set here.
+        bank.set_capitalization(r.capitalization);
+        bank.set_stake_keys(
+            f.stake_delegations
+                .iter()
+                .map(|k| Pubkey::new_from_array(*k))
+                .collect(),
+        );
+        bank.set_reward_inputs(crate::rewards::RewardInputs {
+            feature_set: feature_set.clone(),
+            inflation,
+            capitalization: r.capitalization,
+            slots_per_year: r.slots_per_year,
+            vote_accounts: r
+                .vote_accounts
+                .iter()
+                .map(|k| Pubkey::new_from_array(*k))
+                .collect(),
+        });
+    }
     let mut replayer = crate::Replayer::new_with_feature_set(f.slot, epoch, feature_set);
     crate::register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
     crate::compat::register_removed_builtins(
@@ -173,8 +223,10 @@ pub fn replay_fixture(f: &Fixture) -> anyhow::Result<Hash> {
     if let Some((slot, detail)) = replay.halt {
         anyhow::bail!("fixture slot {slot} halted: {detail:?}");
     }
-    bank.parent_bank_hash()
-        .ok_or_else(|| anyhow::anyhow!("no bank hash after replaying the fixture"))
+    let hash = bank
+        .parent_bank_hash()
+        .ok_or_else(|| anyhow::anyhow!("no bank hash after replaying the fixture"))?;
+    Ok((hash, bank))
 }
 
 #[cfg(test)]

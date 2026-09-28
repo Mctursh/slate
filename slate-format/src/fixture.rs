@@ -17,6 +17,7 @@ pub mod tag {
     pub const BLOCK: u16 = 5;
     pub const ACCOUNTS: u16 = 6;
     pub const REWARD_INPUTS: u16 = 7;
+    pub const STAKE_DELEGATIONS: u16 = 8;
 }
 
 /// Reward-pass inputs a boundary slot needs and an ordinary slot does not. Scalars, not
@@ -45,6 +46,9 @@ pub struct Fixture {
     /// set is derived from them rather than stored, so there is one source of truth.
     pub accounts: Vec<([u8; 32], Vec<u8>)>,
     pub reward_inputs: Option<RewardInputsRecord>,
+    /// agave's stake cache, which a scan of `accounts` cannot reproduce: at slot 349047024 a scan
+    /// finds 1,100,650 delegated accounts against the cache's 1,097,015.
+    pub stake_delegations: Vec<[u8; 32]>,
 }
 
 fn section(out: &mut Vec<u8>, tag: u16, payload: &[u8]) {
@@ -96,6 +100,15 @@ impl Fixture {
             section(&mut sections, tag::REWARD_INPUTS, &p);
             count += 1;
         }
+        if !self.stake_delegations.is_empty() {
+            let mut p = Vec::with_capacity(4 + self.stake_delegations.len() * 32);
+            p.extend_from_slice(&(self.stake_delegations.len() as u32).to_le_bytes());
+            for k in &self.stake_delegations {
+                p.extend_from_slice(k);
+            }
+            section(&mut sections, tag::STAKE_DELEGATIONS, &p);
+            count += 1;
+        }
 
         let mut out = Vec::with_capacity(20 + sections.len());
         out.extend_from_slice(MAGIC);
@@ -128,6 +141,7 @@ impl Fixture {
         let mut block = None;
         let mut accounts = None;
         let mut reward_inputs = None;
+        let mut stake_delegations = Vec::new();
 
         for _ in 0..count {
             let tag = u16::from_le_bytes(r.take(2, "section tag")?.try_into().unwrap());
@@ -152,6 +166,9 @@ impl Fixture {
                 tag::BLOCK => block = Some(payload.to_vec()),
                 tag::ACCOUNTS => accounts = Some(decode_accounts(payload)?),
                 tag::REWARD_INPUTS => reward_inputs = Some(decode_reward_inputs(payload)?),
+                tag::STAKE_DELEGATIONS => {
+                    stake_delegations = decode_pubkeys(payload, "stake delegation")?
+                }
                 _ => {}
             }
         }
@@ -170,6 +187,7 @@ impl Fixture {
             block: block.ok_or(FormatError::MissingSection { tag: tag::BLOCK })?,
             accounts: accounts.ok_or(FormatError::MissingSection { tag: tag::ACCOUNTS })?,
             reward_inputs,
+            stake_delegations,
         })
     }
 }
@@ -189,6 +207,16 @@ fn decode_accounts(p: &[u8]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let pubkey: [u8; 32] = r.take(32, "account pubkey")?.try_into().unwrap();
         let len = u32::from_le_bytes(r.take(4, "account len")?.try_into().unwrap());
         out.push((pubkey, r.take(len as usize, "account record")?.to_vec()));
+    }
+    Ok(out)
+}
+
+fn decode_pubkeys(p: &[u8], field: &'static str) -> Result<Vec<[u8; 32]>> {
+    let mut r = Reader::new(p);
+    let n = u32::from_le_bytes(r.take(4, field)?.try_into().unwrap());
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        out.push(r.take(32, field)?.try_into().unwrap());
     }
     Ok(out)
 }
@@ -244,6 +272,7 @@ mod tests {
                 ),
             ],
             reward_inputs: None,
+            stake_delegations: Vec::new(),
         }
     }
 
@@ -259,6 +288,7 @@ mod tests {
             slots_per_year: 78_892_314.984,
             vote_accounts: vec![[11u8; 32], [12u8; 32]],
         });
+        f.stake_delegations = vec![[21u8; 32], [22u8; 32], [23u8; 32]];
         f
     }
 
@@ -274,6 +304,22 @@ mod tests {
         let back = Fixture::decode(&f.encode()).unwrap();
         assert_eq!(back, f);
         assert_eq!(back.reward_inputs.unwrap().vote_accounts.len(), 2);
+    }
+
+    #[test]
+    fn stake_delegations_survive_and_an_older_fixture_without_them_still_decodes() {
+        let f = boundary();
+        let back = Fixture::decode(&f.encode()).unwrap();
+        assert_eq!(back.stake_delegations.len(), 3);
+
+        let mut older = f.clone();
+        older.stake_delegations.clear();
+        let back = Fixture::decode(&older.encode()).unwrap();
+        assert!(
+            back.stake_delegations.is_empty(),
+            "a fixture written before tag 8 existed must still read"
+        );
+        assert_eq!(back.reward_inputs, f.reward_inputs);
     }
 
     #[test]
