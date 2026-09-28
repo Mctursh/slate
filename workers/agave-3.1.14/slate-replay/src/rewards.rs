@@ -697,9 +697,12 @@ pub fn process_epoch_boundary(
     );
     let delegation_count = bank.stake_delegations().len();
     let new_rate_epoch = new_warmup_cooldown_rate_epoch(feature_set);
+    // The manifest's set is frozen at the seed slot, so voters created since it are missing.
+    let mut vote_cache = inputs.vote_accounts.clone();
+    vote_cache.extend(bank.vote_accounts_written_since(prev_epoch * SLOTS_PER_EPOCH));
     let calculated = calculate_epoch_rewards(
         bank,
-        &inputs.vote_accounts,
+        &vote_cache,
         inflation_rewards.validator_rewards,
         prev_epoch,
         new_rate_epoch,

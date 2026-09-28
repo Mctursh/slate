@@ -156,6 +156,25 @@ impl ReplayBank {
     }
 
     // Union, never replace: a resume's checkpoint set holds keys created after the snapshot was taken.
+    // agave's stakes cache holds voters it has upserted; an abandoned voter's last write predates the rewarded epoch.
+    pub fn vote_accounts_written_since(&self, since_slot: u64) -> HashSet<Pubkey> {
+        use solana_account::ReadableAccount;
+        let mut candidates = Vec::new();
+        self.store.scan(&mut |pubkey, account| {
+            if *account.owner() == solana_sdk_ids::vote::id() && account.lamports() > 0 {
+                candidates.push(pubkey);
+            }
+        });
+        candidates
+            .into_iter()
+            .filter(|pubkey| {
+                self.store
+                    .get(pubkey)
+                    .is_some_and(|(_, slot)| slot >= since_slot)
+            })
+            .collect()
+    }
+
     pub fn extend_stake_keys(&mut self, keys: HashSet<Pubkey>) {
         self.stake_keys.extend(keys);
     }
