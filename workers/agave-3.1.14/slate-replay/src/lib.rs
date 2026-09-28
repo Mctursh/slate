@@ -1,10 +1,10 @@
 pub mod backfill;
 pub mod bankhash;
-#[cfg(feature = "boundary-fixtures")]
-pub mod boundary_fixtures;
 pub mod block;
 pub mod boundary;
 pub mod compat;
+#[cfg(feature = "boundary-fixtures")]
+pub mod boundary_fixtures;
 pub mod fixture_capture;
 pub mod source;
 pub mod store;
@@ -136,6 +136,12 @@ pub struct WriteRecord {
     pub pubkey: Pubkey,
     pub account: AccountSharedData,
 }
+
+// Read once: this is consulted on every replayed block.
+static DUMP_CHANGES: std::sync::LazyLock<Option<(u64, String)>> = std::sync::LazyLock::new(|| {
+    let slot = std::env::var("SLATE_DUMP_CHANGES").ok()?.parse().ok()?;
+    Some((slot, std::env::var("SLATE_CHANGES_OUT").ok()?))
+});
 
 impl ReplayBank {
     // Unlike get_account_shared_data, counts zero-lamport tombstones.
@@ -1139,6 +1145,27 @@ impl Replayer {
                 .sum();
             // Evict any program upgraded this slot; the same changes then roll into the lattice.
             let changes = bank.take_slot_changes();
+            if let Some((want, out)) = DUMP_CHANGES.as_ref()
+                && *want == block.slot
+            {
+                use solana_account::ReadableAccount;
+                use std::io::Write as _;
+                let mut f =
+                    std::io::BufWriter::new(std::fs::File::create(&out).expect("changes out"));
+                for (pk, _, new) in &changes {
+                    let hex: String = new.data().iter().map(|b| format!("{b:02x}")).collect();
+                    writeln!(
+                        f,
+                        "{pk} lam={} own={} exec={} dlen={} data={hex}",
+                        new.lamports(),
+                        new.owner(),
+                        new.executable() as u8,
+                        new.data().len()
+                    )
+                    .unwrap();
+                }
+                eprintln!("changes dump: {} accounts -> {out}", changes.len());
+            }
             self.invalidate_upgraded_programs(&changes);
             if let Some(bank_hash) =
                 bank.finalize_slot_bankhash(&changes, signature_count, &block.blockhash)

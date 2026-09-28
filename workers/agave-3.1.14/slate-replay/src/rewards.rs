@@ -396,12 +396,63 @@ pub struct Distributed {
 
 // agave store_stake_accounts_in_partition: credit the CURRENT balance, write the calculation-time
 // Stake over it, and burn rather than pay if the account stopped qualifying since calculation.
+// Read once: distribute_partition runs on every distribution block.
+static DUMP_REWARD_SLOTS: std::sync::LazyLock<Vec<u64>> = std::sync::LazyLock::new(|| {
+    std::env::var("SLATE_DUMP_REWARDS_SLOTS")
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+});
+
 pub fn distribute_partition(
     bank: &mut ReplayBank,
     partition: &[StakeReward],
     slot: u64,
 ) -> Distributed {
     use solana_account::{ReadableAccount, WritableAccount};
+    let dump = DUMP_REWARD_SLOTS.contains(&slot);
+    if dump {
+        let mut body = String::from(
+            "pubkey reward old_lam new_lam old_credits new_credits voter new_stake old_stake act_epoch deact_epoch data_len flags\n",
+        );
+        for r in partition {
+            let cur = bank
+                .get_account_shared_data(&r.stake_pubkey)
+                .and_then(|(a, _)| stake_state_of(&a).map(|st| (a, st)));
+            let (old_lam, old_credits, old_stake, data_len, flags) = match &cur {
+                Some((a, StakeStateV2::Stake(_, st, fl))) => (
+                    a.lamports(),
+                    st.credits_observed,
+                    st.delegation.stake,
+                    a.data().len(),
+                    format!("{fl:?}"),
+                ),
+                Some((a, other)) => (a.lamports(), 0, 0, a.data().len(), format!("NOT-STAKE:{other:?}")),
+                None => (0, 0, 0, 0, "ABSENT".to_string()),
+            };
+            let d = &r.stake.delegation;
+            body.push_str(&format!(
+                "{} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+                r.stake_pubkey,
+                r.lamports,
+                old_lam,
+                old_lam.saturating_add(r.lamports),
+                old_credits,
+                r.stake.credits_observed,
+                d.voter_pubkey,
+                d.stake,
+                old_stake,
+                d.activation_epoch,
+                d.deactivation_epoch,
+                data_len,
+                flags.replace(' ', ""),
+            ));
+        }
+        let _ = std::fs::write(format!("/tmp/slate-rewards-{slot}.txt"), body);
+    }
     let mut out = Distributed::default();
     for reward in partition {
         let current = bank
@@ -435,6 +486,14 @@ pub fn distribute_partition(
         .saturating_add(out.credited)
         .saturating_add(out.burned);
     write_epoch_rewards(bank, &rewards, slot);
+    if dump {
+        eprintln!(
+            "reward-dump slot {slot}: entries {}, credited {}, burned {}",
+            partition.len(),
+            out.credited,
+            out.burned
+        );
+    }
     out
 }
 
