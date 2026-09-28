@@ -112,7 +112,7 @@ pub fn load_accounts_with_stakes<R: Read>(
             let is_stake = crossing && *account.owner() == solana_sdk_ids::stake::id();
             let is_vote = crossing && *account.owner() == solana_sdk_ids::vote::id();
             // A deletion record has a ZEROED owner, so an owner sweep would drop it and resurrect the account.
-            let is_tombstone = crossing && account.lamports() == 0;
+            let is_tombstone = account.lamports() == 0;
             // Filter during parse to bound memory: keep footprint (seed) or program-owned (persist).
             let keep = is_stake
                 || is_vote
@@ -175,8 +175,13 @@ pub fn stream_into_store<R: Read>(
             let crossing = stake_keys.is_some();
             let is_stake = crossing && *account.owner() == solana_sdk_ids::stake::id();
             let is_vote = crossing && *account.owner() == solana_sdk_ids::vote::id();
-            let keep =
-                is_owned || is_stake || is_vote || footprint.is_none_or(|f| f.contains(&pubkey));
+            // A deletion record's owner is zeroed, so it fails every owner test above.
+            let is_tombstone = account.lamports() == 0;
+            let keep = is_owned
+                || is_stake
+                || is_vote
+                || is_tombstone
+                || footprint.is_none_or(|f| f.contains(&pubkey));
             if !keep {
                 continue;
             }
