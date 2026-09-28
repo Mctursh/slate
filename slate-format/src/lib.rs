@@ -1,4 +1,4 @@
-//! On-disk byte formats: the account record and the resume checkpoint.
+//! On-disk byte formats: the account record, the resume checkpoint, and the slot fixture.
 //!
 //! Cross-era contracts. A checkpoint may be read by a different binary linking a
 //! different agave, so the layouts are spelled out here rather than being whatever
@@ -14,15 +14,19 @@ use std::fmt;
 #[derive(Debug, PartialEq, Eq)]
 pub enum FormatError {
     BadMagic,
+    BadFixtureMagic,
     UnknownCheckpointVersion(u32),
+    UnknownFixtureVersion(u32),
     UnknownAccountFormat(u32),
     Truncated { field: &'static str },
+    MissingSection { tag: u16 },
 }
 
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::BadMagic => write!(f, "not a slate checkpoint (bad magic)"),
+            Self::BadFixtureMagic => write!(f, "not a slate fixture (bad magic)"),
             Self::UnknownCheckpointVersion(v) => write!(
                 f,
                 "checkpoint format v{v}, this build understands v{CHECKPOINT_VERSION}"
@@ -31,14 +35,24 @@ impl fmt::Display for FormatError {
                 f,
                 "account record format v{v}, this build understands v{ACCOUNT_FORMAT_VERSION}"
             ),
+            Self::UnknownFixtureVersion(v) => write!(
+                f,
+                "fixture format v{v}, this build understands v{}",
+                fixture::FIXTURE_VERSION
+            ),
             Self::Truncated { field } => write!(f, "checkpoint truncated reading `{field}`"),
+            Self::MissingSection { tag } => {
+                write!(f, "fixture is missing required section {tag}")
+            }
         }
     }
 }
 
 impl std::error::Error for FormatError {}
 
-type Result<T> = std::result::Result<T, FormatError>;
+pub(crate) type Result<T> = std::result::Result<T, FormatError>;
+
+pub mod fixture;
 
 // ---------------------------------------------------------------- account record
 
@@ -249,17 +263,17 @@ impl Checkpoint {
 // So a corrupt length can't allocate gigabytes before the read that would reject it.
 const MAX_PREALLOC: usize = 1 << 20;
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
-    fn take(&mut self, n: usize, field: &'static str) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize, field: &'static str) -> Result<&'a [u8]> {
         let end = self
             .at
             .checked_add(n)

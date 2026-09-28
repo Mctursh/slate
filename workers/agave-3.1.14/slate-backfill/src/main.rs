@@ -70,6 +70,14 @@ struct Args {
     /// Helius; raise it (16-32) for an unmetered local yellowstone-faithful.
     #[arg(long, default_value_t = 1)]
     fetch_concurrency: usize,
+    /// Capture a replayable fixture at these slots (comma separated). Written only once the
+    /// slot's bank hash is confirmed by a consensus vote, and a vote landing in the next
+    /// --chunk-slots chunk is too late, so a slot near a chunk edge may report unwritten.
+    #[arg(long, value_delimiter = ',')]
+    fixture_at: Vec<u64>,
+    /// Where to write captured fixtures. Required with --fixture-at.
+    #[arg(long)]
+    fixture_dir: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -79,6 +87,20 @@ fn main() -> anyhow::Result<()> {
     if args.from >= args.to {
         anyhow::bail!(
             "--from ({}) must be below --to ({}); the range (from, to] would be empty",
+            args.from,
+            args.to
+        );
+    }
+    if !args.fixture_at.is_empty() && args.fixture_dir.is_none() {
+        anyhow::bail!("--fixture-at needs --fixture-dir");
+    }
+    if let Some(bad) = args
+        .fixture_at
+        .iter()
+        .find(|s| **s <= args.from || **s > args.to)
+    {
+        anyhow::bail!(
+            "--fixture-at {bad} is outside the replayed range ({}, {}]",
             args.from,
             args.to
         );
@@ -123,9 +145,7 @@ fn main() -> anyhow::Result<()> {
         Some(path)
     };
     if args.resume {
-        println!(
-            "preflight ok: RPC, program, config, and ClickHouse check out (resume)"
-        );
+        println!("preflight ok: RPC, program, config, and ClickHouse check out (resume)");
     } else {
         println!("preflight ok: RPC, program, config, ClickHouse, and snapshot all check out");
     }
@@ -215,6 +235,12 @@ fn main() -> anyhow::Result<()> {
             verify_end,
             args.resume,
             reward_inputs,
+            args.fixture_dir.as_ref().map(|dir| {
+                slate_replay::fixture_capture::FixtureCapture::new(
+                    args.fixture_at.iter().copied().collect(),
+                    dir,
+                )
+            }),
     )
         .await?;
         match &result.replay.halt {
