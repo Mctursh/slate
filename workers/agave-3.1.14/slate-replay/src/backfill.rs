@@ -131,7 +131,14 @@ pub async fn backfill(
             let programdata = block::programdata_addresses(&fp);
             fp.extend(programdata);
             fp.insert(solana_sdk_ids::sysvar::slot_hashes::id());
-            let missing: HashSet<Pubkey> = fp.into_iter().filter(|k| !bank.contains(k)).collect();
+            // contains() counts a stale tombstone as present, so re-ask for dead rows too.
+            let missing: HashSet<Pubkey> = fp
+                .into_iter()
+                .filter(|k| {
+                    use solana_account::ReadableAccount;
+                    bank.store().get(k).is_none_or(|(a, _)| a.lamports() == 0)
+                })
+                .collect();
             if !missing.is_empty() || crosses_epoch {
                 // A resume into a crossing needs every stake/vote account: absent ones are dropped silently.
                 let mut collected = HashSet::new();
@@ -142,13 +149,20 @@ pub async fn backfill(
                     None,
                     crosses_epoch.then_some(&mut collected),
                 )?;
+                let mut revived = 0usize;
                 for (pubkey, (account, slot)) in &accounts {
-                    if !bank.contains(pubkey) {
-                        bank.insert(*pubkey, account.clone(), *slot);
+                    match bank.store().get(pubkey) {
+                        None => bank.insert(*pubkey, account.clone(), *slot),
+                        // Strictly newer only: never resurrect a close the replay itself performed.
+                        Some((_, have)) if *slot > have => {
+                            bank.insert(*pubkey, account.clone(), *slot);
+                            revived += 1;
+                        }
+                        Some(_) => {}
                     }
                 }
                 eprintln!(
-                    "resume: {} accounts outside the seeded range seeded from the snapshot{}",
+                    "resume: {} accounts outside the seeded range seeded from the snapshot ({revived} stale dead rows outranked){}",
                     missing.len(),
                     if crosses_epoch {
                         format!(", plus {} stake accounts for the crossing", collected.len())
