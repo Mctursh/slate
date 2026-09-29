@@ -18,6 +18,7 @@ pub mod tag {
     pub const ACCOUNTS: u16 = 6;
     pub const REWARD_INPUTS: u16 = 7;
     pub const STAKE_DELEGATIONS: u16 = 8;
+    pub const CAPITALIZATION: u16 = 9;
 }
 
 /// Reward-pass inputs a boundary slot needs and an ordinary slot does not. Scalars, not
@@ -49,6 +50,8 @@ pub struct Fixture {
     /// agave's stake cache, which a scan of `accounts` cannot reproduce: at slot 349047024 a scan
     /// finds 1,100,650 delegated accounts against the cache's 1,097,015.
     pub stake_delegations: Vec<[u8; 32]>,
+    /// Absent in fixtures captured before tag 9; freeze burns fees, so a bank starting at 0 underflows.
+    pub capitalization: Option<u64>,
 }
 
 fn section(out: &mut Vec<u8>, tag: u16, payload: &[u8]) {
@@ -109,6 +112,10 @@ impl Fixture {
             section(&mut sections, tag::STAKE_DELEGATIONS, &p);
             count += 1;
         }
+        if let Some(c) = self.capitalization {
+            section(&mut sections, tag::CAPITALIZATION, &c.to_le_bytes());
+            count += 1;
+        }
 
         let mut out = Vec::with_capacity(20 + sections.len());
         out.extend_from_slice(MAGIC);
@@ -142,6 +149,7 @@ impl Fixture {
         let mut accounts = None;
         let mut reward_inputs = None;
         let mut stake_delegations = Vec::new();
+        let mut capitalization = None;
 
         for _ in 0..count {
             let tag = u16::from_le_bytes(r.take(2, "section tag")?.try_into().unwrap());
@@ -169,6 +177,9 @@ impl Fixture {
                 tag::STAKE_DELEGATIONS => {
                     stake_delegations = decode_pubkeys(payload, "stake delegation")?
                 }
+                tag::CAPITALIZATION => {
+                    capitalization = Some(u64::from_le_bytes(take_exact(payload, 8, "capitalization")?))
+                }
                 _ => {}
             }
         }
@@ -188,6 +199,7 @@ impl Fixture {
             accounts: accounts.ok_or(FormatError::MissingSection { tag: tag::ACCOUNTS })?,
             reward_inputs,
             stake_delegations,
+            capitalization,
         })
     }
 }

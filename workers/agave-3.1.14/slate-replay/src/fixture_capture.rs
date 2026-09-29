@@ -23,6 +23,7 @@ struct Pending {
     accounts: Vec<([u8; 32], Vec<u8>)>,
     reward_inputs: Option<RewardInputsRecord>,
     stake_delegations: Vec<[u8; 32]>,
+    capitalization: u64,
 }
 
 pub struct FixtureCapture {
@@ -68,9 +69,10 @@ impl FixtureCapture {
         };
 
         let mut keys = crate::block::footprint(std::slice::from_ref(block));
-        keys.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
         let programdata = crate::block::programdata_addresses(&keys);
         keys.extend(programdata);
+        // A TowerSync vote reads SlotHashes from the sysvar cache without declaring it as a key.
+        keys.insert(solana_sdk_ids::sysvar::slot_hashes::id());
 
         let mut sorted: Vec<Pubkey> = keys.into_iter().collect();
         sorted.sort_unstable();
@@ -100,6 +102,7 @@ impl FixtureCapture {
                 accounts,
                 reward_inputs: None,
                 stake_delegations: Vec::new(),
+                capitalization: bank.capitalization(),
             },
         );
     }
@@ -123,12 +126,23 @@ impl FixtureCapture {
             accounts: p.accounts,
             reward_inputs: p.reward_inputs,
             stake_delegations: p.stake_delegations,
+            capitalization: Some(p.capitalization),
         };
+        // A live hash match does not prove the captured inputs are sufficient: replay them.
+        match replay_fixture_with_bank(&fixture) {
+            Ok((got, _)) if got == vote => {}
+            Ok((got, _)) => anyhow::bail!(
+                "refusing to write fixture for slot {slot}: inputs replay to {got}, vote {vote}"
+            ),
+            Err(e) => {
+                anyhow::bail!("refusing to write fixture for slot {slot}: inputs do not replay: {e}")
+            }
+        }
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("slot-{slot}.slfix"));
         std::fs::write(&path, fixture.encode())?;
         eprintln!(
-            "fixture: wrote {} ({} accounts, vote-confirmed)",
+            "fixture: wrote {} ({} accounts, replay-verified)",
             path.display(),
             fixture.accounts.len()
         );
@@ -139,9 +153,14 @@ impl FixtureCapture {
 
 /// Decode a `.slfix` file and replay it, returning the bank hash it produces.
 pub fn replay_fixture_file(path: impl AsRef<Path>) -> anyhow::Result<(Hash, [u8; 32])> {
-    let bytes = std::fs::read(path.as_ref())?;
-    let f =
-        Fixture::decode(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.as_ref().display()))?;
+    let path = path.as_ref();
+    let raw = std::fs::read(path)?;
+    let bytes = if path.extension().is_some_and(|e| e == "zst") {
+        zstd::decode_all(&raw[..])?
+    } else {
+        raw
+    };
+    let f = Fixture::decode(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     let got = replay_fixture(&f)?;
     Ok((got, f.expected_bank_hash))
 }
@@ -174,6 +193,11 @@ pub fn replay_fixture_with_bank(f: &Fixture) -> anyhow::Result<(Hash, ReplayBank
         f.parent_lt_hash.clone(),
         Hash::new_from_array(f.parent_bank_hash),
     );
+
+    // Freeze folds the slot's lamport deltas in, so a bank starting at 0 underflows on burned fees.
+    if let Some(c) = f.capitalization {
+        bank.set_capitalization(c);
+    }
 
     let block: Block = bincode::deserialize(&f.block)?;
     let epoch = crate::epoch_of(f.slot);
@@ -266,12 +290,25 @@ mod tests {
 
     #[test]
     fn a_confirmed_slot_is_written_and_decodes_back() {
-        let (bank, block) = bank_and_block();
+        let (mut bank, block) = bank_and_block();
+        seed_all_features(&mut bank, block.slot - 1);
         let dir = capture_dir("confirmed");
         let mut cap = FixtureCapture::new(HashSet::from([block.slot]), &dir);
         cap.snapshot(&bank, &block);
 
-        let h = Hash::new_unique();
+        let epoch = crate::epoch_of(block.slot);
+        let feature_set = crate::build_feature_set(&bank, block.slot);
+        bank.set_feature_set(feature_set.clone());
+        let mut replayer = crate::Replayer::new_with_feature_set(block.slot, epoch, feature_set);
+        crate::register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
+        crate::compat::register_removed_builtins(
+            &mut bank,
+            &replayer.processor,
+            replayer.feature_set(),
+        );
+        replayer.replay_range(&mut bank, std::slice::from_ref(&block));
+        let h = bank.parent_bank_hash().expect("a bank hash");
+
         cap.confirm(block.slot, h, h).unwrap();
 
         assert_eq!(cap.written(), &[block.slot]);
