@@ -3,6 +3,9 @@ pub mod bankhash;
 pub mod block;
 pub mod boundary;
 pub mod compat;
+#[cfg(feature = "boundary-fixtures")]
+pub mod boundary_fixtures;
+pub mod fixture_capture;
 pub mod source;
 pub mod store;
 use store::{AccountStore, MemStore};
@@ -134,6 +137,12 @@ pub struct WriteRecord {
     pub account: AccountSharedData,
 }
 
+// Read once: this is consulted on every replayed block.
+static DUMP_CHANGES: std::sync::LazyLock<Option<(u64, String)>> = std::sync::LazyLock::new(|| {
+    let slot = std::env::var("SLATE_DUMP_CHANGES").ok()?.parse().ok()?;
+    Some((slot, std::env::var("SLATE_CHANGES_OUT").ok()?))
+});
+
 impl ReplayBank {
     // Unlike get_account_shared_data, counts zero-lamport tombstones.
     pub fn contains(&self, key: &Pubkey) -> bool {
@@ -155,6 +164,25 @@ impl ReplayBank {
     }
 
     // Union, never replace: a resume's checkpoint set holds keys created after the snapshot was taken.
+    // agave's stakes cache holds voters it has upserted; an abandoned voter's last write predates the rewarded epoch.
+    pub fn vote_accounts_written_since(&self, since_slot: u64) -> HashSet<Pubkey> {
+        use solana_account::ReadableAccount;
+        let mut candidates = Vec::new();
+        self.store.scan(&mut |pubkey, account| {
+            if *account.owner() == solana_sdk_ids::vote::id() && account.lamports() > 0 {
+                candidates.push(pubkey);
+            }
+        });
+        candidates
+            .into_iter()
+            .filter(|pubkey| {
+                self.store
+                    .get(pubkey)
+                    .is_some_and(|(_, slot)| slot >= since_slot)
+            })
+            .collect()
+    }
+
     pub fn extend_stake_keys(&mut self, keys: HashSet<Pubkey>) {
         self.stake_keys.extend(keys);
     }
@@ -254,6 +282,10 @@ impl ReplayBank {
     // Last finalized slot's bank hash, prepended into SlotHashes for the next slot; None if the roll isn't active.
     pub fn parent_bank_hash(&self) -> Option<Hash> {
         self.bankhash_roller.as_ref().map(|r| r.bank_hash())
+    }
+
+    pub fn parent_lt_hash(&self) -> Option<LtHash> {
+        self.bankhash_roller.as_ref().map(|r| r.lt_hash().clone())
     }
 
     // Durably checkpoint at `slot`: accounts + everything a resume needs, in one atomic commit.
@@ -736,6 +768,7 @@ pub struct Replayer {
     feature_set: FeatureSet,
     // SVM view of feature_set, held once for the per-batch environment.
     svm_feature_set: SVMFeatureSet,
+    fixture_capture: Option<crate::fixture_capture::FixtureCapture>,
 }
 
 // invoke_units drops 1000 -> 946 when SIMD-0339 is active; the processor defaults to 1000 forever unless told.
@@ -760,6 +793,14 @@ fn program_runtime_v1(svm_feature_set: &SVMFeatureSet) -> ProgramRuntimeEnvironm
 }
 
 impl Replayer {
+    pub fn capture_fixtures(&mut self, capture: crate::fixture_capture::FixtureCapture) {
+        self.fixture_capture = Some(capture);
+    }
+
+    pub fn take_fixture_capture(&mut self) -> Option<crate::fixture_capture::FixtureCapture> {
+        self.fixture_capture.take()
+    }
+
     // The exact per-slot feature set, used to gate compat shims (e.g. re-supplied removed builtins).
     pub fn feature_set(&self) -> &FeatureSet {
         &self.feature_set
@@ -785,6 +826,7 @@ impl Replayer {
         processor.set_execution_cost(execution_cost(&feature_set));
         Self {
             _fork_graph: fork_graph,
+            fixture_capture: None,
             processor,
             feature_set,
             svm_feature_set,
@@ -965,7 +1007,8 @@ impl Replayer {
             }
             set.extend(crate::block::programdata_addresses(&set));
             set.insert(solana_sdk_ids::sysvar::slot_hashes::id());
-            let mut f = std::io::BufWriter::new(std::fs::File::create(&out).expect("footprint out"));
+            let mut f =
+                std::io::BufWriter::new(std::fs::File::create(&out).expect("footprint out"));
             let mut n = 0usize;
             for pk in &set {
                 if let Some((a, _)) = bank.get_account_shared_data(pk) {
@@ -983,7 +1026,11 @@ impl Replayer {
                 }
             }
             f.flush().unwrap();
-            eprintln!("FOOTPRINT slot {} wrote {n} of {} keys -> {out}", block.slot, set.len());
+            eprintln!(
+                "FOOTPRINT slot {} wrote {n} of {} keys -> {out}",
+                block.slot,
+                set.len()
+            );
         }
         // With the roll active, record slot writes and prepend the parent's bank hash into SlotHashes (like the runtime) so votes read real recent history.
         let rolling = bank.parent_bank_hash().is_some();
@@ -1098,6 +1145,27 @@ impl Replayer {
                 .sum();
             // Evict any program upgraded this slot; the same changes then roll into the lattice.
             let changes = bank.take_slot_changes();
+            if let Some((want, out)) = DUMP_CHANGES.as_ref()
+                && *want == block.slot
+            {
+                use solana_account::ReadableAccount;
+                use std::io::Write as _;
+                let mut f =
+                    std::io::BufWriter::new(std::fs::File::create(&out).expect("changes out"));
+                for (pk, _, new) in &changes {
+                    let hex: String = new.data().iter().map(|b| format!("{b:02x}")).collect();
+                    writeln!(
+                        f,
+                        "{pk} lam={} own={} exec={} dlen={} data={hex}",
+                        new.lamports(),
+                        new.owner(),
+                        new.executable() as u8,
+                        new.data().len()
+                    )
+                    .unwrap();
+                }
+                eprintln!("changes dump: {} accounts -> {out}", changes.len());
+            }
             self.invalidate_upgraded_programs(&changes);
             if let Some(bank_hash) =
                 bank.finalize_slot_bankhash(&changes, signature_count, &block.blockhash)
@@ -1116,6 +1184,7 @@ impl Replayer {
         let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
         let mut confirmed: HashMap<u64, Hash> = HashMap::new();
         let mut verified = 0usize;
+        let mut capture = self.fixture_capture.take();
 
         for (completed, block) in blocks.iter().enumerate() {
             // Harvest this block's votes; reconcile any slot we've already computed.
@@ -1138,7 +1207,14 @@ impl Replayer {
                             )),
                         };
                     }
-                    Some(_) => verified += 1,
+                    Some((got, _)) => {
+                        verified += 1;
+                        if let Some(c) = &mut capture
+                            && let Err(e) = c.confirm(slot, got, vote_hash)
+                        {
+                            eprintln!("fixture: {e}");
+                        }
+                    }
                     None => {
                         confirmed.entry(slot).or_insert(vote_hash);
                     }
@@ -1146,6 +1222,9 @@ impl Replayer {
             }
 
             let epoch = epoch_of(block.slot);
+            if let Some(c) = &mut capture {
+                c.snapshot(bank, block);
+            }
             let processor = self.processor.new_from(block.slot, epoch);
             let block_replay = self.replay_block_with(&processor, bank, block, epoch);
             if !block_replay.is_complete() {
@@ -1172,13 +1251,22 @@ impl Replayer {
                             )),
                         };
                     }
-                    Some(_) => verified += 1,
+                    Some(vote_hash) => {
+                        verified += 1;
+                        if let Some(c) = &mut capture
+                            && let Err(e) = c.confirm(block.slot, got, vote_hash)
+                        {
+                            eprintln!("fixture: {e}");
+                        }
+                    }
                     None => {
                         computed.insert(block.slot, (got, completed));
                     }
                 }
             }
         }
+
+        self.fixture_capture = capture;
 
         // The tail (~30 slots) can't be confirmed here, their votes fall past the range end, so they're unverified, not wrong.
         let mut unconfirmed: Vec<u64> = computed.keys().copied().collect();

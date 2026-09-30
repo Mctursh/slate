@@ -43,6 +43,7 @@ pub async fn backfill(
     verify_end: Option<Box<dyn Read>>,
     resume: bool,
     reward_inputs: Option<rewards::ManifestRewardInputs>,
+    fixture_capture: Option<crate::fixture_capture::FixtureCapture>,
 ) -> Result<BackfillReport> {
     let crosses_epoch = epoch_of(from) != epoch_of(to);
     ensure_single_epoch(from, to, reward_inputs.is_some())?;
@@ -60,9 +61,20 @@ pub async fn backfill(
     // Footprint pass: stream the range once to build the seed set. A resume skips the seed, so this only runs then if the boundary diff needs it to filter the end snapshot.
     let mut footprint = HashSet::new();
     if !resume || verify_end.is_some() {
+        eprintln!(
+            "footprint pass: fetching {} blocks to build the seed set",
+            slots.len()
+        );
+        let mut fetched = 0usize;
         for chunk in slots.chunks(chunk_slots) {
             let blocks = fetch_chunk(&source, chunk).await?;
             block::extend_footprint(&mut footprint, &blocks);
+            fetched += chunk.len();
+            eprintln!(
+                "footprint pass: {fetched}/{} slots fetched, {} accounts so far",
+                slots.len(),
+                footprint.len()
+            );
         }
         block::footprint_fixed(&mut footprint);
         // programData PDAs and SlotHashes are read, not declared as keys, so the footprint misses them.
@@ -94,18 +106,39 @@ pub async fn backfill(
         eprintln!("resuming after checkpoint at slot {}", restored.slot);
 
         // Extending --to must seed the new slots' accounts; a missing one reads as absent.
-        let pending: Vec<u64> = slots.iter().copied().filter(|s| *s > restored.slot).collect();
+        let pending: Vec<u64> = slots
+            .iter()
+            .copied()
+            .filter(|s| *s > restored.slot)
+            .collect();
         if !pending.is_empty() {
+            eprintln!(
+                "footprint top-up: fetching {} blocks past the checkpoint",
+                pending.len()
+            );
             let mut fp = HashSet::new();
+            let mut fetched = 0usize;
             for chunk in pending.chunks(chunk_slots) {
                 let blocks = fetch_chunk(&source, chunk).await?;
                 block::extend_footprint(&mut fp, &blocks);
+                fetched += chunk.len();
+                eprintln!(
+                    "footprint top-up: {fetched}/{} slots fetched",
+                    pending.len()
+                );
             }
             block::footprint_fixed(&mut fp);
             let programdata = block::programdata_addresses(&fp);
             fp.extend(programdata);
             fp.insert(solana_sdk_ids::sysvar::slot_hashes::id());
-            let missing: HashSet<Pubkey> = fp.into_iter().filter(|k| !bank.contains(k)).collect();
+            // contains() counts a stale tombstone as present, so re-ask for dead rows too.
+            let missing: HashSet<Pubkey> = fp
+                .into_iter()
+                .filter(|k| {
+                    use solana_account::ReadableAccount;
+                    bank.store().get(k).is_none_or(|(a, _)| a.lamports() == 0)
+                })
+                .collect();
             if !missing.is_empty() || crosses_epoch {
                 // A resume into a crossing needs every stake/vote account: absent ones are dropped silently.
                 let mut collected = HashSet::new();
@@ -116,13 +149,20 @@ pub async fn backfill(
                     None,
                     crosses_epoch.then_some(&mut collected),
                 )?;
+                let mut revived = 0usize;
                 for (pubkey, (account, slot)) in &accounts {
-                    if !bank.contains(pubkey) {
-                        bank.insert(*pubkey, account.clone(), *slot);
+                    match bank.store().get(pubkey) {
+                        None => bank.insert(*pubkey, account.clone(), *slot),
+                        // Strictly newer only: never resurrect a close the replay itself performed.
+                        Some((_, have)) if *slot > have => {
+                            bank.insert(*pubkey, account.clone(), *slot);
+                            revived += 1;
+                        }
+                        Some(_) => {}
                     }
                 }
                 eprintln!(
-                    "resume: {} accounts outside the seeded range seeded from the snapshot{}",
+                    "resume: {} accounts outside the seeded range seeded from the snapshot ({revived} stale dead rows outranked){}",
                     missing.len(),
                     if crosses_epoch {
                         format!(", plus {} stake accounts for the crossing", collected.len())
@@ -137,6 +177,7 @@ pub async fn backfill(
         }
         (bank, Vec::new(), restored.slot, Some(restored))
     } else {
+        eprintln!("seeding accounts from the snapshot");
         let (mut bank, baseline) = match account_store {
             AccountStoreChoice::Memory => {
                 let accounts = snapshot::load_accounts(snapshot, Some(&footprint), Some(program))?;
@@ -187,6 +228,9 @@ pub async fn backfill(
     // On resume, replay only the slots past the checkpoint; earlier ones are already persisted.
     let replay_slots: Vec<u64> = slots.into_iter().filter(|&s| s > resume_from).collect();
     let mut covered_hi = resume_from;
+    if !replay_slots.is_empty() {
+        eprintln!("replaying {} slots", replay_slots.len());
+    }
     let result = if let Some(&first_slot) = replay_slots.first() {
         let epoch = epoch_of(first_slot);
         let feature_set = build_feature_set(&bank, first_slot);
@@ -229,6 +273,9 @@ pub async fn backfill(
         register_builtins(&mut bank, &replayer.processor, replayer.feature_set());
         // Compat: re-supply native builtins agave deleted post core-BPF migration (e.g. Stake), gated per feature so it's a no-op once active.
         compat::register_removed_builtins(&mut bank, &replayer.processor, replayer.feature_set());
+        if let Some(c) = fixture_capture {
+            replayer.capture_fixtures(c);
+        }
 
         let mut completed = 0usize;
         let mut halt = None;
@@ -255,6 +302,16 @@ pub async fn backfill(
             }
             // Checkpoint clean chunks only. On a halt the roller sits one slot past covered_hi, so we skip it and let the halting chunk's buffered writes drop unflushed; resume re-runs that chunk.
             bank.checkpoint(covered_hi)?;
+        }
+        if let Some(c) = replayer.take_fixture_capture() {
+            let unconfirmed = c.unconfirmed();
+            eprintln!("fixture: wrote {} slot(s)", c.written().len());
+            if !unconfirmed.is_empty() {
+                eprintln!(
+                    "fixture: {} slot(s) never vote-confirmed in their chunk, nothing written: {unconfirmed:?}",
+                    unconfirmed.len()
+                );
+            }
         }
         RangeReplay {
             blocks_completed: completed,
@@ -464,6 +521,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .expect("backfill");
@@ -543,6 +601,7 @@ mod tests {
             2000,
             Some(Box::new(SNAPSHOT)),
             false,
+            None,
             None,
         )
         .await
@@ -650,6 +709,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .expect("fresh run");
@@ -669,6 +729,7 @@ mod tests {
             1,
             None,
             true,
+            None,
             None,
         )
         .await

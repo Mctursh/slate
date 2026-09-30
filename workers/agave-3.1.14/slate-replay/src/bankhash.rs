@@ -2,7 +2,7 @@
 // computation lives in slate-hash so every era shares one implementation.
 
 use slate_hash::LtHash;
-use solana_account::{AccountSharedData, ReadableAccount};
+use solana_account::{AccountSharedData, ReadableAccount, WritableAccount};
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 
@@ -33,6 +33,18 @@ pub fn bank_hash(
     ))
 }
 
+// Divergence-hunt targets, read once: roll_slot runs per slot and must not touch the environment.
+static SEARCH_TARGET: std::sync::LazyLock<Option<Hash>> = std::sync::LazyLock::new(|| {
+    std::env::var("SLATE_HASH_SEARCH_TARGET")
+        .ok()
+        .and_then(|raw| raw.parse::<Hash>().ok())
+});
+static REVERT_LISTS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    std::env::var("SLATE_HASH_REVERT_LIST")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default()
+});
+
 // Rolls the lattice forward per slot (mix out old, in new) and computes each bank hash, parent for the next slot and the SlotHashes entry.
 pub struct BankHashRoller {
     lt_hash: LtHash,
@@ -60,14 +72,208 @@ impl BankHashRoller {
         signature_count: u64,
         blockhash: &Hash,
     ) -> Hash {
+        let parent = self.bank_hash;
         for (pubkey, old, new) in changes {
             if let Some(old) = old {
                 self.lt_hash.mix_out(&lt_hash_account(pubkey, old));
             }
             self.lt_hash.mix_in(&lt_hash_account(pubkey, new));
         }
-        self.bank_hash = bank_hash(&self.bank_hash, signature_count, blockhash, &self.lt_hash);
+        self.bank_hash = bank_hash(&parent, signature_count, blockhash, &self.lt_hash);
+        for pubkey in self.search_single_account(&parent, changes, signature_count, blockhash) {
+            eprintln!("hash-search HIT: target reached by reverting {pubkey}");
+        }
+        for label in self.search_subsets(&parent, changes, signature_count, blockhash) {
+            eprintln!("hash-search SUBSET HIT: target reached by reverting {label}");
+        }
+        for label in self.search_variants(&parent, changes, signature_count, blockhash) {
+            eprintln!("hash-search VARIANT HIT: {label}");
+        }
+        if let Some(label) = self.search_revert_list(&parent, changes, signature_count, blockhash) {
+            eprintln!("hash-search LIST HIT: {label}");
+        }
         self.bank_hash
+    }
+
+    fn search_single_account(
+        &self,
+        parent: &Hash,
+        changes: &[SlotChange],
+        signature_count: u64,
+        blockhash: &Hash,
+    ) -> Vec<Pubkey> {
+        let Some(target) = *SEARCH_TARGET else {
+            return Vec::new();
+        };
+        self.revert_candidates(parent, changes, signature_count, blockhash, &target)
+    }
+
+    fn search_subsets(
+        &self,
+        parent: &Hash,
+        changes: &[SlotChange],
+        signature_count: u64,
+        blockhash: &Hash,
+    ) -> Vec<&'static str> {
+        let Some(target) = *SEARCH_TARGET else {
+            return Vec::new();
+        };
+        if self.bank_hash == target {
+            return Vec::new();
+        }
+        let stake = solana_sdk_ids::stake::id();
+        let preds: [(&'static str, fn(&SlotChange, &Pubkey) -> bool); 5] = [
+            ("data-only changes (lamports unchanged)", |(_, old, new), _| {
+                old.as_ref().is_some_and(|o| o.lamports() == new.lamports())
+            }),
+            ("data-only stake-owned changes", |(_, old, new), stake| {
+                old.as_ref().is_some_and(|o| o.lamports() == new.lamports()) && new.owner() == stake
+            }),
+            ("all stake-owned changes", |(_, _, new), stake| new.owner() == stake),
+            ("accounts created this slot", |(_, old, _), _| old.is_none()),
+            ("non-stake-owned changes", |(_, _, new), stake| new.owner() != stake),
+        ];
+        let mut hits = Vec::new();
+        for (label, pred) in preds {
+            let mut cand = self.lt_hash.clone();
+            let mut n = 0usize;
+            for ch in changes {
+                if pred(ch, &stake) {
+                    let (pubkey, old, new) = ch;
+                    cand.mix_out(&lt_hash_account(pubkey, new));
+                    if let Some(old) = old {
+                        cand.mix_in(&lt_hash_account(pubkey, old));
+                    }
+                    n += 1;
+                }
+            }
+            if n > 0 && bank_hash(parent, signature_count, blockhash, &cand) == target {
+                hits.push(label);
+            }
+        }
+        hits
+    }
+
+    fn search_variants(
+        &self,
+        parent: &Hash,
+        changes: &[SlotChange],
+        signature_count: u64,
+        blockhash: &Hash,
+    ) -> Vec<String> {
+        let Some(target) = *SEARCH_TARGET else {
+            return Vec::new();
+        };
+        if self.bank_hash == target {
+            return Vec::new();
+        }
+        const CANON: usize = 200;
+        let mut hits = Vec::new();
+        for (pubkey, old, new) in changes {
+            if new.data().len() == CANON || new.owner() != &solana_sdk_ids::stake::id() {
+                continue;
+            }
+            let Some(old) = old else { continue };
+            let mut base = self.lt_hash.clone();
+            base.mix_out(&lt_hash_account(pubkey, new));
+
+            let mut keep_old_data = old.clone();
+            keep_old_data.set_lamports(new.lamports());
+
+            let mut zero_tail = new.clone();
+            {
+                let d = zero_tail.data_as_mut_slice();
+                for b in d.iter_mut().skip(CANON) {
+                    *b = 0;
+                }
+            }
+
+            let mut truncated = new.clone();
+            truncated.set_data_from_slice(&new.data()[..CANON.min(new.data().len())]);
+
+            let mut old_truncated = old.clone();
+            old_truncated.set_lamports(new.lamports());
+            old_truncated.set_data_from_slice(&old.data()[..CANON.min(old.data().len())]);
+
+            for (label, cand) in [
+                ("new-lamports + OLD data", &keep_old_data),
+                ("new state, tail beyond 200 ZEROED", &zero_tail),
+                ("new state TRUNCATED to 200", &truncated),
+                ("old data truncated to 200", &old_truncated),
+            ] {
+                let mut lt = base.clone();
+                lt.mix_in(&lt_hash_account(pubkey, cand));
+                if bank_hash(parent, signature_count, blockhash, &lt) == target {
+                    hits.push(format!("{pubkey}: {label}"));
+                }
+            }
+        }
+        hits
+    }
+
+    fn search_revert_list(
+        &self,
+        parent: &Hash,
+        changes: &[SlotChange],
+        signature_count: u64,
+        blockhash: &Hash,
+    ) -> Option<String> {
+        let target = (*SEARCH_TARGET)?;
+        if self.bank_hash == target {
+            return None;
+        }
+        for path in REVERT_LISTS.iter() {
+            let Ok(body) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let want: std::collections::HashSet<String> =
+                body.lines().map(|l| l.trim().to_string()).collect();
+            let mut cand = self.lt_hash.clone();
+            let mut n = 0usize;
+            for (pubkey, old, new) in changes {
+                if !want.contains(&pubkey.to_string()) {
+                    continue;
+                }
+                cand.mix_out(&lt_hash_account(pubkey, new));
+                if let Some(old) = old {
+                    cand.mix_in(&lt_hash_account(pubkey, old));
+                }
+                n += 1;
+            }
+            if n == 0 {
+                continue;
+            }
+            if bank_hash(parent, signature_count, blockhash, &cand) == target {
+                return Some(format!("{path}: reverting {n} account(s) reaches the target"));
+            }
+            eprintln!("list-revert: {path} -> {n} reverted, no match");
+        }
+        None
+    }
+
+    fn revert_candidates(
+        &self,
+        parent: &Hash,
+        changes: &[SlotChange],
+        signature_count: u64,
+        blockhash: &Hash,
+        target: &Hash,
+    ) -> Vec<Pubkey> {
+        if self.bank_hash == *target {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for (pubkey, old, new) in changes {
+            let mut cand = self.lt_hash.clone();
+            cand.mix_out(&lt_hash_account(pubkey, new));
+            if let Some(old) = old {
+                cand.mix_in(&lt_hash_account(pubkey, old));
+            }
+            if bank_hash(parent, signature_count, blockhash, &cand) == *target {
+                hits.push(*pubkey);
+            }
+        }
+        hits
     }
 }
 
@@ -145,6 +351,50 @@ mod tests {
         lt.mix_in(&lt_hash_account(&k2, &a2));
         assert_eq!(bh, bank_hash(&Hash::default(), 5, &blockhash, &lt));
         assert_eq!(roller.bank_hash(), bh);
+    }
+
+    // The divergence search must actually find a planted culprit, not silently return nothing.
+    #[test]
+    fn revert_candidates_names_the_one_account_that_closes_the_gap() {
+        let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let before = test_account(100, &[1, 2, 3]);
+        let after = test_account(150, &[9, 9, 9]);
+        let created = test_account(200, &[4, 5]);
+        let blockhash = Hash::new_from_array([3; 32]);
+        let parent = Hash::new_from_array([1; 32]);
+
+        let mut lt0 = LtHash::identity();
+        lt0.mix_in(&lt_hash_account(&k1, &before));
+        let mut roller = BankHashRoller::new(lt0, parent);
+        let changes = vec![
+            (k1, Some(before.clone()), after.clone()),
+            (k2, None, created.clone()),
+        ];
+        let got = roller.roll_slot(&changes, 4, &blockhash);
+
+        let mut without_k2 = LtHash::identity();
+        without_k2.mix_in(&lt_hash_account(&k1, &after));
+        let target = bank_hash(&parent, 4, &blockhash, &without_k2);
+        assert_ne!(got, target);
+        assert_eq!(
+            roller.revert_candidates(&parent, &changes, 4, &blockhash, &target),
+            vec![k2]
+        );
+
+        let mut reverted_k1 = LtHash::identity();
+        reverted_k1.mix_in(&lt_hash_account(&k1, &before));
+        reverted_k1.mix_in(&lt_hash_account(&k2, &created));
+        let target_k1 = bank_hash(&parent, 4, &blockhash, &reverted_k1);
+        assert_eq!(
+            roller.revert_candidates(&parent, &changes, 4, &blockhash, &target_k1),
+            vec![k1]
+        );
+
+        assert!(
+            roller
+                .revert_candidates(&parent, &changes, 4, &blockhash, &got)
+                .is_empty()
+        );
     }
 
     // Updating rolls out old + in new, so the lattice ends holding only the new value.
