@@ -159,7 +159,13 @@ pub fn calculate_epoch_rewards(
     };
 
     let mut points: u128 = 0;
+    let mut progress = crate::progress::Progress::lazy(
+        "epoch boundary: calculating points",
+        Some(delegations.len() as u64),
+        crate::progress::Unit::Count,
+    );
     for (stake_pubkey, delegation) in &delegations {
+        progress.add(1);
         let Some((account, _)) = bank.get_account_shared_data(stake_pubkey) else {
             continue;
         };
@@ -191,9 +197,17 @@ pub fn calculate_epoch_rewards(
         };
     };
 
+    progress.finish();
+
     let mut stake_rewards = Vec::new();
     let mut vote_commission: HashMap<Pubkey, u64> = HashMap::new();
+    let mut progress = crate::progress::Progress::lazy(
+        "epoch boundary: redeeming rewards",
+        Some(delegations.len() as u64),
+        crate::progress::Unit::Count,
+    );
     for (stake_pubkey, delegation) in &delegations {
+        progress.add(1);
         let Some((mut account, _)) = bank.get_account_shared_data(stake_pubkey) else {
             continue;
         };
@@ -225,6 +239,8 @@ pub fn calculate_epoch_rewards(
             });
         }
     }
+
+    progress.finish();
 
     EpochRewardsCalculation {
         point_value: Some(point_value),
@@ -736,6 +752,9 @@ pub fn process_epoch_boundary(
         vote_accounts: _,
     } = inputs;
     let prev_epoch = epoch.saturating_sub(1);
+    eprintln!(
+        "epoch boundary {epoch} at slot {slot}: rolling stake history, then calculating rewards"
+    );
     roll_stake_history(bank, feature_set, prev_epoch, slot);
 
     // The bank's running value: the manifest's is stale by the fees burned since the seed slot.

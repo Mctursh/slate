@@ -2,6 +2,7 @@
 # Compress each boundary fixture, record its sha256, and print the upload command.
 # The checksum file is committed; the .zst files are release assets.
 set -euo pipefail
+command -v zstd >/dev/null || { echo "needs the zstd CLI: brew install zstd, or apt install zstd"; exit 1; }
 cd "$(dirname "$0")/boundary"
 
 shopt -s nullglob
@@ -25,6 +26,6 @@ echo
 echo "wrote checksums.txt:"
 grep -v '^#' checksums.txt | sed 's/^/  /'
 echo
-echo "now upload, then commit checksums.txt:"
+echo "now upload, describe any new fixture in expected.txt, then commit checksums.txt and expected.txt:"
 echo "  gh release create fixtures-v1 --title 'Boundary fixtures v1' --notes 'Tier-2 boundary fixtures' ./*.slfix.zst"
 echo "  (or: gh release upload fixtures-v1 ./*.slfix.zst --clobber)"

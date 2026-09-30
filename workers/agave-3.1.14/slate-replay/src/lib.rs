@@ -1,3 +1,11 @@
+// Shadows std's eprintln so a status message never lands on the end of an open progress line.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        $crate::progress::clear_line();
+        ::std::eprintln!($($arg)*);
+    }};
+}
+
 pub mod backfill;
 pub mod bankhash;
 pub mod block;
@@ -12,6 +20,7 @@ use store::{AccountStore, MemStore};
 pub mod fixture;
 pub mod oracle;
 pub mod persist;
+pub mod progress;
 pub mod rewards;
 pub mod snapshot;
 
@@ -168,11 +177,18 @@ impl ReplayBank {
     pub fn vote_accounts_written_since(&self, since_slot: u64) -> HashSet<Pubkey> {
         use solana_account::ReadableAccount;
         let mut candidates = Vec::new();
+        let mut progress = crate::progress::Progress::lazy(
+            "epoch boundary: scanning the store for vote accounts",
+            self.store.len_hint(),
+            crate::progress::Unit::Count,
+        );
         self.store.scan(&mut |pubkey, account| {
+            progress.add(1);
             if *account.owner() == solana_sdk_ids::vote::id() && account.lamports() > 0 {
                 candidates.push(pubkey);
             }
         });
+        progress.finish();
         candidates
             .into_iter()
             .filter(|pubkey| {
@@ -197,14 +213,21 @@ impl ReplayBank {
 
     // agave's stake_delegations. Sorted: the count drives num_partitions.
     pub fn stake_delegations(&self) -> Vec<(Pubkey, solana_stake_interface::state::Delegation)> {
+        let mut progress = crate::progress::Progress::lazy(
+            "epoch boundary: reading stake accounts",
+            Some(self.stake_keys.len() as u64),
+            crate::progress::Unit::Count,
+        );
         let mut out: Vec<_> = self
             .stake_keys
             .iter()
             .filter_map(|key| {
+                progress.add(1);
                 let (account, _) = self.get_account_shared_data(key)?;
                 Some((*key, stake_delegation(&account)?))
             })
             .collect();
+        progress.finish();
         out.sort_unstable_by_key(|(key, _)| *key);
         out
     }
@@ -1167,17 +1190,13 @@ impl Replayer {
                 eprintln!("changes dump: {} accounts -> {out}", changes.len());
             }
             self.invalidate_upgraded_programs(&changes);
-            if let Some(bank_hash) =
-                bank.finalize_slot_bankhash(&changes, signature_count, &block.blockhash)
-            {
-                eprintln!("slot {} computed bank_hash {bank_hash}", block.slot);
-            }
+            bank.finalize_slot_bankhash(&changes, signature_count, &block.blockhash);
         }
 
         BlockReplay::complete(block.transactions.len())
     }
 
-    // Replay a contiguous range in slot order against one bank that rolls forward; each block gets a fresh per-slot processor (new_from) sharing the program cache. Intra-epoch only, crossing an epoch needs machinery not built yet.
+    // Replay a contiguous range in slot order against one bank that rolls forward; each block gets a fresh per-slot processor (new_from) sharing the program cache.
     pub fn replay_range(&mut self, bank: &mut ReplayBank, blocks: &[Block]) -> RangeReplay {
         // Self-verify against consensus: a vote carries the voted slot's bank hash, so later votes confirm earlier computed hashes. computed/confirmed pair them up (bounded to the ~30-slot vote lag); a mismatch means we diverged from a stake supermajority, halt.
         let first_slot = blocks.first().map_or(0, |b| b.slot);
@@ -1185,6 +1204,11 @@ impl Replayer {
         let mut confirmed: HashMap<u64, Hash> = HashMap::new();
         let mut verified = 0usize;
         let mut capture = self.fixture_capture.take();
+        let mut progress = crate::progress::Progress::lazy(
+            "replaying",
+            Some(blocks.len() as u64),
+            crate::progress::Unit::Count,
+        );
 
         for (completed, block) in blocks.iter().enumerate() {
             // Harvest this block's votes; reconcile any slot we've already computed.
@@ -1264,7 +1288,9 @@ impl Replayer {
                     }
                 }
             }
+            progress.add(1);
         }
+        progress.finish();
 
         self.fixture_capture = capture;
 

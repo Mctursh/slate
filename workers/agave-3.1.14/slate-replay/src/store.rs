@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
-use redb::{Database, Durability, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 
@@ -11,6 +11,9 @@ pub trait AccountStore: Send + Sync {
     fn contains(&self, key: &Pubkey) -> bool;
     // Walk every live account. Only used to rebuild derived sets (e.g. stake keys) after a resume.
     fn scan(&self, visit: &mut dyn FnMut(Pubkey, &AccountSharedData));
+    fn len_hint(&self) -> Option<u64> {
+        None
+    }
     // Commit buffered writes; no-op for write-through stores.
     fn flush(&mut self);
     // Flush buffered accounts + the resume checkpoint in one durable commit; no-op if the
@@ -42,6 +45,10 @@ impl AccountStore for MemStore {
         for (key, (account, _)) in &self.accounts {
             visit(*key, account);
         }
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        Some(self.accounts.len() as u64)
     }
 
     fn flush(&mut self) {}
@@ -146,6 +153,12 @@ impl AccountStore for DiskStore {
                 visit(key, &account);
             }
         }
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        let txn = self.db.begin_read().ok()?;
+        let table = txn.open_table(ACCOUNTS).ok()?;
+        Some(table.len().ok()? + self.buffer.len() as u64)
     }
 
     fn flush(&mut self) {

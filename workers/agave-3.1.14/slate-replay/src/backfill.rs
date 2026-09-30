@@ -9,7 +9,9 @@ use solana_pubkey::Pubkey;
 use crate::{
     RangeReplay, ReplayBank, Replayer, SLOTS_PER_EPOCH, WriteRecord,
     block::{self, Block},
-    boundary, build_feature_set, compat, epoch_of, persist, register_builtins, rewards, snapshot,
+    boundary, build_feature_set, compat, epoch_of, persist,
+    progress::{Progress, Unit},
+    register_builtins, rewards, snapshot,
     source::{BlockSource, CachingBlockSource},
     store::{AccountStore, DiskStore, MemStore},
 };
@@ -65,17 +67,16 @@ pub async fn backfill(
             "footprint pass: fetching {} blocks to build the seed set",
             slots.len()
         );
-        let mut fetched = 0usize;
+        let mut progress = Progress::lazy("footprint pass", Some(slots.len() as u64), Unit::Count);
         for chunk in slots.chunks(chunk_slots) {
-            let blocks = fetch_chunk(&source, chunk).await?;
+            let blocks = fetch_chunk(&source, chunk, &mut progress).await?;
             block::extend_footprint(&mut footprint, &blocks);
-            fetched += chunk.len();
-            eprintln!(
-                "footprint pass: {fetched}/{} slots fetched, {} accounts so far",
-                slots.len(),
-                footprint.len()
-            );
         }
+        progress.finish();
+        eprintln!(
+            "footprint pass: {} accounts in the seed set",
+            footprint.len()
+        );
         block::footprint_fixed(&mut footprint);
         // programData PDAs and SlotHashes are read, not declared as keys, so the footprint misses them.
         let programdata = block::programdata_addresses(&footprint);
@@ -117,16 +118,13 @@ pub async fn backfill(
                 pending.len()
             );
             let mut fp = HashSet::new();
-            let mut fetched = 0usize;
+            let mut progress =
+                Progress::lazy("footprint top-up", Some(pending.len() as u64), Unit::Count);
             for chunk in pending.chunks(chunk_slots) {
-                let blocks = fetch_chunk(&source, chunk).await?;
+                let blocks = fetch_chunk(&source, chunk, &mut progress).await?;
                 block::extend_footprint(&mut fp, &blocks);
-                fetched += chunk.len();
-                eprintln!(
-                    "footprint top-up: {fetched}/{} slots fetched",
-                    pending.len()
-                );
             }
+            progress.finish();
             block::footprint_fixed(&mut fp);
             let programdata = block::programdata_addresses(&fp);
             fp.extend(programdata);
@@ -140,6 +138,15 @@ pub async fn backfill(
                 })
                 .collect();
             if !missing.is_empty() || crosses_epoch {
+                eprintln!(
+                    "resume: loading {} accounts from the snapshot{}",
+                    missing.len(),
+                    if crosses_epoch {
+                        ", plus every stake and vote account for the crossing"
+                    } else {
+                        ""
+                    }
+                );
                 // A resume into a crossing needs every stake/vote account: absent ones are dropped silently.
                 let mut collected = HashSet::new();
                 // No owner filter: it would clobber replay-written values with snapshot state.
@@ -222,6 +229,10 @@ pub async fn backfill(
 
     // Fresh run inserts the S_snap baseline; a resume already has it.
     if !baseline.is_empty() {
+        eprintln!(
+            "persisting {} baseline rows at slot {s_snap}",
+            baseline.len()
+        );
         store.insert_accounts(&baseline).await?;
     }
 
@@ -280,7 +291,10 @@ pub async fn backfill(
         let mut completed = 0usize;
         let mut halt = None;
         for chunk in replay_slots.chunks(chunk_slots) {
-            let blocks = fetch_chunk(&source, chunk).await?;
+            let mut progress =
+                Progress::lazy("fetching blocks", Some(chunk.len() as u64), Unit::Count);
+            let blocks = fetch_chunk(&source, chunk, &mut progress).await?;
+            progress.finish();
             let chunk_replay = replayer.replay_range(&mut bank, &blocks);
             let done = chunk_replay.blocks_completed;
             if done > 0 {
@@ -293,14 +307,20 @@ pub async fn backfill(
                 .into_iter()
                 .filter(|w| w.slot <= covered_hi)
                 .collect();
-            store
-                .insert_accounts(&persist::program_account_rows(&changes, program))
-                .await?;
+            let rows = persist::program_account_rows(&changes, program);
+            if !rows.is_empty() {
+                eprintln!(
+                    "persisting {} account rows up to slot {covered_hi}",
+                    rows.len()
+                );
+            }
+            store.insert_accounts(&rows).await?;
             if let Some(h) = chunk_replay.halt {
                 halt = Some(h);
                 break;
             }
             // Checkpoint clean chunks only. On a halt the roller sits one slot past covered_hi, so we skip it and let the halting chunk's buffered writes drop unflushed; resume re-runs that chunk.
+            eprintln!("checkpointing at slot {covered_hi}");
             bank.checkpoint(covered_hi)?;
         }
         if let Some(c) = replayer.take_fixture_capture() {
@@ -362,18 +382,36 @@ fn ensure_single_epoch(from: u64, to: u64, have_reward_inputs: bool) -> Result<(
     if lo != hi && !have_reward_inputs {
         let boundary = (lo + 1) * SLOTS_PER_EPOCH;
         anyhow::bail!(
-            "range {from}..={to} crosses an epoch boundary at slot {boundary} (epoch {lo} -> {hi}); \
-             epoch-boundary replay is not implemented yet, split the range at {boundary}"
+            "range {from}..={to} crosses an epoch boundary at slot {boundary} (epoch {lo} -> {hi}), \
+             but the snapshot manifest has no inflation to calculate rewards; split the range at {boundary}"
         );
     }
     Ok(())
 }
 
 // Run the source's blocking fetch on the blocking pool so the previous chunk's persist doesn't stall behind the network.
-async fn fetch_chunk(source: &Arc<dyn BlockSource>, slots: &[u64]) -> Result<Vec<Block>> {
+async fn fetch_chunk(
+    source: &Arc<dyn BlockSource>,
+    slots: &[u64],
+    progress: &mut Progress,
+) -> Result<Vec<Block>> {
     let src = Arc::clone(source);
-    let slots = slots.to_vec();
-    tokio::task::spawn_blocking(move || src.fetch(&slots)).await?
+    let owned = slots.to_vec();
+    let (base, start) = (progress.done(), source.slots_done());
+    let mut task = tokio::task::spawn_blocking(move || src.fetch(&owned));
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            joined = &mut task => {
+                progress.set(base + slots.len() as u64);
+                return joined?;
+            }
+            _ = tick.tick() => {
+                let n = source.slots_done().saturating_sub(start).min(slots.len() as u64);
+                progress.set(base + n);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

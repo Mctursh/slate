@@ -6,6 +6,7 @@ use slate_common::config::Config;
 use slate_replay::{
     backfill::{AccountStoreChoice, backfill},
     block::{Block, current_slot, fetch_block, fetch_confirmed_slots, sanitize},
+    progress::ProgressReader,
     rewards::ManifestRewardInputs,
     snapshot::{read_manifest_fields, read_manifest_lt_hash, read_manifest_stakes_cache},
     source::{BlockSource, RpcBlockSource},
@@ -16,8 +17,8 @@ use solana_pubkey::Pubkey;
 #[derive(Parser)]
 #[command(about = "Reconstruct a program's historical account state by replaying a slot range")]
 struct Args {
-    /// Path to the full snapshot the range starts from (omit with --dry-run or --resume).
-    #[arg(required_unless_present_any = ["dry_run", "resume"])]
+    /// Path to the full snapshot the range starts from (omit with --dry-run).
+    #[arg(required_unless_present = "dry_run")]
     snapshot: Option<String>,
     /// Slot the snapshot was taken at. Replay covers (from, to].
     #[arg(long)]
@@ -39,8 +40,8 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
     /// Resume a crashed or halted run from the store's last checkpoint instead of seeding
-    /// fresh. Needs --store disk at the same --store-path (and the same --block-cache to
-    /// skip re-fetching). No snapshot needed.
+    /// fresh. Needs the same snapshot and --store disk at the same --store-path (and the
+    /// same --block-cache to skip re-fetching).
     #[arg(long)]
     resume: bool,
     /// Account store: `memory` (RAM, small ranges) or `disk` (redb, large ranges).
@@ -154,24 +155,24 @@ fn main() -> anyhow::Result<()> {
     let bootstrap = match snapshot_path {
         None => None,
         Some(path) => {
-            let manifest = read_manifest_fields(
-                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
-                args.from,
-            )
-            .context("reading the snapshot manifest bank hash")?;
-            let lt_hash = read_manifest_lt_hash(
-                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
-                args.from,
-            )
-            .context("reading the snapshot manifest lattice hash")?
-            .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
+            eprintln!("reading the snapshot manifest: bank hash, lattice hash, stakes cache");
+            let open = |label: &str| -> anyhow::Result<ProgressReader<File>> {
+                let file = File::open(path).with_context(|| format!("opening snapshot {path}"))?;
+                Ok(ProgressReader::new(
+                    file,
+                    format!("manifest: {label}"),
+                    None,
+                ))
+            };
+            let manifest = read_manifest_fields(open("bank hash")?, args.from)
+                .context("reading the snapshot manifest bank hash")?;
+            let lt_hash = read_manifest_lt_hash(open("lattice hash")?, args.from)
+                .context("reading the snapshot manifest lattice hash")?
+                .context("snapshot has no accounts_lt_hash (a pre-lattice snapshot?)")?;
             // Only complete inputs are useful: without the curve the reward totals would be wrong,
             // so a crossing is refused rather than approximated.
-            let stakes_cache = read_manifest_stakes_cache(
-                File::open(path).with_context(|| format!("opening snapshot {path}"))?,
-                args.from,
-            )
-            .context("reading the manifest stakes cache")?;
+            let stakes_cache = read_manifest_stakes_cache(open("stakes cache")?, args.from)
+                .context("reading the manifest stakes cache")?;
             reward_inputs = match manifest.inflation {
                 Some(inflation) => Some(ManifestRewardInputs {
                     inflation,
@@ -188,9 +189,7 @@ fn main() -> anyhow::Result<()> {
 
     let snapshot: Box<dyn Read> = match snapshot_path {
         None => Box::new(std::io::empty()),
-        Some(path) => {
-            Box::new(File::open(path).with_context(|| format!("opening snapshot {path}"))?)
-        }
+        Some(path) => Box::new(sized_reader(path, "snapshot")?),
     };
 
     let account_store = match args.store.as_str() {
@@ -215,9 +214,7 @@ fn main() -> anyhow::Result<()> {
             Arc::new(RpcBlockSource::new(&args.rpc).with_concurrency(args.fetch_concurrency));
         // Optional byte-exact end-state check against the snapshot at --to.
         let verify_end: Option<Box<dyn Read>> = match &args.verify_boundary {
-            Some(path) => Some(Box::new(
-                File::open(path).with_context(|| format!("opening boundary snapshot {path}"))?,
-            )),
+            Some(path) => Some(Box::new(sized_reader(path, "end snapshot")?)),
             None => None,
         };
         let result = backfill(
@@ -292,6 +289,12 @@ fn fetch_range(args: &Args) -> anyhow::Result<Vec<Block>> {
         .into_iter()
         .map(|slot| fetch_block(&args.rpc, slot))
         .collect()
+}
+
+fn sized_reader(path: &str, label: &str) -> anyhow::Result<ProgressReader<File>> {
+    let file = File::open(path).with_context(|| format!("opening {label} {path}"))?;
+    let size = file.metadata().ok().map(|m| m.len());
+    Ok(ProgressReader::new(file, label, size))
 }
 
 // Check the snapshot exists and has the zstd magic, so a wrong path fails now, not deep in the loader.

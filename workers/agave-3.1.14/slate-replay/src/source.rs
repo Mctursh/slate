@@ -23,6 +23,10 @@ pub trait BlockSource: Send + Sync {
     fn confirmed_slots(&self, from: u64, to: u64) -> Result<Vec<u64>>;
     // Blocking is fine, the caller drives chunks, so only one chunk is ever resident.
     fn fetch(&self, slots: &[u64]) -> Result<Vec<Block>>;
+    // Slots resolved so far across every fetch, polled for progress while a chunk is in flight.
+    fn slots_done(&self) -> u64 {
+        0
+    }
 }
 
 // getBlock over JSON-RPC; backs both a local yellowstone-faithful (production) and a remote provider (Helius/QuickNode), only the URL differs.
@@ -30,6 +34,7 @@ pub struct RpcBlockSource {
     rpc_url: String,
     client: Client,
     concurrency: usize,
+    done: AtomicU64,
 }
 
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
@@ -67,6 +72,7 @@ impl RpcBlockSource {
             rpc_url: rpc_url.into(),
             client,
             concurrency: 1,
+            done: AtomicU64::new(0),
         }
     }
 
@@ -112,7 +118,9 @@ impl BlockSource for RpcBlockSource {
         if self.concurrency == 1 {
             let mut out = Vec::with_capacity(slots.len());
             for &slot in slots {
-                if let Some(block) = self.fetch_one(slot)? {
+                let fetched = self.fetch_one(slot)?;
+                self.done.fetch_add(1, Ordering::Relaxed);
+                if let Some(block) = fetched {
                     out.push(block);
                 }
             }
@@ -132,6 +140,7 @@ impl BlockSource for RpcBlockSource {
                             break;
                         }
                         let fetched = self.fetch_one(slots[i]);
+                        self.done.fetch_add(1, Ordering::Relaxed);
                         *results[i].lock().expect("results mutex") = Some(fetched);
                     }
                 });
@@ -150,6 +159,10 @@ impl BlockSource for RpcBlockSource {
             }
         }
         Ok(out)
+    }
+
+    fn slots_done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
     }
 }
 
@@ -216,6 +229,10 @@ impl BlockSource for CachingBlockSource {
             crate::block::verify_chains_to(&pair[1], &pair[0])?;
         }
         Ok(out)
+    }
+
+    fn slots_done(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed) + self.inner.slots_done()
     }
 }
 
