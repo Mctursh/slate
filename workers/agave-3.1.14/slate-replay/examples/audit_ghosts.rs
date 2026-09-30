@@ -13,7 +13,9 @@ fn slot_of(path: &std::path::Path) -> Option<u64> {
 
 fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
-    let snap = a.next().context("usage: <snapshot.tar.zst> <store.redb> [--apply]")?;
+    let snap = a
+        .next()
+        .context("usage: <snapshot.tar.zst> <store.redb> [--apply]")?;
     let store_path = a.next().context("store path")?;
     let apply = a.next().is_some_and(|f| f == "--apply");
 
@@ -57,8 +59,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if files % 50_000 == 0 {
-            eprintln!("  .. {files} account files, {} candidates resolved", top.len());
+        if files.is_multiple_of(50_000) {
+            eprintln!(
+                "  .. {files} account files, {} candidates resolved",
+                top.len()
+            );
         }
     }
     eprintln!("scanned {files} account files");
@@ -83,7 +88,11 @@ fn main() -> Result<()> {
 
     if apply {
         for (pk, del_slot, _, _) in &ghosts {
-            store.put(*pk, AccountSharedData::new(0, 0, &Pubkey::default()), *del_slot);
+            store.put(
+                *pk,
+                AccountSharedData::new(0, 0, &Pubkey::default()),
+                *del_slot,
+            );
         }
         store.flush();
         println!("APPLIED {} tombstone(s)", ghosts.len());

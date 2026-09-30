@@ -11,7 +11,11 @@ fn main() -> anyhow::Result<()> {
     let store = DiskStore::open(&path, 16 * 1024 * 1024)?;
     let (acct, slot) = store.get(&key).expect("account absent");
     let data = acct.data();
-    let elf = if data.len() > 45 && data[0..4] == [3, 0, 0, 0] { &data[45..] } else { data };
+    let elf = if data.len() > 45 && data[0..4] == [3, 0, 0, 0] {
+        &data[45..]
+    } else {
+        data
+    };
     std::fs::write(&out, elf)?;
     println!("wrote {} bytes from slot {slot} to {out}", elf.len());
     Ok(())

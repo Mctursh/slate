@@ -53,7 +53,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        println!("  program account is not loader-v3 Program state: first4={:?}", &data[0..4.min(data.len())]);
+        println!(
+            "  program account is not loader-v3 Program state: first4={:?}",
+            &data[0..4.min(data.len())]
+        );
     }
     Ok(())
 }

@@ -77,11 +77,16 @@ pub fn ensure(name: &str, sha256: &str) -> Result<PathBuf> {
                 have as f64 / 1048576.0
             ));
         } else {
-            note(&format!("  {name}: fetching from GitHub (attempt {attempt})"));
+            note(&format!(
+                "  {name}: fetching from GitHub (attempt {attempt})"
+            ));
         }
         match fetch_from(&client, &url, &tmp, have, name) {
             Ok(total) => {
-                note(&format!("  {name}: downloaded {:.1} MB", total as f64 / 1048576.0));
+                note(&format!(
+                    "  {name}: downloaded {:.1} MB",
+                    total as f64 / 1048576.0
+                ));
                 last = None;
                 break;
             }
@@ -132,7 +137,9 @@ fn fetch_from(
     }
     let mut resp = req.send()?.error_for_status()?;
     let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    let total = resp.content_length().map(|l| l + if resumed { have } else { 0 });
+    let total = resp
+        .content_length()
+        .map(|l| l + if resumed { have } else { 0 });
     let mut f = if resumed {
         std::fs::OpenOptions::new().append(true).open(tmp)?
     } else {

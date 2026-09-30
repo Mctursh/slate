@@ -446,7 +446,13 @@ pub fn distribute_partition(
                     a.data().len(),
                     format!("{fl:?}"),
                 ),
-                Some((a, other)) => (a.lamports(), 0, 0, a.data().len(), format!("NOT-STAKE:{other:?}")),
+                Some((a, other)) => (
+                    a.lamports(),
+                    0,
+                    0,
+                    a.data().len(),
+                    format!("NOT-STAKE:{other:?}"),
+                ),
                 None => (0, 0, 0, 0, "ABSENT".to_string()),
             };
             let d = &r.stake.delegation;
@@ -798,7 +804,10 @@ pub fn process_epoch_boundary(
                 );
             }
             let _ = f.flush();
-            eprintln!("wrote {} stake rewards to {path}", calculated.stake_rewards.len());
+            eprintln!(
+                "wrote {} stake rewards to {path}",
+                calculated.stake_rewards.len()
+            );
         }
     }
 
@@ -1002,8 +1011,15 @@ mod boundary_tests {
 
         let i = inputs(fs, 603_724_512_541_705_391, &mut bank);
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        let out = process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         assert_eq!(out.paid_delegations, 1);
         assert_eq!(out.num_partitions, 1);
@@ -1043,7 +1059,15 @@ mod boundary_tests {
 
         let i = inputs(FeatureSet::all_enabled(), 600_000_000_000, &mut bank);
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         let history = stake_history_of(&bank).expect("entry written");
         assert!(
@@ -1061,8 +1085,15 @@ mod boundary_tests {
             &mut bank,
         );
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        let out = process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         let start = epoch_rewards_of(&bank).distribution_starting_block_height;
         let index = partition_for_block(start, start, out.num_partitions).unwrap();

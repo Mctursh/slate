@@ -7,7 +7,9 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).context("usage: <cache.redb>")?;
-    let db = Database::builder().open(&path).context("opening the cache")?;
+    let db = Database::builder()
+        .open(&path)
+        .context("opening the cache")?;
     let txn = db.begin_read()?;
     let table = match txn.open_table(BLOCKS) {
         Ok(t) => t,

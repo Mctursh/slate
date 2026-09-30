@@ -6,7 +6,9 @@ use std::str::FromStr;
 
 fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
-    let store_path = a.next().context("usage: <store.redb> <post-balances.txt>")?;
+    let store_path = a
+        .next()
+        .context("usage: <store.redb> <post-balances.txt>")?;
     let list = a.next().context("list")?;
     let store = DiskStore::open(&store_path, 1 << 28)?;
     let (mut ok, mut bad, mut missing) = (0usize, 0usize, 0usize);

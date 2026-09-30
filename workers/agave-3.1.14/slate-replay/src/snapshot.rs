@@ -94,7 +94,6 @@ pub fn load_accounts_with_stakes<R: Read>(
     keep_owned_by: Option<&Pubkey>,
     stake_keys: Option<&mut HashSet<Pubkey>>,
 ) -> Result<HashMap<Pubkey, (AccountSharedData, u64)>> {
-    let mut stake_keys = stake_keys;
     let decoder = zstd::Decoder::new(reader).context("open zstd stream")?;
     let mut archive = tar::Archive::new(decoder);
     let mut accounts: HashMap<Pubkey, (AccountSharedData, u64)> = HashMap::new();
@@ -133,7 +132,7 @@ pub fn load_accounts_with_stakes<R: Read>(
 
     // Drop dead (zero-lamport) accounts: on-chain they're purged and read as the default, so seeding the stale AppendVec record would diverge from the chain.
     accounts.retain(|_, (account, _)| account.lamports() > 0);
-    if let Some(keys) = stake_keys.as_deref_mut() {
+    if let Some(keys) = stake_keys {
         for (pubkey, (account, _)) in accounts.iter() {
             if *account.owner() == solana_sdk_ids::stake::id() {
                 keys.insert(*pubkey);
@@ -766,4 +765,3 @@ mod manifest_field_tests {
         );
     }
 }
-

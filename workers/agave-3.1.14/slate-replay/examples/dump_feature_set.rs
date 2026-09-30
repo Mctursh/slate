@@ -1,9 +1,12 @@
-use slate_replay::{build_feature_set, store::DiskStore, ReplayBank};
+use slate_replay::{ReplayBank, build_feature_set, store::DiskStore};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: <accounts.redb> <slot>");
-    let slot: u64 = args.next().expect("usage: <accounts.redb> <slot>").parse()?;
+    let slot: u64 = args
+        .next()
+        .expect("usage: <accounts.redb> <slot>")
+        .parse()?;
     let store = DiskStore::open(&path, 1 << 28)?;
     let bank = ReplayBank::with_store(Box::new(store));
     let fs = build_feature_set(&bank, slot);
@@ -11,7 +14,11 @@ fn main() -> anyhow::Result<()> {
         let at = fs.activated_slot(id);
         println!(
             "{id}\t{}\t{}\t{name}",
-            if fs.is_active(id) { "ACTIVE" } else { "inactive" },
+            if fs.is_active(id) {
+                "ACTIVE"
+            } else {
+                "inactive"
+            },
             at.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
         );
     }

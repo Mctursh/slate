@@ -264,9 +264,9 @@ fn with_rpc_retry_base<T>(what: &str, base_ms: u64, mut f: impl FnMut() -> Resul
             Err(e) => {
                 attempt += 1;
                 if attempt > RPC_PROBE_RETRIES {
-                    return Err(e.context(format!(
-                        "{what} failed after {RPC_PROBE_RETRIES} retries"
-                    )));
+                    return Err(
+                        e.context(format!("{what} failed after {RPC_PROBE_RETRIES} retries"))
+                    );
                 }
                 let backoff_ms = (base_ms << (attempt as u32 - 1).min(6)).min(20_000);
                 std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
@@ -538,7 +538,10 @@ mod tests {
         assert!(flipped, "fixture has no instruction data to corrupt");
         let err = verify_signatures(&block).unwrap_err().to_string();
         assert!(err.contains("invalid"), "{err}");
-        assert!(err.contains("not Slate"), "the error must attribute the fault: {err}");
+        assert!(
+            err.contains("not Slate"),
+            "the error must attribute the fault: {err}"
+        );
     }
 
     #[test]

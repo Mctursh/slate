@@ -122,16 +122,22 @@ impl BankHashRoller {
             return Vec::new();
         }
         let stake = solana_sdk_ids::stake::id();
-        let preds: [(&'static str, fn(&SlotChange, &Pubkey) -> bool); 5] = [
-            ("data-only changes (lamports unchanged)", |(_, old, new), _| {
-                old.as_ref().is_some_and(|o| o.lamports() == new.lamports())
-            }),
+        type Predicate = (&'static str, fn(&SlotChange, &Pubkey) -> bool);
+        let preds: [Predicate; 5] = [
+            (
+                "data-only changes (lamports unchanged)",
+                |(_, old, new), _| old.as_ref().is_some_and(|o| o.lamports() == new.lamports()),
+            ),
             ("data-only stake-owned changes", |(_, old, new), stake| {
                 old.as_ref().is_some_and(|o| o.lamports() == new.lamports()) && new.owner() == stake
             }),
-            ("all stake-owned changes", |(_, _, new), stake| new.owner() == stake),
+            ("all stake-owned changes", |(_, _, new), stake| {
+                new.owner() == stake
+            }),
             ("accounts created this slot", |(_, old, _), _| old.is_none()),
-            ("non-stake-owned changes", |(_, _, new), stake| new.owner() != stake),
+            ("non-stake-owned changes", |(_, _, new), stake| {
+                new.owner() != stake
+            }),
         ];
         let mut hits = Vec::new();
         for (label, pred) in preds {
@@ -244,7 +250,9 @@ impl BankHashRoller {
                 continue;
             }
             if bank_hash(parent, signature_count, blockhash, &cand) == target {
-                return Some(format!("{path}: reverting {n} account(s) reaches the target"));
+                return Some(format!(
+                    "{path}: reverting {n} account(s) reaches the target"
+                ));
             }
             eprintln!("list-revert: {path} -> {n} reverted, no match");
         }

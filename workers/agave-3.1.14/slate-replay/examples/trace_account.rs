@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, TableDefinition};
 use slate_replay::block::Block;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -8,7 +8,9 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
-    let path = a.next().context("usage: <cache.redb> <pubkey> [from] [to]")?;
+    let path = a
+        .next()
+        .context("usage: <cache.redb> <pubkey> [from] [to]")?;
     let want = Pubkey::from_str(&a.next().context("pubkey")?)?;
     let from: u64 = a.next().map(|s| s.parse().unwrap()).unwrap_or(0);
     let to: u64 = a.next().map(|s| s.parse().unwrap()).unwrap_or(u64::MAX);

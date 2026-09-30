@@ -10,9 +10,9 @@ pub mod backfill;
 pub mod bankhash;
 pub mod block;
 pub mod boundary;
-pub mod compat;
 #[cfg(feature = "boundary-fixtures")]
 pub mod boundary_fixtures;
+pub mod compat;
 pub mod fixture_capture;
 pub mod source;
 pub mod store;
@@ -618,6 +618,7 @@ impl ReplayBank {
     }
 
     // agave's update_rent writes the rent COLLECTOR, so burn_percent comes from genesis (50), not the sysvar, which mainnet left at 100 since slot 328457012.
+    #[allow(deprecated)]
     pub fn deprecate_rent_exemption_threshold(&mut self) {
         let mut rent = self.rent();
         rent.lamports_per_byte_year =
@@ -1174,7 +1175,7 @@ impl Replayer {
                 use solana_account::ReadableAccount;
                 use std::io::Write as _;
                 let mut f =
-                    std::io::BufWriter::new(std::fs::File::create(&out).expect("changes out"));
+                    std::io::BufWriter::new(std::fs::File::create(out).expect("changes out"));
                 for (pk, _, new) in &changes {
                     let hex: String = new.data().iter().map(|b| format!("{b:02x}")).collect();
                     writeln!(
