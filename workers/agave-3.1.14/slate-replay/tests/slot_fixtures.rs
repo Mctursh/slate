@@ -23,7 +23,7 @@ fn dir() -> PathBuf {
 #[test]
 fn every_declared_slot_fixture_is_present_and_replays_to_its_recorded_hash() {
     for (slot, note) in declared() {
-        let path = dir().join(format!("slot-{slot}.slfix"));
+        let path = dir().join(format!("slot-{slot}.slfix.zst"));
         assert!(
             path.exists(),
             "fixtures/slots/expected.txt declares slot {slot} ({note}) but {} is missing",
@@ -49,7 +49,7 @@ fn no_fixture_sits_in_the_directory_undeclared() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(slot) = name
             .strip_prefix("slot-")
-            .and_then(|s| s.strip_suffix(".slfix"))
+            .and_then(|s| s.strip_suffix(".slfix.zst").or_else(|| s.strip_suffix(".slfix")))
             .and_then(|s| s.parse::<u64>().ok())
         else {
             continue;

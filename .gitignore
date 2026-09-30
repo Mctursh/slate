@@ -11,3 +11,6 @@ TASKS.md
 
 # Boundary/slot fixtures are release assets, not git objects (GBs).
 *.slfix
+*.slfix.zst
+# Tier 1 alone ships compressed in git; tier-2 .zst are release assets, never git objects.
+!workers/agave-3.1.14/fixtures/slots/*.slfix.zst
