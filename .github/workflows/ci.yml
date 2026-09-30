@@ -21,6 +21,10 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            workers/agave-3.1.14
 
       - name: Format
         run: cargo fmt --all --check
@@ -50,3 +54,14 @@ jobs:
 
       - name: Test
         run: cargo test --workspace -- --test-threads=1
+
+      # workers/ is excluded from the root workspace, so the replay engine needs its own steps.
+      # Both carry the feature so one build of slate-replay serves them.
+      - name: Replay slot fixtures
+        working-directory: workers/agave-3.1.14
+        run: cargo test --release -p slate-replay --features boundary-fixtures --test slot_fixtures
+
+      # Downloads ~867 MB of release assets and peaks near 4.3 GB RSS on a 7 GB runner.
+      - name: Replay boundary fixtures
+        working-directory: workers/agave-3.1.14
+        run: cargo test --release -p slate-replay --features boundary-fixtures --test boundary_fixtures

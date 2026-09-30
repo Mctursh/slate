@@ -178,7 +178,11 @@ impl Fixture {
                     stake_delegations = decode_pubkeys(payload, "stake delegation")?
                 }
                 tag::CAPITALIZATION => {
-                    capitalization = Some(u64::from_le_bytes(take_exact(payload, 8, "capitalization")?))
+                    capitalization = Some(u64::from_le_bytes(take_exact(
+                        payload,
+                        8,
+                        "capitalization",
+                    )?))
                 }
                 _ => {}
             }
@@ -285,6 +289,7 @@ mod tests {
             ],
             reward_inputs: None,
             stake_delegations: Vec::new(),
+            capitalization: Some(603_724_476_344_619_300),
         }
     }
 
