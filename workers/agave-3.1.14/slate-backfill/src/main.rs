@@ -53,6 +53,9 @@ struct Args {
     /// Path for the disk store's redb file.
     #[arg(long, default_value = "slate-accounts.redb")]
     store_path: String,
+    /// Delete an existing --store-path before seeding. Without it a fresh run refuses one.
+    #[arg(long, conflicts_with = "resume")]
+    overwrite: bool,
     /// Block cache path (redb). Point runs of the same cluster at one file to skip
     /// re-fetching on retries. Omit to disable.
     #[arg(long)]
@@ -127,8 +130,20 @@ fn main() -> anyhow::Result<()> {
         .context("--program is required for a real run")?;
     let program = Pubkey::from_str(program_str)
         .with_context(|| format!("invalid program pubkey {program_str}"))?;
+    slate_replay::persist::ensure_persistable(&program)?;
     let cfg = Config::load(&args.config)?;
     check_clickhouse(&cfg.clickhouse.url)?;
+    let store_path = std::path::Path::new(&args.store_path);
+    if args.store == "disk" && !args.resume && store_path.exists() {
+        if !args.overwrite {
+            anyhow::bail!(
+                "{} already exists; pass --resume to continue it or --overwrite to start over",
+                args.store_path
+            );
+        }
+        std::fs::remove_file(store_path)
+            .with_context(|| format!("removing {}", args.store_path))?;
+    }
 
     let snapshot_path = if args.resume {
         // Resume still seeds: the footprint top-up reads it, and without it slots under-seed.
