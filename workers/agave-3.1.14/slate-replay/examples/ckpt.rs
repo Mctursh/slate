@@ -5,7 +5,7 @@ use slate_replay::store::{AccountStore, DiskStore};
 
 fn main() -> anyhow::Result<()> {
     let db = std::env::args().nth(1).unwrap();
-    let store = DiskStore::create(&db, 1 << 28)?;
+    let store = DiskStore::open(&db, 1 << 28)?;
 
     let Some(blob) = store.read_checkpoint() else {
         println!("no checkpoint in {db}");

@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
             .nth(2)
             .unwrap_or_else(|| "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string()),
     )?;
-    let store = DiskStore::create(&path, 64 * 1024 * 1024)?;
+    let store = DiskStore::open(&path, 64 * 1024 * 1024)?;
 
     let data = show(&store, "program    ", &program);
     let Some(data) = data else { return Ok(()) };

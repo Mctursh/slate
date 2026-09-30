@@ -78,7 +78,7 @@ curl -s localhost:8899 -X POST -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["<pubkey>",{"asOfSlot":479302991}]}'
 ```
 
-The compose file is for local use only: default password, ports published on the host.
+The compose file is for local use: it binds ClickHouse to 127.0.0.1 with a default password.
 
 ## Configuration
 
@@ -122,6 +122,7 @@ cargo run -p slate-backfill --release -- \
 | `--block-cache` | keep fetched blocks so a rerun or resume doesn't fetch them again |
 | `--verify-boundary` | diff the end state byte-for-byte against the real snapshot at `--to`; exits non-zero on any mismatch |
 | `--resume` | continue from the last checkpoint; pass the same snapshot, `--store-path` and `--block-cache` |
+| `--overwrite` | delete an existing `--store-path` first; without it a fresh run refuses one |
 | `--chunk-slots` | slots per checkpoint, default 2000 |
 | `--dry-run` | fetch and parse the range without a snapshot, as a preflight |
 

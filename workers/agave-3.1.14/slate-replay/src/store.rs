@@ -68,7 +68,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 // Flush the write-buffer once it holds this many bytes, so it never grows unbounded.
 const FLUSH_THRESHOLD_BYTES: usize = 256 * 1024 * 1024;
 
-// redb-backed scratch store (rebuilt each run) so Durability::None; writes buffered + flushed in batches because per-put commits bloat the file to 152 GiB.
+// redb-backed scratch store (one per run, reopened only by --resume) so Durability::None; writes buffered + flushed in batches because per-put commits bloat the file to 152 GiB.
 pub struct DiskStore {
     db: Database,
     buffer: HashMap<Pubkey, (AccountSharedData, u64)>,
@@ -78,8 +78,20 @@ pub struct DiskStore {
 }
 
 impl DiskStore {
-    // cache_bytes is redb's page-cache = the store's RAM budget (universe lives on disk).
+    // redb's create opens an existing file, and a fresh seed merged into an old store keeps its stale rows.
     pub fn create(path: impl AsRef<Path>, cache_bytes: usize) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        if path.exists() {
+            anyhow::bail!(
+                "{} already exists; refusing to seed into an old store",
+                path.display()
+            );
+        }
+        Self::open(path, cache_bytes)
+    }
+
+    // cache_bytes is redb's page-cache = the store's RAM budget (universe lives on disk).
+    pub fn open(path: impl AsRef<Path>, cache_bytes: usize) -> anyhow::Result<Self> {
         let db = Database::builder()
             .set_cache_size(cache_bytes)
             .create(path)?;
@@ -234,6 +246,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn create_refuses_an_existing_store_and_open_reuses_it() {
+        let path = std::env::temp_dir().join("slate_diskstore_create_refuses.redb");
+        let _ = std::fs::remove_file(&path);
+        drop(DiskStore::create(&path, 16 * 1024 * 1024).unwrap());
+        assert!(DiskStore::create(&path, 16 * 1024 * 1024).is_err());
+        assert!(DiskStore::open(&path, 16 * 1024 * 1024).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn diskstore_round_trips_an_account() {
         let path = std::env::temp_dir().join("slate_diskstore_roundtrip.redb");
         let _ = std::fs::remove_file(&path);
@@ -290,7 +312,7 @@ mod tests {
             store.checkpoint_flush(&checkpoint).unwrap();
         } // drop closes the db, standing in for a process exit
 
-        let store = DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let store = DiskStore::open(&path, 16 * 1024 * 1024).unwrap();
         let got = store.read_checkpoint().expect("checkpoint survived reopen");
         assert_eq!(got, checkpoint);
         let (acct, s) = store.get(&key).expect("account present after reopen");

@@ -97,7 +97,7 @@ pub async fn backfill(
         let AccountStoreChoice::Disk { path, cache_bytes } = account_store else {
             anyhow::bail!("--resume requires --store disk");
         };
-        let mut disk = crate::store::DiskStore::create(&path, cache_bytes)?;
+        let mut disk = crate::store::DiskStore::open(&path, cache_bytes)?;
         disk.set_checkpoint_mode(true);
         let mut bank = ReplayBank::with_store(Box::new(disk));
         let restored = bank
@@ -351,7 +351,12 @@ pub async fn backfill(
         bank.flush();
         let mut end_store: Box<dyn AccountStore> = match &end_store_mode {
             None => Box::new(MemStore::default()),
-            Some((path, cache_bytes)) => Box::new(DiskStore::create(path, *cache_bytes)?),
+            Some((path, cache_bytes)) => {
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
+                Box::new(DiskStore::create(path, *cache_bytes)?)
+            }
         };
         let (loaded, _) = snapshot::stream_into_store(
             end_snapshot,

@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     let slot: u64 = args.next().expect("slot").parse()?;
     let elf_path = args.next();
 
-    let store = DiskStore::create(&path, 1 << 28)?;
+    let store = DiskStore::open(&path, 1 << 28)?;
     let bank = ReplayBank::with_store(Box::new(store));
     let fs = build_feature_set(&bank, slot);
     let svm: SVMFeatureSet = fs.runtime_features();

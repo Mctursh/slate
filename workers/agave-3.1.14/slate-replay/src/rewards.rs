@@ -1320,7 +1320,7 @@ mod mainnet_tests {
         let m = read_manifest_fields(File::open(snap).unwrap(), 349_047_024).unwrap();
         let inflation = m.inflation.expect("curve parsed");
 
-        let store = DiskStore::create("/tmp/rewards-check.redb", 1 << 30).unwrap();
+        let store = DiskStore::open("/tmp/rewards-check.redb", 1 << 30).unwrap();
         let bank = ReplayBank::with_store(Box::new(store));
         let fs = build_feature_set(&bank, m.slot);
 

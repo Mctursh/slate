@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     let boundary_slot: u64 = a[3].parse().context("boundary_slot")?;
     let rpc = &a[4];
 
-    let store = DiskStore::create(store_path, 2 * 1024 * 1024 * 1024)?;
+    let store = DiskStore::open(store_path, 2 * 1024 * 1024 * 1024)?;
     let raw = store
         .read_checkpoint()
         .context("store has no checkpoint; it was never replayed into")?;

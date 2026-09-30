@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     let apply = a.next().is_some_and(|f| f == "--apply");
 
     // The store is ~5M rows against >1e9 snapshot records, so candidates come from the store.
-    let mut store = DiskStore::create(&store_path, 1 << 30)?;
+    let mut store = DiskStore::open(&store_path, 1 << 30)?;
     let mut held: HashMap<Pubkey, u64> = HashMap::new();
     store.scan(&mut |pubkey, account| {
         if account.lamports() > 0 {

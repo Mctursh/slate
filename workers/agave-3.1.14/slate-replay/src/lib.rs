@@ -1529,7 +1529,7 @@ mod tests {
             bank.set_capitalization(2_000);
         } // drop closes the db, standing in for a crash
 
-        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let disk = crate::store::DiskStore::open(&path, 16 * 1024 * 1024).unwrap();
         let mut bank = ReplayBank::with_store(Box::new(disk));
         let restored = bank
             .restore_checkpoint()
@@ -1560,7 +1560,7 @@ mod tests {
                 .unwrap();
         }
 
-        let disk = crate::store::DiskStore::create(&path, 16 * 1024 * 1024).unwrap();
+        let disk = crate::store::DiskStore::open(&path, 16 * 1024 * 1024).unwrap();
         let mut bank = ReplayBank::with_store(Box::new(disk));
         assert!(bank.restore_checkpoint().is_err());
 

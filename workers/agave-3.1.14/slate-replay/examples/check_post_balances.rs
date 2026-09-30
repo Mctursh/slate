@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
     let store_path = a.next().context("usage: <store.redb> <post-balances.txt>")?;
     let list = a.next().context("list")?;
-    let store = DiskStore::create(&store_path, 1 << 28)?;
+    let store = DiskStore::open(&store_path, 1 << 28)?;
     let (mut ok, mut bad, mut missing) = (0usize, 0usize, 0usize);
     for line in std::fs::read_to_string(&list)?.lines() {
         let mut it = line.split_whitespace();
