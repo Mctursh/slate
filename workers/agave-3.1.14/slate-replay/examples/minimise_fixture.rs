@@ -6,11 +6,12 @@
 //!
 //! Usage: minimise_fixture <in.slfix> <out.slfix>
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use slate_format::fixture::Fixture;
 use slate_replay::fixture_capture::{replay_fixture, replay_fixture_with_bank};
+use slate_replay::store::AccountStore as _;
 use solana_pubkey::Pubkey;
 
 fn main() -> Result<()> {
@@ -22,12 +23,32 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("decoding {}: {e}", a[0]))?;
     eprintln!("input: {} accounts", full.accounts.len());
 
-    let (hash, mut bank) = replay_fixture_with_bank(&full).context("replaying the full fixture")?;
+    let (hash, bank) = replay_fixture_with_bank(&full).context("replaying the full fixture")?;
     if hash.to_bytes() != full.expected_bank_hash {
         bail!("the input fixture does not replay to its own recorded hash");
     }
-    let written: HashSet<Pubkey> = bank.take_writes().into_iter().map(|w| w.pubkey).collect();
-    eprintln!("the boundary writes {} accounts", written.len());
+    // A boundary writes through insert(), so take_writes() is empty; diff the bank instead.
+    let mut before: HashMap<Pubkey, u64> = HashMap::with_capacity(full.accounts.len());
+    for (pubkey, record) in &full.accounts {
+        let r = slate_format::decode_account(record)
+            .map_err(|e| anyhow::anyhow!("fixture account: {e}"))?;
+        before.insert(Pubkey::new_from_array(*pubkey), value_of(r.lamports, r.rent_epoch, r.executable, &r.owner, r.data));
+    }
+    let mut written: HashSet<Pubkey> = HashSet::new();
+    bank.store().scan(&mut |pubkey, account| {
+        use solana_account::ReadableAccount;
+        let after = value_of(
+            account.lamports(),
+            account.rent_epoch(),
+            account.executable(),
+            &account.owner().to_bytes(),
+            account.data(),
+        );
+        if before.get(&pubkey) != Some(&after) {
+            written.insert(pubkey);
+        }
+    });
+    eprintln!("the boundary changes {} accounts", written.len());
 
     let block: slate_replay::block::Block = bincode::deserialize(&full.block)?;
     let mut keep: HashSet<Pubkey> = written;
@@ -67,4 +88,16 @@ fn main() -> Result<()> {
         bytes.len() as f64 / 1e9
     );
     Ok(())
+}
+
+// A digest, not the bytes: 825 carries 10.1M accounts and the values alone would be gigabytes.
+fn value_of(lamports: u64, rent_epoch: u64, executable: bool, owner: &[u8; 32], data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lamports.hash(&mut h);
+    rent_epoch.hash(&mut h);
+    executable.hash(&mut h);
+    owner.hash(&mut h);
+    data.hash(&mut h);
+    h.finish()
 }

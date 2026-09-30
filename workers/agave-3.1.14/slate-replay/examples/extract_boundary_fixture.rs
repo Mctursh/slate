@@ -116,27 +116,72 @@ fn main() -> Result<()> {
     // replayed footprint, and an account written there but seeded absent mixes out as zero.
     let mut resolved: Vec<(Pubkey, (solana_account::AccountSharedData, u64))> = Vec::new();
     let mut in_store: HashSet<Pubkey> = HashSet::new();
+    let mut dead_in_store: HashSet<Pubkey> = HashSet::new();
     store.scan(&mut |key, account| {
         in_store.insert(key);
+        if account.lamports() == 0 {
+            dead_in_store.insert(key);
+            return;
+        }
         resolved.push((key, (account.clone(), checkpoint.slot)));
     });
-    let missing: HashSet<Pubkey> = keys.difference(&in_store).copied().collect();
+    // A dead row may be a stale tombstone, not a real close: re-resolve it against the snapshot.
+    let mut missing: HashSet<Pubkey> = keys.difference(&in_store).copied().collect();
+    missing.extend(dead_in_store.iter().copied());
     eprintln!(
-        "{} accounts from the store, {} more to load from the snapshot",
+        "{} live accounts from the store, {} dead rows to re-resolve, {} to load from the snapshot",
         resolved.len(),
+        dead_in_store.len(),
         missing.len()
     );
+    // stake_keys marks a crossing, which keeps every stake and vote account the manifest cache missed.
+    let mut crossing_stakes: HashSet<Pubkey> = HashSet::new();
     if !missing.is_empty() {
         let from_snapshot = slate_replay::snapshot::load_accounts_with_stakes(
             std::fs::File::open(snap_path)?,
             Some(&missing),
             None,
-            None,
+            Some(&mut crossing_stakes),
         )
         .context("loading the crossing's accounts from the snapshot")?;
         eprintln!("{} accounts found in the snapshot", from_snapshot.len());
-        resolved.extend(from_snapshot);
+        let mut revived = 0usize;
+        for (key, (account, slot)) in from_snapshot {
+            if dead_in_store.contains(&key) {
+                // Strictly newer only: never resurrect a close the replay itself performed.
+                let store_slot = store.get(&key).map(|(_, s)| s).unwrap_or(0);
+                if slot <= store_slot {
+                    continue;
+                }
+                revived += 1;
+            } else if in_store.contains(&key) {
+                continue;
+            }
+            resolved.push((key, (account, slot)));
+        }
+        eprintln!("{revived} dead store rows outranked by a newer snapshot record");
     }
+
+    let mut stake_keys: HashSet<Pubkey> = checkpoint
+        .stake_keys
+        .iter()
+        .map(|k| Pubkey::new_from_array(*k))
+        .collect();
+    stake_keys.extend(crossing_stakes.iter().copied());
+    // The bank resolves delegations by walking this set, so it must name every stake account held.
+    let from_resolved = resolved
+        .iter()
+        .filter(|(_, (a, _))| *a.owner() == solana_sdk_ids::stake::id() && a.lamports() > 0)
+        .map(|(k, _)| *k)
+        .collect::<HashSet<Pubkey>>();
+    let added = from_resolved.difference(&stake_keys).count();
+    stake_keys.extend(from_resolved);
+    eprintln!(
+        "{} stake keys from the checkpoint, {} after the snapshot crossing, {} more held by the bank",
+        checkpoint.stake_keys.len(),
+        stake_keys.len() - added,
+        added
+    );
 
     resolved.sort_unstable_by_key(|(k, _)| *k);
     let accounts: Vec<([u8; 32], Vec<u8>)> = resolved
@@ -174,7 +219,8 @@ fn main() -> Result<()> {
             slots_per_year: manifest.slots_per_year,
             vote_accounts: vote_accounts.iter().map(|k| k.to_bytes()).collect(),
         }),
-        stake_delegations: checkpoint.stake_keys.clone(),
+        stake_delegations: stake_keys.iter().map(Pubkey::to_bytes).collect(),
+        capitalization: Some(checkpoint.capitalization),
     };
 
     let computed = replay_fixture(&fixture).context("replaying the fixture we just built")?;
