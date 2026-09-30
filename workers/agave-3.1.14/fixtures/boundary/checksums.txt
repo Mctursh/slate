@@ -1,3 +1,9 @@
 # sha256 of each published boundary fixture, verified before the file is trusted.
-# Regenerate with: shasum -a 256 *.slfix.zst
+# Regenerate with: ./fixtures/publish-boundary.sh
 # Format: <sha256>  <filename>
+af336880b1af25dbef2eb59e3617aedb81fe1b0f085616a5df86ee06d4d7879a  slot-349056000.slfix.zst
+da4227856e46f0e1d68dea9cdfa73c4719f21dd618e6e739bb6c384313c80499  slot-355536000.slfix.zst
+c2d80fa4b38415c543e33288f4b7b907b52b918196626ccd9a13aff6ae3b8f28  slot-356400000.slfix.zst
+ddc8b8f496221c1addcebf79b8b9f5d2e9dc71465bd1dce1b3912f34bb02bff6  slot-407376000.slfix.zst
+44f629f38775af4d5d98c61e73bd80d137c89d58f2d66361dc0850f519d4f48f  slot-409968000.slfix.zst
+6e806aef09039581c4378d50a9b1697c54c5910616bbbced19f28cd6f7d30543  slot-419472000.slfix.zst
