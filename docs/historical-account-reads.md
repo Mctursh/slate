@@ -18,40 +18,9 @@ slot.
 
 ## Motivation
 
-The read layer answers "now".
+Nothing in the current read layer answers "what did this account hold at slot N". RPC nodes prune, snapshots land a few times per epoch, and per-slot account writes are discarded once they finalize. Common cases: pool reserves just before a swap, program state at the slot an exploit landed, backtesting against the state a strategy saw, reproducing an old bug report.
 
-Ledger history is covered: superbank ingests it into ClickHouse and serves it over
-Solana-compatible JSON-RPC. Current account reads are covered: cloudbreak maintains a
-Postgres-backed segment of account state by program owner and serves
-getProgramAccounts-style reads from it. Nothing in this stack answers "what did this
-account hold at slot N".
-
-The question is routine. Reconstructing a pool's reserves just before a swap. Auditing
-a program's state at the slot an exploit landed. Backtesting against the state a
-strategy actually saw rather than the state that exists now. Reproducing a bug report
-from three days ago. Each of these is currently solved privately, approximately, or
-not at all.
-
-Three things keep it broken, and they compound:
-
-- RPC prunes. An archival node keeps blocks, not per-slot account state.
-- Snapshots are periodic and large. They give you state at a few slots per epoch, not
-  the slot you care about.
-- The per-slot account writes that would answer it are discarded once they finalize.
-
-So the state has to be rebuilt by replaying blocks forward from a snapshot. That part
-is well understood. The hard part is proving the result is right, because a replay
-that is subtly wrong looks exactly like one that is correct unless it is checked
-against something the implementation did not produce itself. Without that check a
-historical answer is a guess with a slot number attached, and a client has no way to
-tell the difference.
-
-Standardising the parameter matters more than it first appears. Any implementation
-that reconstructs history has to express *coverage*: how far back it reaches, whether
-a range is complete, whether a given slot is trustworthy. If each one expresses that
-differently, clients cannot treat them interchangeably, which is the point of having a
-shared spec. Fixing the shape while there are few implementations is cheaper than reconciling
-several later.
+The state can be rebuilt by replaying blocks from a snapshot. The hard part is proving it's right, so any implementation also has to say how much it can vouch for. If each implementation expresses coverage differently, clients can't treat them interchangeably. Fixing the shape while there are few implementations is cheaper than reconciling several later.
 
 ## Specification
 
@@ -96,7 +65,7 @@ error rather than ignoring it and answering for the current slot.
 - `context` gains `fidelity` (string) on `getAccountInfo`, `getBalance` and
   `getProgramAccounts`.
 - `context` gains `fidelities` (array of string) on `getMultipleAccounts`.
-- New method `getCoverage`, returning an array of `{ first_slot, last_slot }`.
+- New method `getCoverage`, returning `{ segments: [{ firstSlot, lastSlot }] }`.
 - No existing field changes meaning or type.
 
 ## Compatibility
@@ -126,79 +95,28 @@ them, is what makes it usable for the cases in the motivation.
 
 ## Reference implementation
 
-[Slate](https://github.com/Mctursh/slate). AGPL-3.0, self-hostable, ClickHouse-backed.
-Serves the four methods with `asOfSlot`, plus `getCoverage`, and tags every response.
+[Slate](https://github.com/Mctursh/slate), AGPL-3.0, ClickHouse-backed. Serves the four methods with `asOfSlot`, plus `getCoverage`.
 
-Correctness is checked three independent ways, because a replay cannot be trusted to
-grade itself, and each check sees a different class of error:
+Backfill checks its replay three independent ways, each catching a different class of error:
 
-1. **Per transaction, against the block's own record.** Every replayed transaction's
-   status, fee, lamport balances and token amounts are compared to the meta the block
-   recorded. This is the narrowest check and gives the most precise diagnostics, but it
-   is blind to account data the block does not report.
-2. **Per slot, against consensus.** Each replayed slot's bank hash is compared to the
-   hash validators voted on, parsed out of the vote transactions in later blocks. This
-   covers the data the per-transaction check cannot see, since every byte of every
-   written account feeds the hash. The run halts at the first slot it cannot reproduce,
-   so coverage never extends past verified state.
-3. **End state, against an artifact it did not produce.** At the end of a range the
-   reconstructed state is diffed against the official Solana snapshot at that slot,
-   account by account, comparing lamports, owner, executable flag and data. A hash
-   mismatch says something is wrong; this says which account.
+1. **Per transaction**: status, fee, lamports and token balances against the block's recorded meta.
+2. **Per slot**: bank hash against the hash validators voted on. Every byte of every written account feeds it. The run halts at the first mismatch, so coverage never extends past verified state.
+3. **End state**: account-by-account diff against the official snapshot at the end of the range.
 
-Most recent run: a full snapshot-to-snapshot mainnet window, 50,079 slots, and the end
-state byte-exact against the snapshot at the end of it across 8,412,739 accounts with
-zero mismatches. Slots are vote-verified except one per replayed chunk, whose
-confirming votes fall outside the window being replayed and so are simply unavailable
-rather than mismatched.
+Results on mainnet:
 
-Two consensus-breaking bugs were found this way, each by a different check, which is
-the argument for keeping all three:
-
-- **Incinerator burn**, caught by the per-slot hash check. Lamports sent to the
-  incinerator are destroyed when the bank freezes. The replay credited the account and
-  left them there. This is invisible for almost every slot, because a zero-lamport
-  account contributes nothing to the accounts lattice, so a missing burn changes nothing
-  until a slot actually burns. It surfaced once in 29,538 slots.
-- **Program delay visibility**, caught by the per-transaction check. A program deployed
-  or upgraded in a slot is not invokable for the remainder of that slot. A mid-block
-  Raydium upgrade was followed by seven transactions that failed on chain and succeeded
-  in the replay, because the upgraded program was made available immediately.
-
-Current scope, stated plainly. The largest window verified against consensus votes is 89,953
-slots across the 824 → 825 crossing; a separate 50,079-slot run inside epoch 808 is the one
-also diffed byte-for-byte against the official snapshot at its end, 8,412,739 of 8,412,739
-accounts. Epoch boundaries are replayed as well, verified at six crossings (807 → 808,
-822 → 823, 824 → 825, 942 → 943, 948 → 949, 970 → 971): pending features activate, the
-inflation pool and vote commission match mainnet to the lamport, and every stake-reward
-partition pays out on the blocks that carried it. 174,656 slots are verified in total.
-
-Reaching further back needs a different agave than reaching forward does, because a given
-version doesn't know features that activate after it was cut and has already deleted code
-earlier epochs need. The range is therefore sliced into eras, one worker per agave version,
-each pinned to its own lockfile and toolchain so a later era can't disturb an earlier one's
-proof. Two eras cover epoch 807 to the present.
-
-The four epochs in 807–978 that rewrite accounts at their boundary are implemented and
-bit-exact (823 Stake to core BPF, 943 Rent sysvar, 949 vote state v4, 971 SPL Token to
-p-token), and the SVM's program-runtime environment is rebuilt at each epoch crossing from
-the feature set at that crossing.
-
-What is not done: 21 of the 27 feature activations in the range have never had a window
-replayed through them. Four of those are networking-layer and cannot affect account state,
-which leaves 17 unproven. The v2 loader environment is also carried across a crossing rather
-than rebuilt. Verification is also honest about its own limits: an era spans roughly 74 million
-slots, replaying all of them is not on the table, so coverage is built at the points where
-behaviour actually changes rather than claimed across the whole range, and 174,656 verified
-slots is 0.24% of the era by count. Extending this is engineering, not open research, but it
-is not done.
+- 440,342 consecutive slots vote-verified from epoch 807 to 809, crossing both boundaries.
+- Every account a 50,079-slot range touched, byte-exact against mainnet's own snapshot at its end: 8,412,739 / 8,412,739.
+- Epoch boundaries 808, 809, 823, 825, 943, 949 and 971 reproduce mainnet's bank hash, including all four in epochs 807 to 978 that rewrite accounts.
+- Not done: 20 of the 27 feature activations in that range have no replayed window through them. 4 are networking-only.
 
 ## Security considerations
 
 - **Unbounded historical scans.** `getProgramAccounts` with an old `asOfSlot` can touch
   far more state than the current-slot form. The reference implementation paginates with
-  an opaque cursor and a server-enforced limit. The spec should require servers to bound
-  the result rather than leave it implementation-defined.
+  an opaque cursor, but only when the caller passes `limit`; it does not cap unpaged
+  scans yet. The spec should require servers to bound the result rather than leave it
+  implementation-defined.
 - **Storage-driven denial of service.** Coverage is chosen by the operator, not the
   caller, and `getCoverage` lets clients avoid queries a server cannot serve, which keeps
   the expensive failure path off the hot path.

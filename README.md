@@ -2,123 +2,95 @@
 
 [![CI](https://github.com/Mctursh/slate/actions/workflows/ci.yml/badge.svg)](https://github.com/Mctursh/slate/actions/workflows/ci.yml)
 
-Historical Solana account state, queryable at any past slot.
+Historical Solana account state, served over JSON-RPC at any past slot.
 
-A normal Solana RPC answers "what does account X look like now." Slate answers "what did account X look like at slot N," for a slot in the past. That history isn't archived anywhere you can query today. Full snapshots are periodic and huge, and the per-slot account writes that flow past on Yellowstone gRPC get dropped once they finalize. Slate captures those writes, keeps them in ClickHouse keyed by (pubkey, slot), and serves them back through the standard Solana JSON-RPC methods with an as-of-slot argument.
+Slate stores every account write for a program in ClickHouse, keyed by `(pubkey, slot)`, and answers `getAccountInfo`, `getProgramAccounts`, `getBalance` and `getMultipleAccounts` with an `asOfSlot` argument. History comes from two places: live capture off Yellowstone gRPC, and backfill, which replays past blocks through the SVM and checks every slot against consensus.
 
-Slate is open source and self-hostable. You run it, point it at the program you want to capture, and the data and the source are yours.
-
-> Slate is licensed under AGPL-3.0-only (see `LICENSE`).
+> [!NOTE]
+> AGPL-3.0-only. See `LICENSE`.
 
 ## Status
 
-v0.2. Live ingest is v1, proven on devnet, not yet mainnet-scale.
+Backfill replays mainnet era 1 (epochs 807 to 978) on agave 3.1.14. Live capture is tested on devnet, not yet at mainnet scale.
 
-Backfill has replayed a full snapshot-to-snapshot mainnet window, 50,079 slots, verified two independent ways: every slot's bank hash checked against the consensus hash carried in that block's own vote transactions, and the end state diffed byte-for-byte against the official snapshot at the end of the range, 8,412,739 accounts with zero mismatches.
+| Check | Result |
+| --- | --- |
+| Longest contiguous range | 440,342 slots from epoch 807 to 809, crossing both boundaries, every bank hash matching a consensus vote |
+| Epoch boundaries reproduced | 808, 809, 823, 825, 943, 949, 971 |
+| Account-rewriting boundaries | all four in era 1: 823 Stake to Core BPF, 943 Rent sysvar, 949 vote state v4, 971 p-token |
+| Not yet verified | 20 of the 27 feature activations in era 1 have no replayed window through them (4 are networking-only) |
 
-Epoch boundaries are replayed too. Six crossings reproduce mainnet's bank hash at the boundary slot exactly: 807 → 808, 822 → 823, 824 → 825, 942 → 943, 948 → 949 and 970 → 971. That includes the inflation pool, the vote commission and every stake-reward partition matching to the lamport, the `EpochRewards` sysvar tracking agave's own values through to the slot it deactivates on, and the four epochs in this range that rewrite program or sysvar accounts at the boundary. 174,656 slots are verified in total, concentrated at the boundaries where behaviour changes rather than spread evenly; [workers/README.md](workers/README.md) has the per-window breakdown.
-
-Builtin registration and precompile verification key off the feature set the replay builds from the on-chain feature accounts, so a range elsewhere in history gets the programs that actually existed at those slots, and the SVM's program-runtime environment is rebuilt at each epoch crossing from the feature set at that crossing. The limits worth knowing: the v2 loader environment is carried across a crossing rather than rebuilt, most of the 27 feature activations in 807–978 have never had a window replayed through them, and fidelity has a tail still being closed. The replay records coverage up to the last verified slot and never guesses (see [Roadmap](#roadmap) and [workers/README.md](workers/README.md)).
+Per-window numbers are in [workers/README.md](workers/README.md).
 
 ## How it works
-
-Slate needs a complete starting point, then everything that changes after it.
-
-1. **Baseline.** On startup it loads the full account set for a program at a recent slot (from `getProgramAccounts`, or from a snapshot file you provide) and stamps that as the coverage floor.
-2. **Stream.** It follows the Yellowstone gRPC stream from just after that slot and commits each account write when its slot finalizes.
-3. **Coverage.** It records the contiguous slot ranges it has actually captured. If the stream drops and reconnects, the hole is recorded, not papered over.
-
-Every read carries a fidelity flag. `Exact` means the answer sits inside a captured range. `Uncertain` means the query is below the floor or across a gap, so Slate still returns its best answer but tells you it can't vouch for it. It won't silently hand back stale or guessed state.
-
-That's the live path. Backfill is the other way to fill history: instead of streaming forward, it replays a past slot range through the SVM (seeded from a snapshot, pulling blocks from an archive) and writes the same per-slot history. Use it for slots before you started, or a program you weren't watching. See [Backfill](#backfill).
 
 ```mermaid
 flowchart LR
   GRPC[Yellowstone gRPC] --> Ingest[slate-ingest]
-  RPC[getProgramAccounts / snapshot] -->|baseline| Ingest
+  RPC[getProgramAccounts] -->|baseline| Ingest
+  Blocks[getBlock archive] --> Backfill[slate-backfill]
+  Snap[full snapshot] -->|seed| Backfill
   Ingest --> CH[(ClickHouse)]
+  Backfill --> CH
   CH --> Serve[slate-rpc]
-  Serve --> Client[JSON-RPC client]
 ```
 
-## Features
-
-- Capture live account writes from any Yellowstone gRPC endpoint, finalized commitment.
-- Bootstrap from a `getProgramAccounts` baseline or a full snapshot file.
-- Backfill past slots by replaying them through the SVM, seeded from a snapshot and self-verified against on-chain consensus.
-- Standard Solana JSON-RPC, every method takes an as-of slot.
-- Honest coverage: a fidelity flag on every response, recorded gaps on reconnect.
-- Keyset pagination for large program scans.
-- A differential harness that validates Slate against an independent reference RPC.
+- **Live.** Loads a program's accounts with `getProgramAccounts`, then streams writes from Yellowstone gRPC. Writes are buffered per slot and committed when the slot finalizes. A reconnect starts a new coverage segment, so the gap stays visible.
+- **Backfill.** Seeds from a full snapshot, replays blocks through the agave SVM, and halts at the first slot it can't reproduce. Coverage is recorded up to the last good slot.
+- **Fidelity.** Every read says `exact` (inside a covered segment) or `uncertain` (below the floor or across a gap).
+- Coverage isn't tracked per program, so keep one program per database.
 
 ## RPC methods
 
-The account methods take the pubkey(s) plus a config object. `asOfSlot` is optional; omit it to get the latest captured slot. Responses use the Agave `{ context, value }` shape with an added `context.fidelity`.
-
 | Method | Params | Returns |
 | --- | --- | --- |
-| `getAccountInfo` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value }`. The account as base64, or `null`. |
-| `getProgramAccounts` | `programId, { asOfSlot?, limit?, cursor? }` | `{ context: { slot, fidelity, nextCursor? }, value: [{ pubkey, account }] }`. Pass `limit` for keyset pagination and thread `nextCursor` until it's `null`. `cursor` is only applied with `limit`. |
-| `getBalance` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value: lamports }`. |
-| `getMultipleAccounts` | `pubkeys[], { asOfSlot? }` | `{ context: { slot, fidelities }, value: [...] }`. Accounts in order, `null` per missing, one fidelity per position. |
-| `getCoverage` | none | `{ segments: [{ firstSlot, lastSlot }] }`. Captured slot ranges, ascending; gaps are the space between segments. |
-| `getFirstAvailableSlot` | none | The earliest captured slot (number), or error `-32000` when nothing is captured yet. |
+| `getAccountInfo` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value }` |
+| `getBalance` | `pubkey, { asOfSlot? }` | `{ context: { slot, fidelity }, value: lamports }` |
+| `getMultipleAccounts` | `pubkeys[], { asOfSlot? }` | `{ context: { slot, fidelities }, value: [...] }`, one fidelity per position |
+| `getProgramAccounts` | `programId, { asOfSlot?, limit?, cursor? }` | `{ context: { slot, fidelity, nextCursor? }, value }`. Page with `limit`, follow `nextCursor` until `null` |
+| `getCoverage` | none | `{ segments: [{ firstSlot, lastSlot }] }` |
+| `getFirstAvailableSlot` | none | earliest covered slot |
 
-**Fidelity.** Every account read carries `context.fidelity`. `exact` means the answer sits inside a captured range; `uncertain` means it's below the floor or across a gap, so Slate still returns its best answer but flags that it can't vouch for it. New values may be added later, so treat anything you don't recognize as `uncertain`.
-
-**Compatibility.** For `getAccountInfo`, `getBalance`, and `getMultipleAccounts` the request and response shapes match Solana, so `asOfSlot` and `fidelity` are the only additions. `getProgramAccounts` always wraps its result in the `{ context, value }` envelope (Solana returns a bare array unless you pass `withContext: true`) so the context can carry `fidelity` and `nextCursor`. Standard Solana config fields (`commitment`, `encoding`, `dataSlice`, `minContextSlot`, and `getProgramAccounts` `filters`) are accepted for compatibility but not applied yet; any other field is rejected as invalid params. lamports are JSON numbers like Solana, with the same >2^53 precision caveat. Base64 only for now; no `memcmp` / `dataSize` filters or `jsonParsed` encoding yet (see [Roadmap](#roadmap)).
-
-**Errors.** Standard JSON-RPC 2.0 codes: `-32700` / `-32600` / `-32601` (transport), `-32602` (invalid params, e.g. a malformed pubkey), `-32603` (internal), plus `-32000` (getFirstAvailableSlot on an empty store).
+- Omit `asOfSlot` to read at the latest covered slot. With nothing covered yet, reads return `-32000`.
+- Data is base64 only. `commitment`, `encoding`, `dataSlice`, `minContextSlot`, `filters` and `withContext` are accepted so Solana clients work, but **ignored**: a `getProgramAccounts` call with `filters` returns every account. Unknown fields are rejected with `-32602`.
+- `getProgramAccounts` always returns the `{ context, value }` envelope.
+- Treat an unrecognized `fidelity` value as `uncertain`.
 
 ## Quick start
 
-You need Docker (for ClickHouse), Rust, a Yellowstone gRPC endpoint, and a JSON-RPC endpoint for the baseline.
+Needs Docker, Rust, a Yellowstone gRPC endpoint and a JSON-RPC endpoint for the baseline.
 
 ```sh
-# 1. Start ClickHouse
-docker compose up -d
+docker compose up -d        # ClickHouse, dev credentials slate/slate
 
-# 2. Create the tables
 for f in slate-common/ddl/*.sql; do
   docker exec -i slate-clickhouse clickhouse-client --user slate --password slate --multiquery < "$f"
 done
 
-# 3. Configure
-cp slate.example.toml slate.toml
-# edit slate.toml: set [ingest] grpc-endpoint, program, x-token, and baseline-rpc
+cp slate.example.toml slate.toml   # set [ingest] grpc-endpoint, program, x-token, baseline-rpc
 
-# 4. Capture (baseline, then live stream)
-cargo run -p slate-ingest --bin live
-
-# 5. Serve (in another terminal)
-cargo run -p slate-rpc
+cargo run -p slate-ingest --bin live   # baseline, then live stream
+cargo run -p slate-rpc                 # serves on 127.0.0.1:8899
 ```
-
-Query an account as of a past slot:
 
 ```sh
 curl -s localhost:8899 -X POST -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["<pubkey>", {"asOfSlot": 479302991}]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["<pubkey>",{"asOfSlot":479302991}]}'
 ```
 
-The response's `context.fidelity` tells you whether Slate can vouch for that slot.
+The compose file is for local use only: default password, ports published on the host.
+
+## Configuration
+
+`slate.toml`, or `--config <path>`. Every key is in [slate.example.toml](slate.example.toml). `GRPC_TOKEN` overrides `[ingest].x-token`. `slate.toml` is gitignored.
 
 ## Backfill
 
-Live capture only covers slots from when you started. Backfill fills the past: it replays a slot range through the SVM, seeded from a snapshot, and writes the same per-slot history. Use it for slots you missed, or a program you weren't watching.
+Needs a full snapshot at the start of the range and a `getBlock` source for the blocks. Writes to the same ClickHouse as live capture.
 
-It needs two things live capture doesn't: a **snapshot** at the start of the range to seed from, and an **archive** to pull the range's blocks from.
+**Snapshot.** Mainnet full snapshots for every epoch are in the Solana Foundation warehouse buckets (for example `gs://mainnet-beta-ledger-us-ny5/`, requester-pays).
 
-**Block source.** Slate reads blocks over `getBlock`, so any JSON-RPC archive works. For old slots that means [Old Faithful](https://github.com/rpcpool/yellowstone-faithful) (`faithful-cli`), which serves any historical block out of the CAR archives without downloading them.
-
-Build `faithful-cli` from source. The prebuilt macOS release won't run on Apple Silicon (unsigned, killed on launch). It's one command:
-
-```sh
-git clone --depth 1 https://github.com/rpcpool/yellowstone-faithful
-cd yellowstone-faithful && make   # needs Go; produces ./bin/faithful-cli
-```
-
-`getBlock` needs only two indexes per epoch (~11 GB), not the 837 GB CAR. The CAR is range-served over HTTP. Download the indexes and point a config at them:
+**Blocks.** Any `getBlock` RPC works. For old slots, run [Old Faithful](https://github.com/rpcpool/yellowstone-faithful) locally: it needs only the epoch's `slot-to-cid` and `cid-to-offset-and-size` indexes on disk and reads the CAR over HTTP. Build `faithful-cli` from source (`make`, needs Go); the prebuilt macOS binary is killed on launch on Apple Silicon.
 
 ```sh
 EPOCH=808
@@ -126,23 +98,16 @@ CID=$(curl -s https://files.old-faithful.net/$EPOCH/epoch-$EPOCH.cid)
 for t in slot-to-cid cid-to-offset-and-size; do
   curl -sL -O "https://files.old-faithful.net/$EPOCH/epoch-$EPOCH-$CID-mainnet-$t.index"
 done
-faithful-cli rpc --listen :8888 epoch-$EPOCH.yml   # config points at the two local indexes + the remote CAR
+faithful-cli rpc --listen :8888 epoch-$EPOCH.yml   # yml points at the two indexes and the remote CAR
 ```
 
-**Snapshot.** Seed from a full snapshot at the first slot of your range (mainnet snapshots live in the warehouse buckets, e.g. `gs://mainnet-beta-ledger-us-ny5/`, requester-pays). Point `--verify-boundary` at a second snapshot at the end to check the result byte-for-byte.
-
-Backfill writes to the same ClickHouse as live capture. Have it running with the tables created ([Quick start](#quick-start) steps 1 and 2) and `[clickhouse]` set in `slate.toml`.
-
-**Run it.**
-
-The backfill CLI lives in its era's worker, so run it from there (see
-[workers/README.md](workers/README.md) for which era covers which epochs):
+**Run** from the era's worker ([workers/README.md](workers/README.md) says which era covers which epochs):
 
 ```sh
 cd workers/agave-3.1.14
 cargo run -p slate-backfill --release -- \
   snapshot-<from>.tar.zst \
-  --from <start_slot> --to <end_slot> \
+  --from <snapshot_slot> --to <end_slot> \
   --program <pubkey> \
   --rpc http://localhost:8888 \
   --store disk --store-path accounts.redb --cache-size 34359738368 \
@@ -151,109 +116,75 @@ cargo run -p slate-backfill --release -- \
   --verify-boundary snapshot-<to>.tar.zst
 ```
 
-`--store disk` keeps a range too big for RAM on disk (pure Rust, no extra deps). Old Faithful flakes under load, so the fetch retries hard; `--fetch-concurrency 16` is a safe default. Drop `--verify-boundary` if you don't have the end snapshot.
+| Flag | What it does |
+| --- | --- |
+| `--store disk` | keep accounts in a redb file instead of RAM; needed for mainnet-size ranges |
+| `--block-cache` | keep fetched blocks so a rerun or resume doesn't fetch them again |
+| `--verify-boundary` | diff the end state byte-for-byte against the real snapshot at `--to`; exits non-zero on any mismatch |
+| `--resume` | continue from the last checkpoint; pass the same snapshot, `--store-path` and `--block-cache` |
+| `--chunk-slots` | slots per checkpoint, default 2000 |
+| `--dry-run` | fetch and parse the range without a snapshot, as a preflight |
 
-**Long runs.** A run checkpoints its accounts and bank-hash roll state together every `--chunk-slots` (default 2000). If it stops, for any reason, `--resume` continues from the last checkpoint instead of re-seeding from the snapshot:
+Each long phase prints one progress line with a count, rate and ETA. It redraws in place on a terminal and prints a fresh line every 30s when piped to a log.
+
+A run stops at the first slot it can't reproduce and prints `halted at slot ...`. That still exits 0, so check the output, not the exit code.
+
+## Tests
+
+Root workspace tests use a separate `slate_test` database. Create it once, with ClickHouse running:
+
+```sh
+docker exec -i slate-clickhouse clickhouse-client --user slate --password slate \
+  --query "CREATE DATABASE IF NOT EXISTS slate_test"
+for f in slate-common/ddl/*.sql; do
+  sed 's/slate\./slate_test./g' "$f" \
+    | docker exec -i slate-clickhouse clickhouse-client --user slate --password slate --multiquery
+done
+
+cargo test --workspace -- --test-threads=1
+```
+
+Each era worker is its own workspace and needs no database:
 
 ```sh
 cd workers/agave-3.1.14
-cargo run -p slate-backfill --release -- --resume \
-  --from <start_slot> --to <end_slot> \
-  --program <pubkey> \
-  --rpc http://localhost:8888 \
-  --store disk --store-path accounts.redb \
-  --block-cache blocks.redb
+cargo test --workspace   # unit tests + slot fixtures, offline
+cargo test --release -p slate-replay --features boundary-fixtures --test boundary_fixtures
 ```
 
-`--resume` needs the same `--store-path`, and takes no snapshot argument. `--block-cache` keeps every fetched block, so a resume or re-run doesn't pull them again; point successive runs of the same range at one file.
-
-**What you get.** As it replays, Slate rolls each slot's bank hash forward and checks it against the consensus hash carried in that block's own vote transactions, so every slot is verified against what the network agreed on, no external oracle needed. It stops at the first slot it can't reproduce and records coverage up to the last good one. The same account history lands in ClickHouse, served through the same as-of-slot RPC.
-
-## Configuration
-
-Config lives in `slate.toml` (pass `--config` to point elsewhere). Copy `slate.example.toml` and fill it in. The gRPC token can sit in `[ingest].x-token` or in the `GRPC_TOKEN` env var, which overrides the file. Keep the real `slate.toml` out of git; it's already gitignored.
-
-```toml
-[clickhouse]
-url = "http://localhost:8123"
-database = "slate"
-user = "slate"
-password = "slate"
-
-[ingest]
-grpc-endpoint = "https://your-grpc-endpoint:443"
-program = "<program pubkey>"
-x-token = "<token>"
-baseline-rpc = "https://your-rpc-endpoint"
-
-[rpc]
-bind = "127.0.0.1:8899"
-```
+Slot fixtures are recorded mainnet slots in `fixtures/slots/`, replayed to their consensus bank hash. Boundary fixtures are six epoch-boundary blocks, about 900 MB from the `fixtures-v1` release, cached in `target/boundary-fixtures/` after the first run. Each directory's `expected.txt` says what every fixture covers. CI runs both.
 
 ## Validation
 
-Backfill self-verifies two ways, neither needing a reference RPC. Per slot, it checks its computed bank hash against the consensus hash carried in that block's own vote transactions (see [Backfill](#backfill)), and halts at the first slot it can't reproduce. At the end of a range, `--verify-boundary` diffs the reconstructed state against the official snapshot at `--to`, account by account, comparing lamports, owner, executable flag and data, and exits non-zero on any mismatch. The first proves each step against what the network agreed on; the second proves the destination against an artifact Slate didn't produce.
+Backfill checks itself three ways: every transaction's status, fee, lamports and token balances against the block's recorded meta; every slot's bank hash against consensus votes; and with `--verify-boundary`, the end state against the real snapshot.
 
-The live path is checked separately, by a differential harness: it reads a program's accounts from a reference RPC at that RPC's current slot, waits for Slate to stream past it, then diffs Slate's as-of answer. A match means Slate's reconstruction of a now-past slot agrees with an RPC it never saw, account for account.
+Live capture is checked against an independent RPC that did not seed the baseline:
 
 ```sh
-# use an RPC that is NOT the one seeding Slate's baseline
 REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate -- <program>
 ```
 
 ## Repository layout
 
-| Crate | Purpose |
+| Path | Purpose |
 | --- | --- |
-| `slate-ingest` | Live capture, baseline bootstrap, and the validation harness. |
-| `slate-store` | ClickHouse access: as-of reads, coverage, fidelity. |
-| `slate-rpc` | JSON-RPC server. |
-| `slate-common` | Config. |
-| `slate-hash` | Lattice hash and bank hash. Byte API, no solana deps, shared by every era. |
-| `slate-format` | On-disk byte layouts: account record and resume checkpoint, both versioned. |
+| `slate-ingest` | live capture, baseline load, differential validator |
+| `slate-store` | ClickHouse reads and writes, coverage, fidelity |
+| `slate-rpc` | JSON-RPC server |
+| `slate-common` | config; ClickHouse DDL in `ddl/` |
+| `slate-hash` | lattice hash and bank hash, byte API, shared by every era |
+| `slate-format` | versioned on-disk formats: account record, checkpoint, fixture |
+| `workers/agave-3.1.14` | era 1: replay engine (`slate-replay`) and CLI (`slate-backfill`), own lockfile and toolchain |
 
-Historical replay lives under `workers/`, one **era** per agave version, each its own Cargo
-workspace with its own lockfile and toolchain so that adding an era can't disturb an
-existing one's proof. See [workers/README.md](workers/README.md).
+## What's coming
 
-| Crate (per worker) | Purpose |
-| --- | --- |
-| `slate-replay` | SVM replay engine: seed from a snapshot, replay blocks, self-verify each slot's bank hash. |
-| `slate-backfill` | Backfill CLI: drives the replay over a slot range and persists the history. |
-
-DDL for the ClickHouse tables is in `slate-common/ddl/`.
-
-## Development
-
-The test suite runs against a separate `slate_test` database so it never touches serving data. Create it once, with ClickHouse running:
-
-```sh
-docker exec -i slate-clickhouse clickhouse-client --user slate --password slate \
-  --query "CREATE DATABASE IF NOT EXISTS slate_test"
-
-for f in slate-common/ddl/*.sql; do
-  sed 's/slate\./slate_test./g' "$f" \
-    | docker exec -i slate-clickhouse clickhouse-client --user slate --password slate --multiquery
-done
-```
-
-Then run the tests serially, since they share that database. Each era worker is a separate
-workspace, so it gets its own run:
-
-```sh
-cargo test --workspace -- --test-threads=1
-(cd workers/agave-3.1.14 && cargo test --workspace -- --test-threads=1)
-```
-
-## Roadmap
-
-- **Backfill fidelity.** Close the remaining tail of historical transactions the replay can't yet reproduce, a class at a time.
-- **Multi-epoch backfill.** Crossing an epoch boundary works and is verified at six of them: pending features activate, inflation rewards are calculated and paid out over their partitions, the bank's feature set is rebuilt at the crossing, and the SVM's program-runtime environment is rebuilt with it. The four boundaries in 807–978 that rewrite accounts are all implemented and bit-exact: 823 (Stake to core BPF), 943 (Rent sysvar), 949 (vote state v4), 971 (SPL Token to p-token). What remains is breadth, not mechanism: 21 of the 27 feature activations in the range have never had a window replayed through them, 4 of those are networking-only and can't affect account state, and the v2 loader environment is still carried across a crossing rather than rebuilt.
-- **Gap repair.** Heal recorded coverage holes from incremental snapshots while they're still in retention.
-- **Durable source.** Ingest from a replayable stream (Triton's Fumarole, Helius's LaserStream, and the like), so a reconnect rewinds and most gaps heal on their own.
-- **asOfTime.** Query by timestamp, not just slot.
-- **More surface.** `getTokenAccountsByOwner`, `memcmp` / `dataSize` filters, base58 and jsonParsed encodings.
-- **Scale.** Cheap deep history via S3 tiering, and multi-node.
+- **v0.3.0.** Halts that say what kind of failure they are, with exit codes to match, so a long run can go unattended.
+- **v0.3.1.** Fetch the next chunk while replaying the current one.
+- **Era 2.** A worker on agave 4.2.1 for epoch 979 to the tip.
+- **Era 1 coverage.** Replay windows through the 16 execution-relevant activations not yet crossed.
+- **RPC surface.** `memcmp` / `dataSize` filters, `dataSlice`, base58 and jsonParsed, `getTokenAccountsByOwner`.
+- **Live capture.** Snapshot bootstrap, a replayable stream (Fumarole, LaserStream) so reconnects heal, gap repair from incremental snapshots.
+- **Later.** `asOfTime`, S3 tiering for deep history.
 
 ## License
 
