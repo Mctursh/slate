@@ -30,7 +30,10 @@ fn progress_done() {
     let _ = e.flush();
 }
 
-const BASE_URL: &str = "https://github.com/Mctursh/slate/releases/download/fixtures-v1/";
+const BASE_URL: &str = concat!(
+    env!("CARGO_PKG_REPOSITORY"),
+    "/releases/download/fixtures-v1/"
+);
 const CHECKSUMS: &str = include_str!("../../fixtures/boundary/checksums.txt");
 
 /// `(filename, sha256)` for every published boundary fixture.

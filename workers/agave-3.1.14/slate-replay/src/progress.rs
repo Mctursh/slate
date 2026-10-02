@@ -130,6 +130,7 @@ impl Progress {
         };
         let rate_text = match self.unit {
             Unit::Bytes => format!("{:.0} MB/s", rate / 1e6),
+            Unit::Count if rate < 10.0 => format!("{rate:.1}/s"),
             Unit::Count => format!("{}/s", group(rate as u64)),
         };
         match self.total {

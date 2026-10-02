@@ -1110,7 +1110,16 @@ impl Replayer {
         for (i, block_tx) in block.transactions.iter().enumerate() {
             let tx = match sanitize(&block_tx.transaction, &block_tx.meta.loaded_addresses) {
                 Ok(tx) => tx,
-                Err(err) => return BlockReplay::halted(i, format!("cannot sanitize: {err}")),
+                Err(err) => {
+                    return BlockReplay::halted(
+                        i,
+                        Halt::Unsanitizable {
+                            tx_index: i,
+                            signature: first_signature(&block_tx.transaction),
+                            error: err.to_string(),
+                        },
+                    );
+                }
             };
             let account_keys: Vec<Pubkey> = tx.message().account_keys().iter().copied().collect();
 
@@ -1138,7 +1147,14 @@ impl Replayer {
             }
             let reconciliation = reconcile(&account_keys, &block_tx.meta, &result);
             if !reconciliation.matched() {
-                return BlockReplay::halted(i, reconciliation.issues.join("; "));
+                return BlockReplay::halted(
+                    i,
+                    Halt::ExecutionDivergence {
+                        tx_index: i,
+                        signature: first_signature(&block_tx.transaction),
+                        issues: reconciliation.issues,
+                    },
+                );
             }
 
             // A deploy or upgrade hands back cache entries whose effective_slot is deployment_slot+1,
@@ -1204,6 +1220,7 @@ impl Replayer {
         let mut computed: HashMap<u64, (Hash, usize)> = HashMap::new();
         let mut confirmed: HashMap<u64, Hash> = HashMap::new();
         let mut verified = 0usize;
+        let mut last_verified = None;
         let mut capture = self.fixture_capture.take();
         let mut progress = crate::progress::Progress::lazy(
             "replaying",
@@ -1219,21 +1236,20 @@ impl Replayer {
                 }
                 match computed.remove(&slot) {
                     Some((got, idx)) if got != vote_hash => {
-                        return RangeReplay {
-                            blocks_completed: idx,
-                            halt: Some((
-                                slot,
-                                BlockReplay::halted(
-                                    0,
-                                    format!(
-                                        "bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"
-                                    ),
-                                ),
-                            )),
-                        };
+                        return RangeReplay::halted(
+                            idx,
+                            slot,
+                            Halt::StateDivergence {
+                                computed: got,
+                                vote: vote_hash,
+                            },
+                            verified,
+                            last_verified,
+                        );
                     }
                     Some((got, _)) => {
                         verified += 1;
+                        last_verified = last_verified.max(Some(slot));
                         if let Some(c) = &mut capture
                             && let Err(e) = c.confirm(slot, got, vote_hash)
                         {
@@ -1252,32 +1268,28 @@ impl Replayer {
             }
             let processor = self.processor.new_from(block.slot, epoch);
             let block_replay = self.replay_block_with(&processor, bank, block, epoch);
-            if !block_replay.is_complete() {
-                return RangeReplay {
-                    blocks_completed: completed,
-                    halt: Some((block.slot, block_replay)),
-                };
+            if let Some(halt) = block_replay.halt {
+                return RangeReplay::halted(completed, block.slot, halt, verified, last_verified);
             }
 
             // Record the slot's computed hash; reconcile if its vote already arrived.
             if let Some(got) = bank.parent_bank_hash() {
                 match confirmed.remove(&block.slot) {
                     Some(vote_hash) if got != vote_hash => {
-                        return RangeReplay {
-                            blocks_completed: completed,
-                            halt: Some((
-                                block.slot,
-                                BlockReplay::halted(
-                                    0,
-                                    format!(
-                                        "bank-hash mismatch vs consensus vote: computed {got}, vote {vote_hash}"
-                                    ),
-                                ),
-                            )),
-                        };
+                        return RangeReplay::halted(
+                            completed,
+                            block.slot,
+                            Halt::StateDivergence {
+                                computed: got,
+                                vote: vote_hash,
+                            },
+                            verified,
+                            last_verified,
+                        );
                     }
                     Some(vote_hash) => {
                         verified += 1;
+                        last_verified = last_verified.max(Some(block.slot));
                         if let Some(c) = &mut capture
                             && let Err(e) = c.confirm(block.slot, got, vote_hash)
                         {
@@ -1313,8 +1325,17 @@ impl Replayer {
         RangeReplay {
             blocks_completed: blocks.len(),
             halt: None,
+            verified,
+            last_verified,
         }
     }
+}
+
+fn first_signature(tx: &solana_transaction::versioned::VersionedTransaction) -> String {
+    tx.signatures
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_default()
 }
 
 // Re-supply SIMD-0162's removed check: flag a writable account that was already executable and came out changed (returns its index); skips freshly created accounts (a legit program deploy).
@@ -1384,9 +1405,21 @@ pub struct BlockReplay {
 }
 
 #[derive(Debug)]
-pub struct Halt {
-    pub tx_index: usize,
-    pub reason: String,
+pub enum Halt {
+    StateDivergence {
+        computed: Hash,
+        vote: Hash,
+    },
+    ExecutionDivergence {
+        tx_index: usize,
+        signature: String,
+        issues: Vec<String>,
+    },
+    Unsanitizable {
+        tx_index: usize,
+        signature: String,
+        error: String,
+    },
 }
 
 impl BlockReplay {
@@ -1397,10 +1430,10 @@ impl BlockReplay {
         }
     }
 
-    fn halted(tx_index: usize, reason: String) -> Self {
+    fn halted(tx_index: usize, halt: Halt) -> Self {
         Self {
             replayed: tx_index,
-            halt: Some(Halt { tx_index, reason }),
+            halt: Some(halt),
         }
     }
 
@@ -1412,10 +1445,27 @@ impl BlockReplay {
 #[derive(Debug)]
 pub struct RangeReplay {
     pub blocks_completed: usize,
-    pub halt: Option<(u64, BlockReplay)>,
+    pub halt: Option<(u64, Halt)>,
+    pub verified: usize,
+    pub last_verified: Option<u64>,
 }
 
 impl RangeReplay {
+    fn halted(
+        blocks_completed: usize,
+        slot: u64,
+        halt: Halt,
+        verified: usize,
+        last_verified: Option<u64>,
+    ) -> Self {
+        Self {
+            blocks_completed,
+            halt: Some((slot, halt)),
+            verified,
+            last_verified,
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         self.halt.is_none()
     }
@@ -3345,6 +3395,141 @@ mod tests {
         assert_eq!(balance(&src), src_pre - a1 - fee);
         assert_eq!(balance(&mid), a1 - a2 - fee);
         assert_eq!(balance(&dst), a2);
+    }
+
+    fn empty_block(slot: u64, transactions: Vec<crate::block::BlockTx>) -> Block {
+        Block {
+            slot,
+            parent_slot: slot - 1,
+            blockhash: Hash::new_from_array([slot as u8; 32]),
+            block_height: 0,
+            previous_blockhash: Hash::default(),
+            block_time: 0,
+            transactions,
+            fee_reward: None,
+        }
+    }
+
+    fn block_tx(
+        ixs: &[solana_instruction::Instruction],
+        payer: &Pubkey,
+        meta: crate::block::TxMeta,
+    ) -> crate::block::BlockTx {
+        use solana_message::{Message, VersionedMessage};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+        let message = Message::new(ixs, Some(payer));
+        crate::block::BlockTx {
+            transaction: VersionedTransaction {
+                signatures: vec![
+                    Signature::default();
+                    message.header.num_required_signatures as usize
+                ],
+                message: VersionedMessage::Legacy(message),
+            },
+            meta,
+        }
+    }
+
+    fn meta(pre: Vec<u64>, post: Vec<u64>) -> crate::block::TxMeta {
+        crate::block::TxMeta {
+            err: None,
+            fee: 5_000,
+            compute_units_consumed: 0,
+            pre_balances: pre,
+            post_balances: post,
+            loaded_addresses: crate::block::LoadedAddresses::default(),
+            post_token_balances: vec![],
+        }
+    }
+
+    #[test]
+    fn a_vote_against_a_computed_hash_halts_as_a_state_divergence() {
+        use solana_vote_interface::{instruction::tower_sync, state::TowerSync};
+        let base_slot = 300u64;
+        let wrong = Hash::new_unique();
+        let (vote_account, voter) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let vote = block_tx(
+            &[tower_sync(
+                &vote_account,
+                &voter,
+                TowerSync::new_from_slot(base_slot, wrong),
+            )],
+            &voter,
+            meta(vec![], vec![]),
+        );
+
+        let mut bank = ReplayBank::default();
+        bank.bootstrap_bankhash(LtHash::identity(), Hash::new_from_array([7; 32]));
+        let mut replayer = Replayer::new(base_slot, base_slot / 432_000);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
+
+        let blocks = [
+            empty_block(base_slot, vec![]),
+            empty_block(base_slot + 1, vec![vote]),
+        ];
+        let range = replayer.replay_range(&mut bank, &blocks);
+        match range.halt {
+            Some((slot, Halt::StateDivergence { computed, vote })) => {
+                assert_eq!(slot, base_slot);
+                assert_eq!(vote, wrong);
+                assert_ne!(computed, wrong);
+            }
+            other => panic!("expected a state divergence at {base_slot}, got {other:?}"),
+        }
+        assert_eq!(range.blocks_completed, 0);
+        assert_eq!((range.verified, range.last_verified), (0, None));
+    }
+
+    #[test]
+    fn a_balance_the_chain_never_had_halts_as_an_execution_divergence() {
+        use solana_instruction::{AccountMeta, Instruction};
+        let system = solana_sdk_ids::system_program::id();
+        let (from, to) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let base_slot = 300u64;
+        let mut data = vec![2u8, 0, 0, 0];
+        data.extend_from_slice(&1_000u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: system,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data,
+        };
+        let transfer = block_tx(&[ix], &from, meta(vec![1_000_000, 0, 1], vec![1, 1, 1]));
+
+        let mut bank = ReplayBank::default();
+        bank.insert(
+            from,
+            AccountSharedData::from(Account {
+                lamports: 1_000_000,
+                data: vec![],
+                owner: system,
+                executable: false,
+                rent_epoch: 0,
+            }),
+            base_slot,
+        );
+        let mut replayer = Replayer::new(base_slot, base_slot / 432_000);
+        register_builtins(&mut bank, &replayer.processor, &FeatureSet::all_enabled());
+
+        let range = replayer.replay_range(&mut bank, &[empty_block(base_slot, vec![transfer])]);
+        match range.halt {
+            Some((
+                slot,
+                Halt::ExecutionDivergence {
+                    tx_index,
+                    signature,
+                    issues,
+                },
+            )) => {
+                assert_eq!((slot, tx_index), (base_slot, 0));
+                assert_eq!(
+                    signature,
+                    solana_signature::Signature::default().to_string()
+                );
+                assert!(!issues.is_empty());
+            }
+            other => panic!("expected an execution divergence, got {other:?}"),
+        }
     }
 
     #[test]

@@ -3052,6 +3052,7 @@ dependencies = [
  "slate-common",
  "slate-replay",
  "slate-store",
+ "solana-hash 3.1.0",
  "solana-pubkey 4.3.0",
  "tokio",
 ]
