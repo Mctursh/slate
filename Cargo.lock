@@ -2935,11 +2935,11 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slate"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "slate-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2948,14 +2948,14 @@ dependencies = [
 
 [[package]]
 name = "slate-format"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "slate-hash",
 ]
 
 [[package]]
 name = "slate-hash"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "bs58",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "slate-ingest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "slate-rpc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "slate-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clickhouse",
  "hex",

@@ -1,8 +1,9 @@
 [package]
 name = "slate-replay"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 repository.workspace = true
+license.workspace = true
 
 [features]
 # Boundary fixtures are release assets, not in git: opt in to download and verify them.

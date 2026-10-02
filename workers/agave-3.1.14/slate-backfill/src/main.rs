@@ -17,7 +17,10 @@ use slate_store::ClickHouseClient;
 use solana_pubkey::Pubkey;
 
 #[derive(Parser)]
-#[command(about = "Reconstruct a program's historical account state by replaying a slot range")]
+#[command(
+    about = "Reconstruct a program's historical account state by replaying a slot range",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SLATE_GIT_COMMIT"), ")")
+)]
 struct Args {
     /// Path to the full snapshot the range starts from (omit with --dry-run).
     #[arg(required_unless_present = "dry_run")]

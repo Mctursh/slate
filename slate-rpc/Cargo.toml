@@ -1,7 +1,8 @@
 [package]
 name = "slate-rpc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 [dependencies]
 jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }

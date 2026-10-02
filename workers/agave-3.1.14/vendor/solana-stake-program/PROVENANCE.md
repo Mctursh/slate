@@ -7,6 +7,7 @@ slots that predate its core-BPF migration.
 
 - Crate: `solana-stake-program` 3.0.14, from crates.io
 - Upstream: https://github.com/anza-xyz/agave, path `programs/stake`
+- License: Apache-2.0, upstream's license text is in `LICENSE` here
 - Commit: `f516a8927c76c07f0ebc54ca7a4ce8b2046eee86` (recorded by crates.io in the
   original `.cargo_vcs_info.json`, which is removed here, see below)
 
