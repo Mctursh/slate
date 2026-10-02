@@ -159,7 +159,13 @@ pub fn calculate_epoch_rewards(
     };
 
     let mut points: u128 = 0;
+    let mut progress = crate::progress::Progress::lazy(
+        "epoch boundary: calculating points",
+        Some(delegations.len() as u64),
+        crate::progress::Unit::Count,
+    );
     for (stake_pubkey, delegation) in &delegations {
+        progress.add(1);
         let Some((account, _)) = bank.get_account_shared_data(stake_pubkey) else {
             continue;
         };
@@ -191,9 +197,17 @@ pub fn calculate_epoch_rewards(
         };
     };
 
+    progress.finish();
+
     let mut stake_rewards = Vec::new();
     let mut vote_commission: HashMap<Pubkey, u64> = HashMap::new();
+    let mut progress = crate::progress::Progress::lazy(
+        "epoch boundary: redeeming rewards",
+        Some(delegations.len() as u64),
+        crate::progress::Unit::Count,
+    );
     for (stake_pubkey, delegation) in &delegations {
+        progress.add(1);
         let Some((mut account, _)) = bank.get_account_shared_data(stake_pubkey) else {
             continue;
         };
@@ -225,6 +239,8 @@ pub fn calculate_epoch_rewards(
             });
         }
     }
+
+    progress.finish();
 
     EpochRewardsCalculation {
         point_value: Some(point_value),
@@ -430,7 +446,13 @@ pub fn distribute_partition(
                     a.data().len(),
                     format!("{fl:?}"),
                 ),
-                Some((a, other)) => (a.lamports(), 0, 0, a.data().len(), format!("NOT-STAKE:{other:?}")),
+                Some((a, other)) => (
+                    a.lamports(),
+                    0,
+                    0,
+                    a.data().len(),
+                    format!("NOT-STAKE:{other:?}"),
+                ),
                 None => (0, 0, 0, 0, "ABSENT".to_string()),
             };
             let d = &r.stake.delegation;
@@ -736,6 +758,9 @@ pub fn process_epoch_boundary(
         vote_accounts: _,
     } = inputs;
     let prev_epoch = epoch.saturating_sub(1);
+    eprintln!(
+        "epoch boundary {epoch} at slot {slot}: rolling stake history, then calculating rewards"
+    );
     roll_stake_history(bank, feature_set, prev_epoch, slot);
 
     // The bank's running value: the manifest's is stale by the fees burned since the seed slot.
@@ -779,7 +804,10 @@ pub fn process_epoch_boundary(
                 );
             }
             let _ = f.flush();
-            eprintln!("wrote {} stake rewards to {path}", calculated.stake_rewards.len());
+            eprintln!(
+                "wrote {} stake rewards to {path}",
+                calculated.stake_rewards.len()
+            );
         }
     }
 
@@ -983,8 +1011,15 @@ mod boundary_tests {
 
         let i = inputs(fs, 603_724_512_541_705_391, &mut bank);
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        let out = process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         assert_eq!(out.paid_delegations, 1);
         assert_eq!(out.num_partitions, 1);
@@ -1024,7 +1059,15 @@ mod boundary_tests {
 
         let i = inputs(FeatureSet::all_enabled(), 600_000_000_000, &mut bank);
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         let history = stake_history_of(&bank).expect("entry written");
         assert!(
@@ -1042,8 +1085,15 @@ mod boundary_tests {
             &mut bank,
         );
         let activated = crate::activate_pending_features(&mut bank, 349_056_000);
-        let out =
-            process_epoch_boundary(&mut bank, &i, 808, 349_056_000, Hash::new_unique(), 1_000, activated);
+        let out = process_epoch_boundary(
+            &mut bank,
+            &i,
+            808,
+            349_056_000,
+            Hash::new_unique(),
+            1_000,
+            activated,
+        );
 
         let start = epoch_rewards_of(&bank).distribution_starting_block_height;
         let index = partition_for_block(start, start, out.num_partitions).unwrap();
@@ -1301,7 +1351,7 @@ mod mainnet_tests {
         let m = read_manifest_fields(File::open(snap).unwrap(), 349_047_024).unwrap();
         let inflation = m.inflation.expect("curve parsed");
 
-        let store = DiskStore::create("/tmp/rewards-check.redb", 1 << 30).unwrap();
+        let store = DiskStore::open("/tmp/rewards-check.redb", 1 << 30).unwrap();
         let bank = ReplayBank::with_store(Box::new(store));
         let fs = build_feature_set(&bank, m.slot);
 

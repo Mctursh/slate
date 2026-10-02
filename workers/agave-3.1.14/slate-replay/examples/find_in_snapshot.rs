@@ -38,7 +38,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        if files % 2000 == 0 {
+        if files.is_multiple_of(2000) {
             eprintln!("  .. {files} account files scanned (last slot {slot})");
         }
     }

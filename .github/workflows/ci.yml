@@ -56,10 +56,18 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
 
       # workers/ is excluded from the root workspace, so the replay engine needs its own steps.
-      # Both carry the feature so one build of slate-replay serves them.
-      - name: Replay slot fixtures
+      # Every worker step carries the feature so one build of slate-replay serves them all.
+      - name: Worker format
         working-directory: workers/agave-3.1.14
-        run: cargo test --release -p slate-replay --features boundary-fixtures --test slot_fixtures
+        run: cargo fmt --all --check
+
+      - name: Worker clippy
+        working-directory: workers/agave-3.1.14
+        run: cargo clippy --release --workspace --all-targets --features slate-replay/boundary-fixtures -- -D warnings
+
+      - name: Worker tests and slot fixtures
+        working-directory: workers/agave-3.1.14
+        run: cargo test --release --workspace --features slate-replay/boundary-fixtures -- --skip every_published_boundary_fixture_replays_to_its_recorded_hash
 
       # Downloads ~867 MB of release assets and peaks near 4.3 GB RSS on a 7 GB runner.
       - name: Replay boundary fixtures

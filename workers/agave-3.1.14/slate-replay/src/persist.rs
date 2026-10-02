@@ -6,6 +6,31 @@ use solana_pubkey::Pubkey;
 
 use crate::WriteRecord;
 
+// Only transaction writes are persisted; these owners also take rewards, fees, activations, migrations and sysvar writes.
+const UNPERSISTED_OWNERS: [Pubkey; 11] = [
+    solana_sdk_ids::system_program::ID,
+    solana_sdk_ids::stake::ID,
+    solana_sdk_ids::vote::ID,
+    solana_sdk_ids::feature::ID,
+    solana_sdk_ids::sysvar::ID,
+    solana_sdk_ids::config::ID,
+    solana_sdk_ids::native_loader::ID,
+    solana_sdk_ids::bpf_loader::ID,
+    solana_sdk_ids::bpf_loader_deprecated::ID,
+    solana_sdk_ids::bpf_loader_upgradeable::ID,
+    solana_sdk_ids::loader_v4::ID,
+];
+
+pub fn ensure_persistable(program: &Pubkey) -> anyhow::Result<()> {
+    if UNPERSISTED_OWNERS.contains(program) {
+        anyhow::bail!(
+            "--program {program} is a builtin owner; its accounts also change outside transactions \
+             (rewards, fees, feature activations, migrations), which aren't persisted yet, so its history would be incomplete"
+        );
+    }
+    Ok(())
+}
+
 // Owner-filter the write log to the indexed program; one row per (account, slot) for per-slot history.
 pub fn program_account_rows(writes: &[WriteRecord], owner: &Pubkey) -> Vec<AccountUpdateInsert> {
     writes
@@ -65,6 +90,13 @@ pub async fn persist_program_accounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_owners_are_refused_and_programs_are_not() {
+        assert!(ensure_persistable(&solana_sdk_ids::stake::ID).is_err());
+        assert!(ensure_persistable(&solana_sdk_ids::bpf_loader_upgradeable::ID).is_err());
+        assert!(ensure_persistable(&Pubkey::new_unique()).is_ok());
+    }
     use solana_account::{Account, AccountSharedData};
 
     fn account(owner: Pubkey, lamports: u64, data: &[u8]) -> AccountSharedData {

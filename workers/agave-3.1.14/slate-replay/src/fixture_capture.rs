@@ -135,7 +135,9 @@ impl FixtureCapture {
                 "refusing to write fixture for slot {slot}: inputs replay to {got}, vote {vote}"
             ),
             Err(e) => {
-                anyhow::bail!("refusing to write fixture for slot {slot}: inputs do not replay: {e}")
+                anyhow::bail!(
+                    "refusing to write fixture for slot {slot}: inputs do not replay: {e}"
+                )
             }
         }
         std::fs::create_dir_all(&self.dir)?;

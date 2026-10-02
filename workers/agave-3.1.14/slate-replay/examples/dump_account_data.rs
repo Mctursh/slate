@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
     let path = a.next().context("usage: <store.redb> <pubkey> [out.bin]")?;
     let key = Pubkey::from_str(&a.next().context("pubkey")?)?;
-    let store = DiskStore::create(&path, 1 << 26)?;
+    let store = DiskStore::open(&path, 1 << 26)?;
     let (acct, slot) = store.get(&key).context("absent")?;
     println!(
         "{key} slot {slot} lamports {} owner {} len {}",

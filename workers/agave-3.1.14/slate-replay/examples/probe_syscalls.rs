@@ -1,4 +1,4 @@
-use slate_replay::{build_feature_set, store::DiskStore, ReplayBank};
+use slate_replay::{ReplayBank, build_feature_set, store::DiskStore};
 use solana_program_runtime::solana_sbpf::{ebpf, elf::Executable, verifier::RequisiteVerifier};
 use solana_svm_feature_set::SVMFeatureSet;
 
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     let slot: u64 = args.next().expect("slot").parse()?;
     let elf_path = args.next();
 
-    let store = DiskStore::create(&path, 1 << 28)?;
+    let store = DiskStore::open(&path, 1 << 28)?;
     let bank = ReplayBank::with_store(Box::new(store));
     let fs = build_feature_set(&bank, slot);
     let svm: SVMFeatureSet = fs.runtime_features();
@@ -49,9 +49,16 @@ fn main() -> anyhow::Result<()> {
     for n in NAMES {
         let h = ebpf::hash_symbol_name(n.as_bytes());
         let found = loader.get_function_registry().lookup_by_key(h).is_some();
-        println!("{:<30} hash={:<12} {}", n, h, if found { "ok" } else { "MISSING" });
+        println!(
+            "{:<30} hash={:<12} {}",
+            n,
+            h,
+            if found { "ok" } else { "MISSING" }
+        );
     }
-    let Some(elf_path) = elf_path else { return Ok(()) };
+    let Some(elf_path) = elf_path else {
+        return Ok(());
+    };
     let bytes = std::fs::read(&elf_path)?;
     let loader = std::sync::Arc::new(loader);
     match Executable::load(&bytes, loader.clone()) {
@@ -69,8 +76,12 @@ fn main() -> anyhow::Result<()> {
             let n = text.len() / ebpf::INSN_SIZE;
             for pc in 0..n {
                 let insn = ebpf::get_insn(text, pc);
-                if insn.opc != ebpf::CALL_IMM { continue; }
-                let key = exe.get_sbpf_version().calculate_call_imm_target_pc(pc, insn.imm);
+                if insn.opc != ebpf::CALL_IMM {
+                    continue;
+                }
+                let key = exe
+                    .get_sbpf_version()
+                    .calculate_call_imm_target_pc(pc, insn.imm);
                 if syscalls.lookup_by_key(insn.imm as u32).is_none()
                     && internal.lookup_by_key(key).is_none()
                 {
@@ -89,7 +100,9 @@ fn main() -> anyhow::Result<()> {
             println!("internal functions {}", fr.len());
             if let Ok(out) = std::env::var("DUMP") {
                 let mut s = String::new();
-                for (k, pc) in &fr { s.push_str(&format!("{k} {pc}\n")); }
+                for (k, pc) in &fr {
+                    s.push_str(&format!("{k} {pc}\n"));
+                }
                 std::fs::write(format!("{out}.registry"), s).unwrap();
                 std::fs::write(format!("{out}.text"), text).unwrap();
                 std::fs::write(format!("{out}.ro"), exe.get_ro_section()).unwrap();

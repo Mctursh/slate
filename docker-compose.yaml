@@ -10,10 +10,8 @@ services:
       # let the created user run DDL and manage the slate database
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      # 8123 = HTTP interface (the `clickhouse` Rust crate talks to this)
-      # 9000 = native TCP (clickhouse-client uses this)
-      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
-      - "${CLICKHOUSE_TCP_PORT:-9000}:9000"
+      # Loopback only: a published docker port bypasses the host firewall. clickhouse-client runs via docker exec.
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
     ulimits:
       # ClickHouse wants a high open-file limit or it warns/refuses on startup
       nofile:

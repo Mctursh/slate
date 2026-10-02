@@ -49,7 +49,10 @@ fn no_fixture_sits_in_the_directory_undeclared() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(slot) = name
             .strip_prefix("slot-")
-            .and_then(|s| s.strip_suffix(".slfix.zst").or_else(|| s.strip_suffix(".slfix")))
+            .and_then(|s| {
+                s.strip_suffix(".slfix.zst")
+                    .or_else(|| s.strip_suffix(".slfix"))
+            })
             .and_then(|s| s.parse::<u64>().ok())
         else {
             continue;

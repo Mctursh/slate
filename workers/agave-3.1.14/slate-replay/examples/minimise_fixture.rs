@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, bail};
 use slate_format::fixture::Fixture;
 use slate_replay::fixture_capture::{replay_fixture, replay_fixture_with_bank};
-use slate_replay::store::AccountStore as _;
 use solana_pubkey::Pubkey;
 
 fn main() -> Result<()> {
@@ -32,7 +31,10 @@ fn main() -> Result<()> {
     for (pubkey, record) in &full.accounts {
         let r = slate_format::decode_account(record)
             .map_err(|e| anyhow::anyhow!("fixture account: {e}"))?;
-        before.insert(Pubkey::new_from_array(*pubkey), value_of(r.lamports, r.rent_epoch, r.executable, &r.owner, r.data));
+        before.insert(
+            Pubkey::new_from_array(*pubkey),
+            value_of(r.lamports, r.rent_epoch, r.executable, &r.owner, r.data),
+        );
     }
     let mut written: HashSet<Pubkey> = HashSet::new();
     bank.store().scan(&mut |pubkey, account| {
@@ -54,7 +56,11 @@ fn main() -> Result<()> {
     let mut keep: HashSet<Pubkey> = written;
     keep.extend(slate_replay::block::footprint(std::slice::from_ref(&block)));
     keep.extend(agave_feature_set::FEATURE_NAMES.keys().copied());
-    keep.extend(full.stake_delegations.iter().map(|k| Pubkey::new_from_array(*k)));
+    keep.extend(
+        full.stake_delegations
+            .iter()
+            .map(|k| Pubkey::new_from_array(*k)),
+    );
     if let Some(r) = &full.reward_inputs {
         keep.extend(r.vote_accounts.iter().map(|k| Pubkey::new_from_array(*k)));
     }
@@ -64,7 +70,9 @@ fn main() -> Result<()> {
     keep.extend(programdata);
 
     let mut small = full.clone();
-    small.accounts.retain(|(k, _)| keep.contains(&Pubkey::new_from_array(*k)));
+    small
+        .accounts
+        .retain(|(k, _)| keep.contains(&Pubkey::new_from_array(*k)));
     eprintln!(
         "kept {} of {} accounts ({:.1}%)",
         small.accounts.len(),
@@ -74,9 +82,7 @@ fn main() -> Result<()> {
 
     let got = replay_fixture(&small).context("replaying the minimised fixture")?;
     if got.to_bytes() != full.expected_bank_hash {
-        bail!(
-            "minimised fixture replays to {got}, not the recorded hash; it is missing something"
-        );
+        bail!("minimised fixture replays to {got}, not the recorded hash; it is missing something");
     }
 
     let bytes = small.encode();
@@ -91,7 +97,13 @@ fn main() -> Result<()> {
 }
 
 // A digest, not the bytes: 825 carries 10.1M accounts and the values alone would be gigabytes.
-fn value_of(lamports: u64, rent_epoch: u64, executable: bool, owner: &[u8; 32], data: &[u8]) -> u64 {
+fn value_of(
+    lamports: u64,
+    rent_epoch: u64,
+    executable: bool,
+    owner: &[u8; 32],
+    data: &[u8],
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     lamports.hash(&mut h);

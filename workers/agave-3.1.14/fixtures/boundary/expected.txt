@@ -1,0 +1,11 @@
+# Boundary fixtures, published as the fixtures-v1 release assets pinned by checksums.txt and
+# replayed by `cargo test --features boundary-fixtures`. Each replays one epoch's first block:
+# the feature activation, any account migration, stake history, and the partitioned reward
+# calculation. The blocks carry no transactions, so none of these exercises execution.
+# Format: <slot>  <what the boundary executes>
+349056000  epoch 808: disable_partitioned_rent_collection activation, reward calculation
+355536000  epoch 823: native Stake program migrated to Core BPF, reward calculation
+356400000  epoch 825: enable_sbpf_v2_deployment_and_execution activation, reward calculation
+407376000  epoch 943: SIMD-0194 rent sysvar rewrite, reward calculation
+409968000  epoch 949: SIMD-0185 Core BPF Stake upgraded from buffer for vote_state_v4
+419472000  epoch 971: SPL Token replaced with p-token, commission read from V4 vote state

@@ -264,9 +264,9 @@ fn with_rpc_retry_base<T>(what: &str, base_ms: u64, mut f: impl FnMut() -> Resul
             Err(e) => {
                 attempt += 1;
                 if attempt > RPC_PROBE_RETRIES {
-                    return Err(e.context(format!(
-                        "{what} failed after {RPC_PROBE_RETRIES} retries"
-                    )));
+                    return Err(
+                        e.context(format!("{what} failed after {RPC_PROBE_RETRIES} retries"))
+                    );
                 }
                 let backoff_ms = (base_ms << (attempt as u32 - 1).min(6)).min(20_000);
                 std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
@@ -463,11 +463,11 @@ pub fn footprint(blocks: &[Block]) -> HashSet<Pubkey> {
     set
 }
 
-// Bank-hash confirmations from a block's votes; best-effort, a slot with no confirming vote is reported unverified, never wrong.
+// Bank-hash confirmations from a block's votes; only a successful vote was checked against SlotHashes, so a failed one can carry any hash.
 pub fn vote_confirmations(block: &Block) -> Vec<(u64, Hash)> {
     use solana_vote_interface::instruction::VoteInstruction;
     let mut out = Vec::new();
-    for btx in &block.transactions {
+    for btx in block.transactions.iter().filter(|t| t.meta.succeeded()) {
         let keys = btx.transaction.message.static_account_keys();
         for ix in btx.transaction.message.instructions() {
             if keys.get(ix.program_id_index as usize) != Some(&solana_sdk_ids::vote::id()) {
@@ -487,7 +487,9 @@ pub fn vote_confirmations(block: &Block) -> Vec<(u64, Hash)> {
                 | VoteInstruction::CompactUpdateVoteStateSwitch(u, _) => (&u.lockouts, u.hash),
                 _ => continue,
             };
-            if let Some(slot) = lockouts.iter().map(|l| l.slot()).max() {
+            if let Some(slot) = lockouts.iter().map(|l| l.slot()).max()
+                && slot < block.slot
+            {
                 out.push((slot, hash));
             }
         }
@@ -536,7 +538,10 @@ mod tests {
         assert!(flipped, "fixture has no instruction data to corrupt");
         let err = verify_signatures(&block).unwrap_err().to_string();
         assert!(err.contains("invalid"), "{err}");
-        assert!(err.contains("not Slate"), "the error must attribute the fault: {err}");
+        assert!(
+            err.contains("not Slate"),
+            "the error must attribute the fault: {err}"
+        );
     }
 
     #[test]
@@ -923,5 +928,51 @@ mod tests {
         .unwrap_err();
         assert_eq!(calls.get(), RPC_PROBE_RETRIES + 1);
         assert!(err.to_string().contains("after 10 retries"), "{err}");
+    }
+
+    fn vote(slot: u64, hash: Hash, err: Option<&str>) -> BlockTx {
+        use solana_vote_interface::{instruction::tower_sync, state::TowerSync};
+        let (vote, voter) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let ix = tower_sync(&vote, &voter, TowerSync::new_from_slot(slot, hash));
+        let msg = solana_message::Message::new(&[ix], Some(&voter));
+        BlockTx {
+            transaction: VersionedTransaction {
+                signatures: vec![
+                    solana_signature::Signature::default();
+                    msg.header.num_required_signatures as usize
+                ],
+                message: solana_message::VersionedMessage::Legacy(msg),
+            },
+            meta: TxMeta {
+                err: err.map(str::to_string),
+                fee: 5_000,
+                compute_units_consumed: 0,
+                pre_balances: vec![],
+                post_balances: vec![],
+                loaded_addresses: LoadedAddresses::default(),
+                post_token_balances: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn only_successful_votes_for_earlier_slots_confirm_a_hash() {
+        let (good, forged, planted) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
+        let block = Block {
+            slot: 10,
+            parent_slot: 9,
+            blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
+            block_time: 0,
+            block_height: 0,
+            transactions: vec![
+                vote(8, forged, Some("SlotHashMismatch")),
+                vote(8, good, None),
+                vote(10, planted, None),
+                vote(50, planted, None),
+            ],
+            fee_reward: None,
+        };
+        assert_eq!(vote_confirmations(&block), vec![(8, good)]);
     }
 }

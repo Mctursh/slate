@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
         .expect("usage: <accounts.redb> <slot>")
         .parse()?;
 
-    let store = DiskStore::create(&path, 1 << 30)?;
+    let store = DiskStore::open(&path, 1 << 30)?;
     let bank = ReplayBank::with_store(Box::new(store));
     let feature_set = build_feature_set(&bank, slot);
 

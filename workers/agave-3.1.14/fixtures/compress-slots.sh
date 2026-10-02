@@ -1,6 +1,7 @@
 #!/bin/bash
 # Tier-1 slot fixtures are committed compressed. Re-run after any re-capture.
 set -euo pipefail
+command -v zstd >/dev/null || { echo "needs the zstd CLI: brew install zstd, or apt install zstd"; exit 1; }
 cd "$(dirname "$0")/slots"
 shopt -s nullglob
 for f in *.slfix; do
