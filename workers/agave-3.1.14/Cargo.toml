@@ -5,6 +5,9 @@
 resolver = "3"
 members = ["slate-replay", "slate-backfill"]
 
+[workspace.package]
+repository = "https://github.com/Mctursh/slate"
+
 # Duplicated from the root deliberately: an era pins its own, so bumping the live
 # pipeline's tokio can't touch a frozen era.
 [workspace.dependencies]

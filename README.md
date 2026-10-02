@@ -128,7 +128,33 @@ cargo run -p slate-backfill --release -- \
 
 Each long phase prints one progress line with a count, rate and ETA. It redraws in place on a terminal and prints a fresh line every 30s when piped to a log.
 
-A run stops at the first slot it can't reproduce and prints `halted at slot ...`. That still exits 0, so check the output, not the exit code.
+## Halts
+
+A run stops at the first slot it can't reproduce. It prints the kind of halt, what was verified, the command to resume, and a report path, then exits 2.
+
+| Exit | Meaning | What to do |
+| --- | --- | --- |
+| 0 | the range replayed and verified | nothing |
+| 1 | crashed: network, disk, config | fix it, re-run with `--resume` |
+| 2 | halted | resume once; if it halts at the same slot again, open an issue and attach the report |
+
+A resume is a new process with an empty program cache, so a transient fault doesn't survive it. A `--store memory` run can't resume and re-runs instead. The report sits at `halt-<slot>/report.txt` beside `--store-path` and holds the release, git commit, agave version, working directory and full command.
+
+### State divergence
+
+A later block's consensus vote names a different bank hash than Slate computed for that slot, so some account state differs. Every earlier slot in the run matched consensus.
+
+### Execution divergence
+
+A transaction replayed differently from what the block recorded: status, fee, lamport or token balances. The report lists each difference. The block's record isn't signed, so a corrupt archive record halts the same way.
+
+### Unsanitizable transaction
+
+A transaction couldn't be prepared for execution, usually its recorded lookup-table addresses or a rule Slate applies differently at that slot.
+
+### End-state mismatch
+
+`--verify-boundary` found accounts that differ from the real snapshot at `--to`, with no slot halting. The report lists every one.
 
 ## Tests
 
@@ -179,13 +205,15 @@ REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate --
 
 ## What's coming
 
-- **v0.3.0.** Halts that say what kind of failure they are, with exit codes to match, so a long run can go unattended.
-- **v0.3.1.** Fetch the next chunk while replaying the current one.
+- **Self-healing halts.** Retry a halt once on its own, count the ones that clear, and tell a bad archive record from an engine fault.
+- **Halt fixtures.** Save a replayable copy of the halting slot to attach to an issue.
+- **Byte checks.** Verify program bytes and cached blocks against their hashes before using them.
+- **Pipelined fetch.** Fetch the next chunk while the current one replays.
 - **Era 2.** A worker on agave 4.2.1 for epoch 979 to the tip.
-- **Era 1 coverage.** Replay windows through the 16 execution-relevant activations not yet crossed.
-- **RPC surface.** `memcmp` / `dataSize` filters, `dataSlice`, base58 and jsonParsed, `getTokenAccountsByOwner`.
-- **Live capture.** Snapshot bootstrap, a replayable stream (Fumarole, LaserStream) so reconnects heal, gap repair from incremental snapshots.
-- **Later.** `asOfTime`, S3 tiering for deep history.
+- **Wider era 1 coverage.** Replay through the 16 execution-relevant activations not yet crossed.
+- **Richer RPC.** `memcmp` / `dataSize` filters, `dataSlice`, base58 and jsonParsed, `getTokenAccountsByOwner`.
+- **Durable live capture.** Snapshot bootstrap, a replayable stream (Fumarole, LaserStream) so reconnects heal, gap repair from incremental snapshots.
+- **Time queries and cold storage.** `asOfTime`, and S3 tiering for deep history.
 
 ## License
 

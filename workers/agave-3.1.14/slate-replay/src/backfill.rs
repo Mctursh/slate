@@ -26,6 +26,7 @@ pub enum AccountStoreChoice {
 
 pub struct BackfillReport {
     pub replay: RangeReplay,
+    pub covered_through: u64,
     pub boundary: Option<boundary::DiffReport>,
 }
 
@@ -290,6 +291,7 @@ pub async fn backfill(
 
         let mut completed = 0usize;
         let mut halt = None;
+        let (mut verified, mut last_verified) = (0usize, None);
         for chunk in replay_slots.chunks(chunk_slots) {
             let mut progress =
                 Progress::lazy("fetching blocks", Some(chunk.len() as u64), Unit::Count);
@@ -301,6 +303,8 @@ pub async fn backfill(
                 covered_hi = blocks[done - 1].slot;
             }
             completed += done;
+            verified += chunk_replay.verified;
+            last_verified = last_verified.max(chunk_replay.last_verified);
             // Drain and persist this chunk's program writes, up to the last good slot.
             let changes: Vec<WriteRecord> = bank
                 .take_writes()
@@ -336,11 +340,15 @@ pub async fn backfill(
         RangeReplay {
             blocks_completed: completed,
             halt,
+            verified,
+            last_verified,
         }
     } else {
         RangeReplay {
             blocks_completed: 0,
             halt: None,
+            verified: 0,
+            last_verified: None,
         }
     };
 
@@ -377,6 +385,7 @@ pub async fn backfill(
 
     Ok(BackfillReport {
         replay: result,
+        covered_through: covered_hi,
         boundary,
     })
 }

@@ -2,6 +2,7 @@
 name = "slate-backfill"
 version = "0.2.0"
 edition = "2024"
+repository.workspace = true
 
 [dependencies]
 slate-replay = { path = "../slate-replay" }
@@ -12,3 +13,6 @@ anyhow = "1"
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+solana-hash = "3.1.0"

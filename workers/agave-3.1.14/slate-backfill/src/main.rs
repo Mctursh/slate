@@ -1,4 +1,6 @@
-use std::{fs::File, io::Read, path::PathBuf, str::FromStr, sync::Arc};
+use std::{fs::File, io::Read, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+
+mod halt;
 
 use anyhow::Context;
 use clap::Parser;
@@ -84,7 +86,10 @@ struct Args {
     fixture_dir: Option<String>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
+    let command: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let args = Args::parse();
 
     // Preflight: fail fast on cheap local checks before fetching a single block.
@@ -120,7 +125,8 @@ fn main() -> anyhow::Result<()> {
 
     if args.dry_run {
         let blocks = fetch_range(&args)?;
-        return dry_run_report(&blocks);
+        dry_run_report(&blocks)?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Validate program, config, and ClickHouse before the expensive fetch.
@@ -253,42 +259,57 @@ fn main() -> anyhow::Result<()> {
                     dir,
                 )
             }),
-    )
+        )
         .await?;
-        match &result.replay.halt {
-            None => println!(
-                "done: {} blocks replayed and persisted; coverage ({}, {}]",
-                result.replay.blocks_completed, args.from, args.to
-            ),
-            Some((slot, block_replay)) => {
-                let detail = block_replay
-                    .halt
-                    .as_ref()
-                    .map(|h| format!("tx {}: {}", h.tx_index, h.reason))
-                    .unwrap_or_else(|| "unknown reason".into());
-                println!(
-                    "halted at slot {slot} after {} completed blocks, on {detail}; \
-                     coverage recorded up to the last good slot",
-                    result.replay.blocks_completed
-                );
-            }
+        let disk_store = args.store == "disk";
+        let run = halt::Run {
+            args: &command,
+            disk_store,
+            verified: result.replay.verified,
+            last_verified: result.replay.last_verified,
+            covered_through: result.covered_through,
+        };
+        if let Some((slot, stop)) = &result.replay.halt {
+            let problem = halt::Problem::Replay {
+                slot: *slot,
+                halt: stop,
+            };
+            return Ok(report_halt(&problem, &run, &args.store_path));
         }
-        // Boundary verdict: hard failure (non-zero exit) on any mismatch so a divergence can't slip through silently.
+        println!(
+            "done: {} blocks replayed and persisted; coverage ({}, {}]",
+            result.replay.blocks_completed, args.from, args.to
+        );
         if let Some(diff) = &result.boundary {
             println!("{}", diff.summary());
-            for m in diff.mismatches.iter().take(20) {
-                println!("  mismatch {} {:?}", m.pubkey, m.kind);
-            }
             if !diff.is_exact() {
-                anyhow::bail!(
-                    "boundary diff: {} mismatch(es); reconstructed end-state is NOT byte-exact vs the snapshot at --to",
-                    diff.mismatches.len()
-                );
+                let problem = halt::Problem::EndState {
+                    slot: args.to,
+                    mismatches: diff
+                        .mismatches
+                        .iter()
+                        .map(|m| format!("{} {:?}", m.pubkey, m.kind))
+                        .collect(),
+                };
+                return Ok(report_halt(&problem, &run, &args.store_path));
             }
             println!("boundary diff: end-state is byte-exact against the snapshot at --to");
         }
-        anyhow::Ok(())
+        anyhow::Ok(ExitCode::SUCCESS)
     })
+}
+
+// Exit 2 on any halt, report or no report: a wrapper must never read a divergence as success.
+fn report_halt(problem: &halt::Problem, run: &halt::Run, store_path: &str) -> ExitCode {
+    let slot = match problem {
+        halt::Problem::Replay { slot, .. } | halt::Problem::EndState { slot, .. } => *slot,
+    };
+    let path = halt::report_path(store_path, run.disk_store, slot);
+    print!("{}", halt::render(problem, run, &path));
+    if let Err(e) = halt::write_report(&path, &halt::report(problem, run, &path)) {
+        eprintln!("could not write {}: {e}", path.display());
+    }
+    ExitCode::from(2)
 }
 
 // Fetch confirmed blocks in (from, to]; blocking, so it must run before any tokio runtime (fetch_block panics nested).
