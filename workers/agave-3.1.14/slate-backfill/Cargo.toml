@@ -3,6 +3,7 @@ name = "slate-backfill"
 version = "0.3.0"
 edition = "2024"
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 slate-replay = { path = "../slate-replay" }

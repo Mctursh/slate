@@ -2,6 +2,7 @@
 name = "slate-format"
 version = "0.3.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 # Byte layouts only, so no solana dependencies. See slate-hash for why a shared crate
 # that takes typed solana values isn't actually shared.

@@ -35,7 +35,7 @@ flowchart LR
   CH --> Serve[slate-rpc]
 ```
 
-- **Live.** Loads a program's accounts with `getProgramAccounts`, then streams writes from Yellowstone gRPC. Writes are buffered per slot and committed when the slot finalizes. A reconnect starts a new coverage segment, so the gap stays visible.
+- **Live.** Loads a program's accounts with `getProgramAccounts`, then streams writes from Yellowstone gRPC. Writes are buffered per slot and committed when the slot finalizes. A reconnect starts a new coverage segment; see [Known limitations](#known-limitations) for what it misses.
 - **Backfill.** Seeds from a full snapshot, replays blocks through the agave SVM, and halts at the first slot it can't reproduce. Coverage is recorded up to the last good slot.
 - **Fidelity.** Every read says `exact` (inside a covered segment) or `uncertain` (below the floor or across a gap).
 - Coverage isn't tracked per program, so keep one program per database.
@@ -203,6 +203,14 @@ REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate --
 | `slate-format` | versioned on-disk formats: account record, checkpoint, fixture |
 | `workers/agave-3.1.14` | era 1: replay engine (`slate-replay`) and CLI (`slate-backfill`), own lockfile and toolchain |
 
+## Known limitations
+
+- **Live capture misses account closes.** Geyser reports a closed account as owned by System, so the owner filter drops it, and the account keeps being served as it was, labelled `exact`.
+- **A live reconnect can mark about 32 slots covered without their writes.** Writes for slots that were in flight when the stream dropped are lost, but those slots still count as covered.
+- **Absence is only meaningful for the captured program.** Asking for an account the program never owned returns `null` labelled `exact`.
+- **The RPC has no request limits.** `getProgramAccounts` without `limit` returns everything, and there is no cap on keys or batch size. Don't expose it publicly.
+- **`--store memory` can't cross an epoch boundary.** It halts there. Use `--store disk` for a range that crosses one.
+
 ## What's coming
 
 - **Self-healing halts.** Retry a halt once on its own, count the ones that clear, and tell a bad archive record from an engine fault.
@@ -212,7 +220,7 @@ REFERENCE_RPC=https://your-other-rpc cargo run -p slate-ingest --bin validate --
 - **Era 2.** A worker on agave 4.2.1 for epoch 979 to the tip.
 - **Wider era 1 coverage.** Replay through the 16 execution-relevant activations not yet crossed.
 - **Richer RPC.** `memcmp` / `dataSize` filters, `dataSlice`, base58 and jsonParsed, `getTokenAccountsByOwner`.
-- **Durable live capture.** Snapshot bootstrap, a replayable stream (Fumarole, LaserStream) so reconnects heal, gap repair from incremental snapshots.
+- **Durable live capture.** Record account closes, resume a dropped stream where it stopped, snapshot bootstrap, a replayable stream (Fumarole, LaserStream) so reconnects heal, gap repair from incremental snapshots.
 - **Time queries and cold storage.** `asOfTime`, and S3 tiering for deep history.
 
 ## License
